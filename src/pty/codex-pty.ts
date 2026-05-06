@@ -278,10 +278,29 @@ export class CodexPTY {
   }
 
   /**
+   * Default Codex feature flags enabled for every cortextOS-managed codex agent.
+   * Currently: `goals` (native goal tracking surface). Per-agent overrides can
+   * be added via the optional `codex_features` array on AgentConfig in future.
+   */
+  private getEnabledFeatures(): string[] {
+    const fromConfig = (this._config as AgentConfig & { codex_features?: string[] }).codex_features;
+    return Array.isArray(fromConfig) && fromConfig.length > 0 ? fromConfig : ['goals'];
+  }
+
+  private featureFlagArgs(): string[] {
+    const args: string[] = [];
+    for (const f of this.getEnabledFeatures()) {
+      args.push('--enable', f);
+    }
+    return args;
+  }
+
+  /**
    * Build args for a fresh exec (new session).
    * --skip-git-repo-check: skip trust check for daemon-managed directories
    * --sandbox workspace-write: sets approval=never + safe sandbox level
    * --json: structured JSONL output for reliable event detection
+   * --enable <feature>: codex feature flags defaulted on for cortextOS agents
    */
   private buildFreshArgs(prompt: string): string[] {
     return [
@@ -289,6 +308,7 @@ export class CodexPTY {
       '--skip-git-repo-check',
       '--sandbox', 'workspace-write',
       '--json',
+      ...this.featureFlagArgs(),
       prompt,
     ];
   }
@@ -297,6 +317,7 @@ export class CodexPTY {
    * Build args for resuming the most recent session in this cwd.
    * --last: pick most recent thread for current cwd (cwd-filtered by default)
    * --dangerously-bypass-approvals-and-sandbox: required for exec resume (--sandbox not available)
+   * --enable <feature>: codex feature flags defaulted on for cortextOS agents
    */
   private buildResumeArgs(prompt: string): string[] {
     return [
@@ -306,6 +327,7 @@ export class CodexPTY {
       '--skip-git-repo-check',
       '--dangerously-bypass-approvals-and-sandbox',
       '--json',
+      ...this.featureFlagArgs(),
       prompt,
     ];
   }
