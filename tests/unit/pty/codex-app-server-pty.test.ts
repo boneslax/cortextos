@@ -131,6 +131,54 @@ describe('CodexAppServerPTY command mapping', () => {
     expect(pty.getOutputBuffer().getRecent()).toContain('[goal] none set');
   });
 
+  it('maps Telegram-delivered /goal with bot suffix to native goal get', async () => {
+    requestMock.mockResolvedValue({ result: { goal: null } });
+    const pty = makeReadyPty();
+    pty.write(`=== TELEGRAM from [USER: James] (chat_id:7940429114) ===
+[Recent conversation:]
+[user]: prior
+\`\`\`
+old fenced text
+\`\`\`
+/goal@codex_app_server_test_bot
+[Your last message: "previous"]
+Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
+`);
+    pty.write('\r');
+    await Promise.resolve();
+    expect(requestMock).toHaveBeenCalledWith('thread/goal/get', { threadId: 'thread-1' });
+    expect(requestMock).not.toHaveBeenCalledWith('turn/start', expect.anything());
+    expect(pty.getOutputBuffer().getRecent()).toContain('[goal] none set');
+  });
+
+  it('maps Telegram-delivered /goal set and clear variants without starting a turn', async () => {
+    requestMock
+      .mockResolvedValueOnce({ result: { goal: { status: 'active' } } })
+      .mockResolvedValueOnce({ result: { cleared: true } });
+    const pty = makeReadyPty();
+
+    pty.write(`=== TELEGRAM from [USER: James] (chat_id:7940429114) ===
+/goal@codex_app_server_test_bot Ship native slash routing
+Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
+`);
+    pty.write('\r');
+    await Promise.resolve();
+
+    pty.write(`=== TELEGRAM from [USER: James] (chat_id:7940429114) ===
+/goal clear
+Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
+`);
+    pty.write('\r');
+    await Promise.resolve();
+
+    expect(requestMock).toHaveBeenNthCalledWith(1, 'thread/goal/set', {
+      threadId: 'thread-1',
+      objective: 'Ship native slash routing',
+    });
+    expect(requestMock).toHaveBeenNthCalledWith(2, 'thread/goal/clear', { threadId: 'thread-1' });
+    expect(requestMock).not.toHaveBeenCalledWith('turn/start', expect.anything());
+  });
+
   it('maps /goal clear to thread/goal/clear', async () => {
     requestMock.mockResolvedValue({ result: { cleared: true } });
     const pty = makeReadyPty();
@@ -148,6 +196,41 @@ describe('CodexAppServerPTY command mapping', () => {
     await Promise.resolve();
     expect(pty.getOutputBuffer().getRecent()).toContain('Did you mean: imagegen');
     expect(requestMock).not.toHaveBeenCalledWith('turn/start', expect.anything());
+  });
+
+  it('maps Telegram-fenced $skill input to native UserInput.skill', async () => {
+    requestMock
+      .mockResolvedValueOnce({
+        result: {
+          data: [{ cwd: '/tmp', skills: [{ name: 'imagegen', path: '/skill.md', enabled: true }] }],
+        },
+      })
+      .mockResolvedValueOnce({ result: {} });
+    const pty = makeReadyPty();
+
+    pty.write(`=== TELEGRAM from [USER: James] (chat_id:7940429114) ===
+\`\`\`
+$imagegen make a logo
+\`\`\`
+Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
+`);
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(requestMock).toHaveBeenNthCalledWith(1, 'skills/list', {
+      cwds: ['/tmp/fw/orgs/acme/agents/codex-app-agent'],
+      forceReload: false,
+    });
+    expect(requestMock).toHaveBeenNthCalledWith(2, 'turn/start', {
+      threadId: 'thread-1',
+      input: [
+        { type: 'skill', name: 'imagegen', path: '/skill.md' },
+        { type: 'text', text: 'make a logo', text_elements: [] },
+      ],
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'dangerFullAccess' },
+    });
   });
 
   it('maps exact $skill input to native UserInput.skill', async () => {

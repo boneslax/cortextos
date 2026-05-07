@@ -220,23 +220,72 @@ export class CodexAppServerPTY {
   }
 
   private async handleInput(content: string): Promise<void> {
-    if (content === '/goal') {
+    const input = this.extractTelegramPayload(content) ?? content;
+    const goalCommand = this.parseGoalCommand(input);
+    if (goalCommand?.type === 'get') {
       await this.getGoal();
       return;
     }
-    if (content === '/goal clear') {
+    if (goalCommand?.type === 'clear') {
       await this.clearGoal();
       return;
     }
-    if (content.startsWith('/goal ')) {
-      await this.setGoal(content.slice('/goal '.length).trim());
+    if (goalCommand?.type === 'set') {
+      await this.setGoal(goalCommand.objective);
       return;
     }
-    if (content.startsWith('$')) {
-      await this.handleSkillInput(content);
+    if (input.startsWith('$')) {
+      await this.handleSkillInput(input);
       return;
     }
-    this.queueTurn([{ type: 'text', text: content, text_elements: [] }]);
+    this.queueTurn([{ type: 'text', text: input, text_elements: [] }]);
+  }
+
+  private extractTelegramPayload(content: string): string | null {
+    if (!content.startsWith('=== TELEGRAM')) return null;
+
+    const beforeReply = content
+      .split('\n[Your last message:', 1)[0]
+      .split('\nReply using:', 1)[0];
+
+    const lines = beforeReply
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = lines[i];
+      if (line.startsWith('=== TELEGRAM')) continue;
+      if (line.startsWith('[Recent conversation:]')) continue;
+      if (line.startsWith('[reply_to:')) continue;
+      if (line.startsWith('/') || line.startsWith('$')) return line;
+      break;
+    }
+
+    const fencedBlocks = [...beforeReply.matchAll(/```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n```/g)];
+    if (fencedBlocks.length > 0) {
+      return fencedBlocks[fencedBlocks.length - 1]?.[1]?.trim() || null;
+    }
+
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = lines[i];
+      if (line.startsWith('=== TELEGRAM')) continue;
+      if (line.startsWith('[Recent conversation:]')) continue;
+      if (line.startsWith('[reply_to:')) continue;
+      return line;
+    }
+
+    return null;
+  }
+
+  private parseGoalCommand(content: string): { type: 'get' | 'clear' } | { type: 'set'; objective: string } | null {
+    const match = content.trim().match(/^\/goal(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/i);
+    if (!match) return null;
+
+    const objective = match[1]?.trim();
+    if (!objective) return { type: 'get' };
+    if (objective.toLowerCase() === 'clear') return { type: 'clear' };
+    return { type: 'set', objective };
   }
 
   private async startAppServerWithRetry(): Promise<void> {
