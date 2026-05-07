@@ -1,0 +1,216 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const fsMocks = {
+  existsSync: vi.fn().mockReturnValue(false),
+  readFileSync: vi.fn(),
+  writeFileSync: vi.fn(),
+  unlinkSync: vi.fn(),
+};
+
+vi.mock('fs', async () => {
+  const actual = await vi.importActual<typeof import('fs')>('fs');
+  return {
+    ...actual,
+    get existsSync() { return fsMocks.existsSync; },
+    get readFileSync() { return fsMocks.readFileSync; },
+    get writeFileSync() { return fsMocks.writeFileSync; },
+    get unlinkSync() { return fsMocks.unlinkSync; },
+  };
+});
+
+vi.mock('../../../src/utils/atomic.js', () => ({
+  ensureDir: vi.fn(),
+}));
+
+vi.mock('node-pty', () => ({
+  spawn: vi.fn().mockReturnValue({
+    pid: 88,
+    write: vi.fn(),
+    onData: vi.fn(),
+    onExit: vi.fn(),
+    kill: vi.fn(),
+  }),
+}));
+
+const requestMock = vi.fn();
+const notifyMock = vi.fn();
+const closeMock = vi.fn();
+const respondErrorMock = vi.fn();
+let messageHandler: ((message: unknown) => void) | null = null;
+
+vi.mock('../../../src/utils/ws-unix-client.js', () => ({
+  WsUnixJsonRpcClient: vi.fn().mockImplementation(function WsUnixJsonRpcClient() {
+    return {
+      connect: vi.fn().mockResolvedValue(undefined),
+      close: closeMock,
+      notify: notifyMock,
+      respondError: respondErrorMock,
+      onMessage: vi.fn().mockImplementation((handler: (message: unknown) => void) => {
+        messageHandler = handler;
+        return vi.fn();
+      }),
+      request: requestMock,
+    };
+  }),
+}));
+
+const { CodexAppServerPTY } = await import('../../../src/pty/codex-app-server-pty.js');
+
+const mockEnv = {
+  instanceId: 'test',
+  ctxRoot: '/tmp/ctx',
+  frameworkRoot: '/tmp/fw',
+  agentName: 'codex-app-agent',
+  agentDir: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+  org: 'acme',
+  projectRoot: '/tmp/fw',
+};
+
+beforeEach(() => {
+  fsMocks.existsSync.mockReset().mockReturnValue(false);
+  fsMocks.readFileSync.mockReset();
+  fsMocks.writeFileSync.mockReset();
+  fsMocks.unlinkSync.mockReset();
+  requestMock.mockReset();
+  notifyMock.mockReset();
+  closeMock.mockReset();
+  respondErrorMock.mockReset();
+  messageHandler = null;
+});
+
+describe('CodexAppServerPTY socket path policy', () => {
+  it('uses codex.sock in the agent state dir by default', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    expect((pty as unknown as { _socketPath: string })._socketPath).toBe('/tmp/ctx/state/codex-app-agent/codex.sock');
+    expect((pty as unknown as { _socketListenArg: string })._socketListenArg).toBe('unix://./codex.sock');
+  });
+
+  it('falls back to /tmp/cas-*.sock when the state socket path is too long', () => {
+    const longEnv = {
+      ...mockEnv,
+      ctxRoot: `/tmp/${'x'.repeat(120)}`,
+    };
+    const pty = new CodexAppServerPTY(longEnv, {});
+    const socketPath = (pty as unknown as { _socketPath: string })._socketPath;
+    expect(socketPath).toMatch(/\/cas-[a-f0-9]{8}\.sock$/);
+    expect((pty as unknown as { _socketListenArg: string })._socketListenArg).toBe(`unix://${socketPath}`);
+    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining('codex-app-server-socket.json'),
+      expect.stringContaining('"fallback": true'),
+      'utf-8',
+    );
+  });
+});
+
+describe('CodexAppServerPTY command mapping', () => {
+  function makeReadyPty() {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _alive: boolean })._alive = true;
+    (pty as unknown as { _threadId: string })._threadId = 'thread-1';
+    (pty as unknown as { _rpc: { request: typeof requestMock; respondError: typeof respondErrorMock } })._rpc = {
+      request: requestMock,
+      respondError: respondErrorMock,
+    };
+    return pty;
+  }
+
+  it('maps /goal to thread/goal/get', async () => {
+    requestMock.mockResolvedValue({ result: { goal: null } });
+    const pty = makeReadyPty();
+    pty.write('/goal');
+    pty.write('\r');
+    await Promise.resolve();
+    expect(requestMock).toHaveBeenCalledWith('thread/goal/get', { threadId: 'thread-1' });
+    expect(pty.getOutputBuffer().getRecent()).toContain('[goal] none set');
+  });
+
+  it('maps /goal clear to thread/goal/clear', async () => {
+    requestMock.mockResolvedValue({ result: { cleared: true } });
+    const pty = makeReadyPty();
+    pty.write('/goal clear');
+    pty.write('\r');
+    await Promise.resolve();
+    expect(requestMock).toHaveBeenCalledWith('thread/goal/clear', { threadId: 'thread-1' });
+  });
+
+  it('does not fall back to text for unknown skills', async () => {
+    requestMock.mockResolvedValue({ result: { data: [{ cwd: '/tmp', skills: [{ name: 'imagegen', path: '/skill.md', enabled: true }] }] } });
+    const pty = makeReadyPty();
+    pty.write('$imag');
+    pty.write('\r');
+    await Promise.resolve();
+    expect(pty.getOutputBuffer().getRecent()).toContain('Did you mean: imagegen');
+    expect(requestMock).not.toHaveBeenCalledWith('turn/start', expect.anything());
+  });
+
+  it('queues turns until native turn/completed arrives', async () => {
+    requestMock.mockResolvedValue({ result: {} });
+    const pty = makeReadyPty();
+    const internals = pty as unknown as { handleRpcMessage(message: unknown): void };
+
+    pty.write('first');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requestMock).toHaveBeenCalledTimes(1);
+    expect(requestMock).toHaveBeenLastCalledWith('turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'first', text_elements: [] }],
+    });
+
+    pty.write('second');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requestMock).toHaveBeenCalledTimes(1);
+
+    internals.handleRpcMessage({ method: 'turn/completed', params: {} });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requestMock).toHaveBeenCalledTimes(2);
+    expect(requestMock).toHaveBeenLastCalledWith('turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'second', text_elements: [] }],
+    });
+
+    internals.handleRpcMessage({ method: 'turn/completed', params: {} });
+  });
+});
+
+describe('CodexAppServerPTY event handling', () => {
+  it('bootstraps on the app-server ready marker', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    pty.getOutputBuffer().push('[codex-app-server] ready thread=abc\n');
+    expect(pty.getOutputBuffer().isBootstrapped()).toBe(true);
+  });
+
+  it('responds with an error for unsupported server requests', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _rpc: { respondError: typeof respondErrorMock } })._rpc = { respondError: respondErrorMock };
+    (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
+      id: 7,
+      method: 'item/commandExecution/requestApproval',
+      params: {},
+    });
+    expect(respondErrorMock).toHaveBeenCalledWith(7, -32601, 'Unsupported app-server request: item/commandExecution/requestApproval');
+    expect(pty.getOutputBuffer().getRecent()).toContain('unsupported request');
+  });
+
+  it('fires Telegram typing from streamed assistant deltas', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    const api = { sendChatAction: vi.fn().mockResolvedValue(undefined) };
+    pty.setTelegramHandle(api as unknown as Parameters<typeof pty.setTelegramHandle>[0], '12345');
+    (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
+      method: 'item/agentMessage/delta',
+      params: { delta: 'hello' },
+    });
+    expect(api.sendChatAction).toHaveBeenCalledWith('12345', 'typing');
+    expect(pty.getOutputBuffer().getRecent()).toContain('hello');
+  });
+
+  it('registers a message handler when connecting RPC', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    await (pty as unknown as { connectRpc(): Promise<void> }).connectRpc();
+    expect(messageHandler).not.toBeNull();
+  });
+});
