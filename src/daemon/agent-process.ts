@@ -429,7 +429,80 @@ export class AgentProcess {
 
   // --- Private methods ---
 
+  /**
+   * Read the tail of this agent's stdout.log without loading the whole file.
+   * Used by handleExit() to inspect recent output for known-crash signatures
+   * (e.g. the image-poison API 400 pattern) so it can decide whether the
+   * exit is a real crash or a recoverable upstream artifact.
+   *
+   * Returns an empty string if the log doesn't exist or can't be read.
+   */
+  private tailStdoutLog(maxBytes: number): string {
+    const logPath = join(this.env.ctxRoot, 'logs', this.name, 'stdout.log');
+    try {
+      if (!existsSync(logPath)) return '';
+      const stats = statSync(logPath);
+      const start = Math.max(0, stats.size - maxBytes);
+      const len = stats.size - start;
+      // Synchronous read of the tail; small and bounded so the cost is fine
+      // even in the exit handler.
+      const fd = require('fs').openSync(logPath, 'r');
+      try {
+        const buf = Buffer.alloc(len);
+        const read = require('fs').readSync(fd, buf, 0, len, start);
+        return buf.toString('utf-8', 0, read);
+      } finally {
+        require('fs').closeSync(fd);
+      }
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Match the API 400 image-poison signature in recent stdout.
+   *
+   * Two variants observed in Anthropic's Messages API responses:
+   *   `API Error: 400 messages.N.content.M.image.source.base64.data: Image format image/<fmt> not supported`
+   *   `API Error: 400 ... image.source.base64.data: ...`
+   *
+   * Matching the prefix `image.source.base64` is robust to wording changes
+   * in Anthropic's error string; matching `image format image/<fmt>` is the
+   * confirmed exact wording today and gives a second signal. Either is enough.
+   */
+  private detectImagePoisonCrash(recentOutput: string): boolean {
+    if (!recentOutput) return false;
+    if (recentOutput.includes('API Error: 400') && recentOutput.includes('image.source.base64')) {
+      return true;
+    }
+    if (/image format image\/[a-z]+ not supported/i.test(recentOutput)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Write the `.force-fresh` marker that AgentProcess.shouldContinue() reads
+   * on the next start() to force a fresh Claude Code session (no --continue).
+   * Used by the image-poison auto-recovery in handleExit().
+   */
+  private armForceFresh(reason: string): void {
+    try {
+      const stateDir = join(this.env.ctxRoot, 'state', this.name);
+      ensureDir(stateDir);
+      const markerPath = join(stateDir, '.force-fresh');
+      writeFileSync(markerPath, `${new Date().toISOString()} ${reason}\n`, 'utf-8');
+    } catch (err) {
+      this.log(`Failed to arm .force-fresh marker: ${err}`);
+    }
+  }
+
   private handleExit(exitCode: number): void {
+    // Capture last 16KB of the agent's stdout BEFORE nulling pty.
+    // Used by the image-poison auto-recovery check below — reads the log
+    // file so this works even if the PTY buffer has already been GC'd.
+    const recentOutput = this.tailStdoutLog(16384);
+
     this.pty = null;
     this.clearSessionTimer();
 
@@ -494,6 +567,24 @@ export class AgentProcess {
         this.notifyStatusChange();
         return;
       }
+    }
+
+    // Image-poison auto-recovery (companion to PR #446's photo-injection fix).
+    // Detects API 400 unsupported-image-format crashes, arms .force-fresh,
+    // and restarts WITHOUT charging the crash counter. Runs after the
+    // CrashLoopPauser so a runaway poison loop still trips the window guard.
+    if (exitCode === 0 && this.detectImagePoisonCrash(recentOutput)) {
+      this.log('Image-poison crash detected (API 400, unsupported image format). Arming .force-fresh and restarting without counting against max_crashes_per_day.');
+      this.armForceFresh('image-poison auto-recovery');
+      this.appendCrashToRestartsLog(exitCode, 5000, 'IMAGE_POISON_RECOVERY');
+      this.status = 'crashed';
+      this.notifyStatusChange();
+      setTimeout(() => {
+        if (this.status === 'crashed') {
+          this.start().catch(err => this.log(`Image-poison restart failed: ${err}`));
+        }
+      }, 5000);
+      return;
     }
 
     // Legacy daily crash counter (fallback when no crash_window is configured,
@@ -780,7 +871,7 @@ export class AgentProcess {
   private appendCrashToRestartsLog(
     exitCode: number,
     backoffMs: number,
-    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP',
+    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY',
   ): void {
     try {
       const logDir = join(this.env.ctxRoot, 'logs', this.name);
@@ -789,7 +880,9 @@ export class AgentProcess {
       const details =
         kind === 'HALTED'
           ? `exit_code=${exitCode} crash_count=${this.crashCount} max_crashes=${this.maxCrashesPerDay}`
-          : `exit_code=${exitCode} crash_count=${this.crashCount} backoff_s=${backoffMs / 1000}`;
+          : kind === 'IMAGE_POISON_RECOVERY'
+            ? `exit_code=${exitCode} backoff_s=${backoffMs / 1000} (not counted toward max_crashes)`
+            : `exit_code=${exitCode} crash_count=${this.crashCount} backoff_s=${backoffMs / 1000}`;
       const logLine = `[${timestamp}] ${kind}: ${details}\n`;
       appendFileSync(join(logDir, 'restarts.log'), logLine, 'utf-8');
     } catch {
