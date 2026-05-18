@@ -240,7 +240,6 @@ Reply using: cortextos bus send-message ${msg.from} normal '<your reply>' ${msg.
     replyToText?: string,
     lastSentText?: string,
     recentHistory?: string,
-    messageId?: number,
   ): string {
     let replyCx = '';
     if (replyToText) {
@@ -264,13 +263,8 @@ Reply using: cortextos bus send-message ${msg.from} normal '<your reply>' ${msg.
     const body = isSlashCommand
       ? text.trim()
       : `\`\`\`\n${text}\n\`\`\``;
-    // Surface the Telegram message_id so agents can react/edit/reply-to a
-    // specific message via cortextos bus react-telegram / edit-message.
-    const msgIdLine = typeof messageId === 'number'
-      ? `[msg_id: ${messageId}]\n`
-      : '';
     return `=== TELEGRAM from [USER: ${from}] (chat_id:${chatId}) ===
-${msgIdLine}${replyCx}${historyCx}${body}
+${replyCx}${historyCx}${body}
 ${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
 `;
