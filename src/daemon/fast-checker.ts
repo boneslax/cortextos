@@ -789,7 +789,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         `message_id: ${messageId}`,
         `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`,
       ].join('\n');
-      const injected = this.agent.injectMessage(msg);
+      const injected = await this.agent.injectMessage(msg);
       if (injected && this.telegramApi) {
         try { await this.telegramApi.answerCallbackQuery(callbackQueryId, 'Got it'); } catch { /* ignore */ }
       }
