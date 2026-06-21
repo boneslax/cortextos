@@ -821,7 +821,7 @@ export class AgentProcess {
     if (this.lastSpawnWasHandoff) return;
     if (!this.telegramApi || !this.telegramChatId) return;
     this.telegramApi
-      .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`)
+      .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`, undefined, { messageThreadId: this.telegramTopicId })
       .catch(() => { /* non-fatal: notification is observability only */ });
   }
 

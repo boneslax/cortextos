@@ -218,6 +218,31 @@ export class AgentManager {
   }
 
   /**
+   * Add/refresh a single agent's topic mapping. Used when an agent is started
+   * dynamically (IPC enable / restart) AFTER the discoverAndStart pre-pass, so
+   * its topic resolves immediately instead of falling back to the orchestrator
+   * until the next daemon restart. Conflicting (chatId,topicId) fails closed.
+   */
+  private upsertTopicRegistry(name: string, chatId?: string, topicId?: number): void {
+    if (!chatId || topicId === undefined) return;
+    const key = `${chatId}:${topicId}`;
+    const existing = this.topicRegistry.get(key);
+    if (existing && existing !== name) {
+      console.warn(`[agent-manager] Duplicate TOPIC_ID ${topicId} in chat ${chatId} (${existing} vs ${name}) — both unmapped, fail closed.`);
+      this.topicRegistry.delete(key);
+      return;
+    }
+    this.topicRegistry.set(key, name);
+  }
+
+  /** Drop any topic mapping owned by `name` (on stop/disable). */
+  private removeFromTopicRegistry(name: string): void {
+    for (const [k, v] of this.topicRegistry) {
+      if (v === name) this.topicRegistry.delete(k);
+    }
+  }
+
+  /**
    * Read the instance-level enabled-agents.json registry.
    * Returns an empty object if the file is missing or unreadable —
    * agents not present in the file default to enabled, matching the existing
@@ -433,6 +458,8 @@ export class AgentManager {
           const alertApi = new TelegramAPI(botToken);
           alertApi.sendMessage(chatId,
             `⚠️ WATCHDOG: ${name} has BOT_TOKEN but ALLOWED_USER is missing or malformed in .env. Telegram is DISABLED for this agent. Fix ALLOWED_USER and restart.`,
+            undefined,
+            { messageThreadId: topicId },
           ).catch(() => {});
         }
         botToken = undefined;
@@ -466,21 +493,25 @@ export class AgentManager {
     if (telegramApi && chatId) {
       const tgApi = telegramApi;
       const tgChatId = chatId;
+      const tgThread = topicId;
       let prevStatus: string | null = null;
       agentProcess.onStatusChanged((status) => {
         if (status.status === 'crashed') {
           const crashNum = status.crashCount ?? '?';
-          tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`).catch(() => {});
+          tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`, undefined, { messageThreadId: tgThread }).catch(() => {});
         } else if (status.status === 'halted') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} HALTED — exceeded crash limit. Restart manually with: cortextos start ${name}`).catch(() => {});
+          tgApi.sendMessage(tgChatId, `Agent ${name} HALTED — exceeded crash limit. Restart manually with: cortextos start ${name}`, undefined, { messageThreadId: tgThread }).catch(() => {});
         } else if (status.status === 'running' && prevStatus === 'crashed') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} recovered and is back online`).catch(() => {});
+          tgApi.sendMessage(tgChatId, `Agent ${name} recovered and is back online`, undefined, { messageThreadId: tgThread }).catch(() => {});
         }
         prevStatus = status.status;
       });
     }
 
     this.agents.set(name, { process: agentProcess, checker, topicId, chatId });
+    // Keep the topic registry current for agents started after the
+    // discoverAndStart pre-pass (IPC enable / restart). [Codex R1 #3]
+    this.upsertTopicRegistry(name, chatId, topicId);
 
     // Start agent
     await agentProcess.start();
@@ -547,7 +578,7 @@ export class AgentManager {
                   const alertText = `⚠️ WATCHDOG: ${name} rejected ${entry.telegramRejectCount} consecutive Telegram messages (ALLOWED_USER gate). Last from_id: ${fromId ?? 'unknown'}. Verify ALLOWED_USER in .env matches expected users, or this may be unsolicited contact.`;
                   log(alertText);
                   if (telegramApi && chatId) {
-                    telegramApi.sendMessage(chatId, alertText).catch(() => {});
+                    telegramApi.sendMessage(chatId, alertText, undefined, { messageThreadId: topicId }).catch(() => {});
                   }
                 }
               }
@@ -625,7 +656,14 @@ export class AgentManager {
         const isMedia = !!(msg.photo || msg.document || msg.voice || msg.audio || msg.video || msg.video_note);
 
         if (isMedia && telegramApi) {
-          const downloadDir = join(agentDir, 'telegram-images');
+          // Media must be downloaded into AND relativized against the OWNING
+          // agent's workspace, not the polling orchestrator's — otherwise the
+          // injected local_file path won't resolve when the target agent reads
+          // it. [Codex R1 #1]
+          const ownerProc = this.agents.get(targetName)?.process;
+          const ownerAgentDir = ownerProc?.getAgentDir() ?? agentDir;
+          const ownerConfig = ownerProc?.getConfig() ?? config;
+          const downloadDir = join(ownerAgentDir, 'telegram-images');
           processMediaMessage(msg, telegramApi, downloadDir).then((media) => {
             if (!media) {
               log('Media processing returned null - falling back to text format');
@@ -639,7 +677,7 @@ export class AgentManager {
             // agent never sees them. Relative paths survive injection.
             // BUG-049: Use the agent's actual launch cwd (config.working_directory
             // if set, else agentDir) so the path resolves when Read() is invoked.
-            const launchDir = config?.working_directory || agentDir;
+            const launchDir = ownerConfig?.working_directory || ownerAgentDir;
             const toRel = (p: string | undefined) => p ? relative(launchDir, p) : '';
             const relImagePath = toRel(media.image_path);
             const relFilePath = toRel(media.file_path);
@@ -733,7 +771,7 @@ export class AgentManager {
                   const alertText = `⚠️ WATCHDOG: ${name} rejected ${entry.telegramRejectCount} consecutive Telegram interactions (ALLOWED_USER gate). Verify ALLOWED_USER in .env matches expected users, or this may be unsolicited contact.`;
                   log(alertText);
                   if (telegramApi && chatId) {
-                    telegramApi.sendMessage(chatId, alertText).catch(() => {});
+                    telegramApi.sendMessage(chatId, alertText, undefined, { messageThreadId: topicId }).catch(() => {});
                   }
                 }
               }
@@ -817,6 +855,8 @@ export class AgentManager {
           telegramApi.sendMessage(
             String(chatId),
             `${name}: Telegram poller wrapper crashed. Inbound messages may be dropped until restart. Check daemon log.`,
+            undefined,
+            { messageThreadId: topicId },
           ).catch(() => { /* swallow alert failure; original log already captured */ });
         }
       });
@@ -976,6 +1016,7 @@ export class AgentManager {
     entry.checker.stop();
     await entry.process.stop();
     this.agents.delete(name);
+    this.removeFromTopicRegistry(name);
 
     // Stop and remove the agent's cron scheduler (if one was wired)
     const scheduler = this.cronSchedulers.get(name);
