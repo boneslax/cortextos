@@ -21,6 +21,34 @@ import { stripBom } from '../utils/strip-bom.js';
 type LogFn = (msg: string) => void;
 
 /**
+ * Pure decision for routing an inline-button callback to a checker, given the
+ * already-resolved owner. Extracted so the safety matrix is unit-testable.
+ *
+ *   - no owner + a thread WAS present + ask callback  -> 'drop' (fail closed:
+ *     ask callbacks replay as PTY keystrokes; never run them on a guessed PTY)
+ *   - no owner otherwise (General/no-thread, or perm/restart)  -> 'self'
+ *   - owner is the orchestrator itself  -> 'self'
+ *   - owner is another agent, running  -> { agent }
+ *   - owner is another agent, NOT running  -> 'drop' (don't mis-route)
+ */
+export function decideCallbackRoute(params: {
+  isAsk: boolean;
+  threadPresent: boolean;
+  owner: string | null;
+  selfName: string;
+  ownerRunning: boolean;
+}): { action: 'self' } | { action: 'drop' } | { action: 'agent'; owner: string } {
+  const { isAsk, threadPresent, owner, selfName, ownerRunning } = params;
+  if (!owner) {
+    if (threadPresent && isAsk) return { action: 'drop' };
+    return { action: 'self' };
+  }
+  if (owner === selfName) return { action: 'self' };
+  if (!ownerRunning) return { action: 'drop' };
+  return { action: 'agent', owner };
+}
+
+/**
  * Manages all agents in a cortextOS instance.
  */
 export class AgentManager {
@@ -727,29 +755,50 @@ export class AgentManager {
       poller.onCallback((query) => {
         // Route the callback to the OWNING agent's checker so the hook-response
         // file / PTY keystrokes land in the agent that posted the prompt — not
-        // always the polling orchestrator. [Codex CB5 / Claude C3]
+        // always the polling orchestrator. [Codex CB5/R2#1 / Claude C3 / GLM#3]
         //
         // Resolution order:
         //   1. topic thread (normal case: the button sits in the agent's topic)
         //   2. pending-callback index by the unique id in callback_data
-        //      (covers the case where Telegram omits message_thread_id)
-        //   3. orchestrator fallback + warn — fail-safe: a mis-routed callback
-        //      writes a response file the wrong agent never reads (its prompt
-        //      times out), it never triggers a wrong action.
+        //      (covers the case where Telegram omits message_thread_id on
+        //      perm/restart prompts)
+        // Safety rules:
+        //   - AskUserQuestion callbacks (askopt/asktoggle/asksubmit) execute as
+        //     PTY KEYSTROKES. They are not globally unique, so when a thread is
+        //     present but resolves to no running owner we FAIL CLOSED (drop) —
+        //     never replay keystrokes on a guessed/orchestrator PTY. A General
+        //     (no-thread) ask is the orchestrator's own and routes to self.
+        //   - A resolved-but-not-running owner is DROPPED (not handed to the
+        //     orchestrator), so a stopped agent's button never mis-fires.
+        const data = query.data || '';
+        const isAsk = /^(?:askopt|asktoggle|asksubmit)_/.test(data);
         const cbChatId = query.message?.chat?.id ?? chatId ?? '';
         const cbThread = query.message?.message_thread_id;
+        const answerExpired = () => {
+          if (telegramApi) telegramApi.answerCallbackQuery(query.id, 'Expired or unavailable').catch(() => {});
+        };
+
         let owner = this.resolveTopicOwner(cbChatId, cbThread);
         if (!owner) {
-          const id = (query.data || '').match(/^(?:perm|restart)_(?:allow|deny|continue)_([a-f0-9]+)$/)?.[1];
+          const id = data.match(/^(?:perm|restart)_(?:allow|deny|continue)_([a-f0-9]+)$/)?.[1];
           if (id) owner = resolvePendingCallback(this.ctxRoot, id);
         }
-        const targetChecker = (owner && owner !== name) ? this.agents.get(owner)?.checker : checker;
-        if (!targetChecker) {
-          log(`[topic-routing] callback owner ${owner ?? '?'} not running → orchestrator fallback`);
-        }
-        (targetChecker ?? checker).handleCallback(query).catch(err => {
-          log(`Callback handling error: ${err}`);
+
+        const route = decideCallbackRoute({
+          isAsk,
+          threadPresent: cbThread !== undefined,
+          owner,
+          selfName: name,
+          ownerRunning: owner ? this.agents.has(owner) : false,
         });
+
+        if (route.action === 'drop') {
+          log(`[topic-routing] callback dropped (fail-safe): owner=${owner ?? '?'} thread=${cbThread ?? '?'} ask=${isAsk}`);
+          answerExpired();
+          return;
+        }
+        const targetChecker = route.action === 'agent' ? this.agents.get(route.owner)?.checker : checker;
+        (targetChecker ?? checker).handleCallback(query).catch(err => log(`Callback handling error: ${err}`));
       });
 
       poller.onReaction((reaction) => {
