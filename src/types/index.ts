@@ -513,6 +513,27 @@ export interface TelegramMessage {
   video_note?: TelegramVideoNote;
   caption?: string;
   reply_to_message?: TelegramMessage;
+  /**
+   * Forum-topic thread id. Present on messages posted inside a forum
+   * supergroup topic; ABSENT on the General topic and on 1:1 DMs. This is
+   * the routing key for per-agent topics (see AgentManager topic routing).
+   */
+  message_thread_id?: number;
+  /** True on genuine (non-General) forum topic messages. Secondary routing guard. */
+  is_topic_message?: boolean;
+  /**
+   * Forum service-message markers. Telegram delivers these on the ordinary
+   * `message` update when a topic is created/edited/closed/etc. They carry a
+   * message_thread_id but no human body, so inbound routing MUST filter them
+   * out before formatting/queueing (otherwise they inject as blank prompts).
+   * Typed loosely — presence is all the routing filter needs.
+   */
+  forum_topic_created?: object;
+  forum_topic_edited?: object;
+  forum_topic_closed?: object;
+  forum_topic_reopened?: object;
+  general_forum_topic_hidden?: object;
+  general_forum_topic_unhidden?: object;
 }
 
 export interface TelegramCallbackQuery {
