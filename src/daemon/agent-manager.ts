@@ -12,6 +12,7 @@ import { TelegramPoller } from '../telegram/poller.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
+import { resolvePendingCallback } from '../telegram/pending-callback.js';
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
@@ -23,8 +24,16 @@ type LogFn = (msg: string) => void;
  * Manages all agents in a cortextOS instance.
  */
 export class AgentManager {
-  private agents: Map<string, { process: AgentProcess; checker: FastChecker; poller?: TelegramPoller; activityPoller?: TelegramPoller; telegramRejectCount?: number; telegramLastRejectAlertAt?: number }> = new Map();
+  private agents: Map<string, { process: AgentProcess; checker: FastChecker; poller?: TelegramPoller; activityPoller?: TelegramPoller; telegramRejectCount?: number; telegramLastRejectAlertAt?: number; topicId?: number; chatId?: string }> = new Map();
   private workers: Map<string, WorkerProcess> = new Map();
+  /**
+   * Forum-topic routing registry: "${chatId}:${topicId}" -> agentName.
+   * Built in a pre-pass over every enabled agent's .env BEFORE any poller
+   * starts (avoids a start-order race where the orchestrator's poller would
+   * resolve against a partial agent map). A duplicate (chatId, topicId)
+   * fails closed: both entries are dropped and a warning is logged.
+   */
+  private topicRegistry: Map<string, string> = new Map();
   /** Daemon-level cron scheduler registry: one CronScheduler per enabled agent. */
   private cronSchedulers: Map<string, CronScheduler> = new Map();
   // Tracks agents that received a start request while still stopping.
@@ -121,18 +130,26 @@ export class AgentManager {
     // re-discover and re-start any agent dir on disk regardless of user intent.
     const instanceEnabled = this.readInstanceEnableList();
 
-    for (const { name, dir, org, config } of agentDirs) {
-      // Per-agent config.json `enabled: false` (existing behavior, unchanged)
+    const willStart = agentDirs.filter(({ name, config }) => {
       if (config.enabled === false) {
         console.log(`[agent-manager] Skipping disabled agent: ${name} (per-agent config.json)`);
-        continue;
+        return false;
       }
-      // Instance-level enabled-agents.json `enabled: false` (BUG-028 fix)
       const entry = instanceEnabled[name];
       if (entry && entry.enabled === false) {
         console.log(`[agent-manager] Skipping disabled agent: ${name} (enabled-agents.json)`);
-        continue;
+        return false;
       }
+      return true;
+    });
+
+    // Pre-pass: build the forum-topic routing registry from every agent that
+    // WILL start, before starting any of them. This is race-free by
+    // construction — the orchestrator's poller (started inside startAgent)
+    // never resolves against a partial map.
+    this.buildTopicRegistry(willStart.map(({ name, dir }) => ({ name, dir })));
+
+    for (const { name, dir, org, config } of willStart) {
       // BUG-043 fix: pass the per-agent org so startAgent can use it instead
       // of falling back to `this.org` (the daemon's startup org).
       await this.startAgent(name, dir, config, org);
@@ -144,6 +161,60 @@ export class AgentManager {
     // are normal operation and should fire the real BUG-011 alarm if a
     // race ever does leak through PR #11's protection.
     this.clearDaemonCrashMarkers();
+  }
+
+  /**
+   * Read CHAT_ID + TOPIC_ID from an agent's .env. Returns undefined fields
+   * when absent. Single source of truth for topic config is the .env
+   * (consistent with BOT_TOKEN/CHAT_ID/ALLOWED_USER resolution).
+   */
+  private readTopicEnv(agentDir: string): { chatId?: string; topicId?: number } {
+    const envFile = join(agentDir, '.env');
+    if (!existsSync(envFile)) return {};
+    try {
+      const content = readFileSync(envFile, 'utf-8');
+      const chatId = content.match(/^CHAT_ID=(.+)$/m)?.[1]?.trim();
+      const topicRaw = content.match(/^TOPIC_ID=(.+)$/m)?.[1]?.trim();
+      const topicId = topicRaw && /^\d+$/.test(topicRaw) ? parseInt(topicRaw, 10) : undefined;
+      return { chatId: chatId || undefined, topicId };
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Build the forum-topic routing registry keyed by "${chatId}:${topicId}".
+   * Duplicate (chatId, topicId) across agents fails closed: BOTH owners are
+   * dropped and a warning logged, so an ambiguous topic never mis-routes.
+   */
+  private buildTopicRegistry(agents: Array<{ name: string; dir: string }>): void {
+    this.topicRegistry.clear();
+    const dupes = new Set<string>();
+    for (const { name, dir } of agents) {
+      const { chatId, topicId } = this.readTopicEnv(dir);
+      if (chatId === undefined || topicId === undefined) continue; // no topic = General owner, not mapped
+      const key = `${chatId}:${topicId}`;
+      if (this.topicRegistry.has(key) || dupes.has(key)) {
+        const prev = this.topicRegistry.get(key);
+        console.warn(`[agent-manager] Duplicate TOPIC_ID ${topicId} in chat ${chatId} (agents: ${prev ?? '?'} and ${name}) — both unmapped, fail closed.`);
+        this.topicRegistry.delete(key);
+        dupes.add(key);
+        continue;
+      }
+      this.topicRegistry.set(key, name);
+    }
+    console.log(`[agent-manager] Topic registry built: ${this.topicRegistry.size} topic(s) mapped.`);
+  }
+
+  /**
+   * Resolve the agent that owns a forum topic for a given chat.
+   *   - threadId undefined  -> null (General / DM: caller keeps the message)
+   *   - mapped (chatId,thread) -> owning agent name
+   *   - set but unmapped    -> null (caller falls back + warns)
+   */
+  resolveTopicOwner(chatId: string | number, threadId?: number): string | null {
+    if (threadId === undefined) return null;
+    return this.topicRegistry.get(`${chatId}:${threadId}`) ?? null;
   }
 
   /**
@@ -314,6 +385,7 @@ export class AgentManager {
     let chatId: string | undefined;
     let allowedUserId: string | undefined;
     let botToken: string | undefined;
+    let topicId: number | undefined;
 
     if (existsSync(agentEnvFile)) {
       // stripBom: Windows tooling writes .env with a UTF-8 BOM that breaks
@@ -326,6 +398,10 @@ export class AgentManager {
       botToken = botTokenMatch?.[1]?.trim();
       chatId = chatIdMatch?.[1]?.trim();
       allowedUserId = allowedUserMatch?.[1]?.trim() || undefined;
+      // Forum-topic id (single source of truth for this agent's topic).
+      // Unset = the agent owns the General topic / plain DM.
+      const topicRaw = envContent.match(/^TOPIC_ID=(.+)$/m)?.[1]?.trim();
+      topicId = topicRaw && /^\d+$/.test(topicRaw) ? parseInt(topicRaw, 10) : undefined;
 
       // Validate BOT_TOKEN format: must be numeric_id:alphanumeric_secret
       if (botToken && !/^\d+:[A-Za-z0-9_-]+$/.test(botToken)) {
@@ -374,12 +450,13 @@ export class AgentManager {
     // can emit sendChatAction directly from the JSONL stream. Has no effect for
     // claude-code / hermes runtimes — those still use fast-checker.
     if (telegramApi && chatId) {
-      agentProcess.setTelegramHandle(telegramApi, chatId);
+      agentProcess.setTelegramHandle(telegramApi, chatId, topicId);
     }
     const checker = new FastChecker(agentProcess, paths, this.frameworkRoot, {
       log,
       telegramApi,
       chatId,
+      topicId,
       // FastChecker only needs the first ID for its single-recipient typing
       // indicator / quick-checks. Multi-user is enforced by the gates above.
       allowedUserId: allowedUserId ? parseInt(allowedUserId.split(',')[0].trim(), 10) : undefined,
@@ -403,7 +480,7 @@ export class AgentManager {
       });
     }
 
-    this.agents.set(name, { process: agentProcess, checker });
+    this.agents.set(name, { process: agentProcess, checker, topicId, chatId });
 
     // Start agent
     await agentProcess.start();
@@ -486,16 +563,63 @@ export class AgentManager {
         const from = stripControlChars(msg.from?.first_name || msg.from?.username || 'Unknown');
         const msgChatId = msg.chat?.id;
         const effectiveChatId = msgChatId ?? chatId ?? '';
-        const stateDir = join(this.ctxRoot, 'state', name);
+
+        // Forum service messages (topic created/edited/closed/reopened, General
+        // hidden/unhidden) arrive on the ordinary `message` update carrying a
+        // message_thread_id but no human body. Filter them BEFORE routing —
+        // otherwise they inject as a blank prompt (and they fire during the
+        // migration's own topic-creation step). [Codex CB5]
+        if (
+          msg.forum_topic_created || msg.forum_topic_edited || msg.forum_topic_closed ||
+          msg.forum_topic_reopened || msg.general_forum_topic_hidden || msg.general_forum_topic_unhidden
+        ) {
+          log(`[topic-routing] ignoring forum service message (thread ${msg.message_thread_id ?? '?'})`);
+          return;
+        }
+
+        // Chat-scope guard: a forum topic id is only meaningful within its own
+        // chat. Never route on a thread id from a chat other than this agent's
+        // configured CHAT_ID — otherwise a foreign group's matching topic id
+        // could inject into an agent. [Codex CB1]
+        if (chatId !== undefined && String(msgChatId) !== String(chatId)) {
+          log(`[topic-routing] ignoring message from non-configured chat ${msgChatId} (expected ${chatId})`);
+          return;
+        }
+
+        // Resolve the topic owner. undefined thread = General → this (the
+        // polling orchestrator). A set-but-unmapped thread falls back to the
+        // orchestrator with a logged warning (single source of routing truth).
+        const threadId = msg.message_thread_id;
+        const resolvedOwner = this.resolveTopicOwner(effectiveChatId, threadId);
+        if (threadId !== undefined && resolvedOwner === null) {
+          log(`[topic-routing] unknown thread ${threadId} in chat ${effectiveChatId} → orchestrator fallback`);
+        }
+        const targetName = resolvedOwner ?? name;
+        // Route state/history/inbound-log under the OWNER agent identity so a
+        // routed specialist sees its own last-sent/history, and per-agent state
+        // dirs keep each topic's traffic isolated. [Codex CB4 / Claude C1]
+        const targetStateDir = join(this.ctxRoot, 'state', targetName);
+        const targetPaths = targetName === name ? paths : resolvePaths(targetName, this.instanceId, resolvedOrg);
+
+        // Single delivery decision point: inject into the owning agent's PTY,
+        // or queue to the orchestrator's own checker for General. Used by EVERY
+        // branch below (text, media-success, media-null, media-error) so no
+        // branch can silently self-queue a routed message. [Claude B3]
+        const deliver = (formatted: string): void => {
+          if (targetName !== name) {
+            const res = this.injectAgentDetailed(targetName, formatted);
+            if (!res.ok && res.code !== 'DEDUPED') {
+              log(`[topic-routing] inject to ${targetName} failed (${res.code}) → orchestrator fallback`);
+              if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+            }
+            return;
+          }
+          if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+        };
 
         // Persist the inbound message to JSONL AND emit a
-        // `message/telegram_received` bus event in one helper so
-        // experiment cycles and dashboards can count inbound traffic.
-        // Without the event, Rubi's v3 fleet measurement found 0
-        // inbound messages on a window where Eros replied to multiple
-        // agents — the JSONL had the data but it never reached the
-        // event log.
-        recordInboundTelegram(paths, this.ctxRoot, name, resolvedOrg, from, msg, log);
+        // `message/telegram_received` bus event — under the OWNER's identity.
+        recordInboundTelegram(targetPaths, this.ctxRoot, targetName, resolvedOrg, from, msg, log);
 
         // Check for media messages (photo, document, voice, audio, video, video_note)
         const isMedia = !!(msg.photo || msg.document || msg.voice || msg.audio || msg.video || msg.video_note);
@@ -506,8 +630,7 @@ export class AgentManager {
             if (!media) {
               log('Media processing returned null - falling back to text format');
               const text = stripControlChars(msg.caption || '');
-              const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
-              if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+              deliver(FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot, undefined, undefined, undefined, threadId));
               return;
             }
 
@@ -524,39 +647,34 @@ export class AgentManager {
             log(`[DEBUG] media.type=${media.type} image_path=${JSON.stringify(relImagePath)} file_path=${JSON.stringify(relFilePath)}`);
             let formatted: string;
             if (media.type === 'photo') {
-              formatted = FastChecker.formatTelegramPhotoMessage(from, effectiveChatId, media.text, relImagePath);
+              formatted = FastChecker.formatTelegramPhotoMessage(from, effectiveChatId, media.text, relImagePath, threadId);
             } else if (media.type === 'document') {
-              formatted = FastChecker.formatTelegramDocumentMessage(from, effectiveChatId, media.text, relFilePath, media.file_name!);
+              formatted = FastChecker.formatTelegramDocumentMessage(from, effectiveChatId, media.text, relFilePath, media.file_name!, threadId);
             } else if (media.type === 'voice' || media.type === 'audio') {
-              formatted = FastChecker.formatTelegramVoiceMessage(from, effectiveChatId, relFilePath, media.duration, media.transcript);
+              formatted = FastChecker.formatTelegramVoiceMessage(from, effectiveChatId, relFilePath, media.duration, media.transcript, threadId);
             } else {
               // video or video_note
-              formatted = FastChecker.formatTelegramVideoMessage(from, effectiveChatId, media.text, relFilePath, media.file_name || '', media.duration);
+              formatted = FastChecker.formatTelegramVideoMessage(from, effectiveChatId, media.text, relFilePath, media.file_name || '', media.duration, threadId);
             }
 
-            if (checker.isDuplicate(formatted)) {
-              log('Duplicate Telegram media message suppressed');
-              return;
-            }
             log(`Media message received: type=${media.type}, path=${media.image_path || media.file_path}`);
-            checker.queueTelegramMessage(formatted);
+            deliver(formatted);
           }).catch((err) => {
             log(`Media processing error: ${err} - falling back to text format`);
             const text = stripControlChars(msg.caption || '');
-            const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
-            if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+            deliver(FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot, undefined, undefined, undefined, threadId));
           });
           return;
         }
 
         // Text message (non-media)
         const text = stripControlChars(msg.text || '');
-        const lastSent = FastChecker.readLastSent(stateDir, effectiveChatId);
+        const lastSent = FastChecker.readLastSent(targetStateDir, effectiveChatId);
         // Build reply context from the replied-to message.
         const replyToText = buildReplyContext(msg.reply_to_message);
 
-        const recentHistory = buildRecentHistory(this.ctxRoot, name, effectiveChatId, 6) ?? undefined;
-        const formatted = FastChecker.formatTelegramTextMessage(
+        const recentHistory = buildRecentHistory(this.ctxRoot, targetName, effectiveChatId, 6) ?? undefined;
+        deliver(FastChecker.formatTelegramTextMessage(
           from,
           effectiveChatId,
           text,
@@ -564,19 +682,34 @@ export class AgentManager {
           replyToText,
           lastSent ?? undefined,
           recentHistory,
-        );
-
-        if (checker.isDuplicate(formatted)) {
-          log('Duplicate Telegram message suppressed');
-          return;
-        }
-        checker.queueTelegramMessage(formatted);
+          threadId,
+        ));
       });
 
       poller.onCallback((query) => {
-        // Route to fast-checker for hook response handling (perm_allow/deny, askopt, etc.)
-        // handleCallback writes hook-response files and edits Telegram messages
-        checker.handleCallback(query).catch(err => {
+        // Route the callback to the OWNING agent's checker so the hook-response
+        // file / PTY keystrokes land in the agent that posted the prompt — not
+        // always the polling orchestrator. [Codex CB5 / Claude C3]
+        //
+        // Resolution order:
+        //   1. topic thread (normal case: the button sits in the agent's topic)
+        //   2. pending-callback index by the unique id in callback_data
+        //      (covers the case where Telegram omits message_thread_id)
+        //   3. orchestrator fallback + warn — fail-safe: a mis-routed callback
+        //      writes a response file the wrong agent never reads (its prompt
+        //      times out), it never triggers a wrong action.
+        const cbChatId = query.message?.chat?.id ?? chatId ?? '';
+        const cbThread = query.message?.message_thread_id;
+        let owner = this.resolveTopicOwner(cbChatId, cbThread);
+        if (!owner) {
+          const id = (query.data || '').match(/^(?:perm|restart)_(?:allow|deny|continue)_([a-f0-9]+)$/)?.[1];
+          if (id) owner = resolvePendingCallback(this.ctxRoot, id);
+        }
+        const targetChecker = (owner && owner !== name) ? this.agents.get(owner)?.checker : checker;
+        if (!targetChecker) {
+          log(`[topic-routing] callback owner ${owner ?? '?'} not running → orchestrator fallback`);
+        }
+        (targetChecker ?? checker).handleCallback(query).catch(err => {
           log(`Callback handling error: ${err}`);
         });
       });
