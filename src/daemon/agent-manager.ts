@@ -49,6 +49,40 @@ export function decideCallbackRoute(params: {
 }
 
 /**
+ * True if the inbound message is a forum lifecycle SERVICE message
+ * (topic created/edited/closed/reopened, General hidden/unhidden). Strictly
+ * keyed on the service fields — NOT message_thread_id (present on every topic
+ * message) — so a real user message is never mistaken for a service event.
+ */
+export function isForumServiceMessage(msg: TelegramMessage): boolean {
+  return !!(
+    msg.forum_topic_created || msg.forum_topic_edited || msg.forum_topic_closed ||
+    msg.forum_topic_reopened || msg.general_forum_topic_hidden || msg.general_forum_topic_unhidden
+  );
+}
+
+/**
+ * Decide whether an inbound message must be dropped BEFORE the ALLOWED_USER
+ * gate / watchdog counter, returning the reason (or null to let the gate run).
+ *   - 'service'  : a forum lifecycle service message (e.g. createForumTopic) —
+ *                  has no human sender to gate; must not count as a reject.
+ *   - 'own-bot'  : authored by this agent's OWN bot (id from BOT_TOKEN). Its own
+ *                  topic-create service msgs were tripping the false "unsolicited
+ *                  contact" watchdog. Scoped to the OWN bot id only — a FOREIGN
+ *                  bot/user still hits the gate and still trips the watchdog.
+ * Returns null otherwise → the gate evaluates the sender normally.
+ */
+export function shouldSkipBeforeWatchdog(
+  msg: TelegramMessage,
+  ownBotId?: number,
+): 'service' | 'own-bot' | null {
+  if (isForumServiceMessage(msg)) return 'service';
+  // String/number-safe: ownBotId is parsed from the token; from.id is a number.
+  if (ownBotId !== undefined && msg.from?.id === ownBotId) return 'own-bot';
+  return null;
+}
+
+/**
  * Manages all agents in a cortextOS instance.
  */
 export class AgentManager {
@@ -62,6 +96,19 @@ export class AgentManager {
    * fails closed: both entries are dropped and a warning is logged.
    */
   private topicRegistry: Map<string, string> = new Map();
+  /**
+   * Per-group throttle for the on-demand topic refresh (chatId -> last refresh
+   * ms). Bounds disk reads when an unmapped thread arrives, so a flood of
+   * unknown threads can't storm the poller hot path.
+   */
+  private lastTopicRefresh: Map<string, number> = new Map();
+  /**
+   * Project label per "${chatId}:${topicId}" (from config.project_topics),
+   * kept in lockstep with topicRegistry + the on-demand refresh. onMessage
+   * reads the label from HERE, not the agent's start-time config closure, so a
+   * topic added after start gets its [project: ...] label without a restart.
+   */
+  private topicLabels: Map<string, string> = new Map();
   /** Daemon-level cron scheduler registry: one CronScheduler per enabled agent. */
   private cronSchedulers: Map<string, CronScheduler> = new Map();
   // Tracks agents that received a start request while still stopping.
@@ -217,6 +264,7 @@ export class AgentManager {
    */
   private buildTopicRegistry(agents: Array<{ name: string; dir: string; config?: AgentConfig }>): void {
     this.topicRegistry.clear();
+    this.topicLabels.clear();
     const dupes = new Set<string>();
     for (const { name, dir, config } of agents) {
       const { chatId, topicId } = this.readTopicEnv(dir);
@@ -226,9 +274,12 @@ export class AgentManager {
       // v2 per-agent-group: every project topic in this agent's own group →
       // this agent. Required so the agent's OWN topic callbacks resolve to self
       // (an unregistered topic would drop ask callbacks, fail-closed).
-      for (const k of Object.keys(config?.project_topics ?? {})) {
+      for (const [k, label] of Object.entries(config?.project_topics ?? {})) {
         const pt = /^\d+$/.test(k) ? parseInt(k, 10) : NaN;
-        if (Number.isFinite(pt)) this.registerTopicKey(name, chatId, pt, dupes);
+        if (Number.isFinite(pt)) {
+          this.registerTopicKey(name, chatId, pt, dupes);
+          this.topicLabels.set(`${chatId}:${pt}`, label);
+        }
       }
     }
     console.log(`[agent-manager] Topic registry built: ${this.topicRegistry.size} topic(s) mapped.`);
@@ -265,6 +316,40 @@ export class AgentManager {
   }
 
   /**
+   * On-demand, throttled, ADDITIVE topic refresh for a group whose owning agent
+   * is already RUNNING. Covers the one real gap: a project topic added to a
+   * running per-agent group's config.json AFTER the agent started isn't in the
+   * in-memory registry, so its messages fall back + miss the project label.
+   *
+   * Finds the running agent that owns this group `chatId` (each PAG group maps
+   * to exactly one agent via its entry's chatId), re-reads ONLY that agent's
+   * config.json from disk, and upserts its project_topics (additive — never a
+   * full registry rebuild). Throttled per-chat to bound disk reads. Returns
+   * true if a refresh ran (caller may retry resolveTopicOwner once).
+   *
+   * Does NOT help the not-yet-running case (an agent absent from this.agents) —
+   * that correctly falls back, since it cannot receive the message anyway.
+   */
+  private refreshTopicsForChat(chatId: string | number, nowMs: number): boolean {
+    const key = String(chatId);
+    if (nowMs - (this.lastTopicRefresh.get(key) ?? 0) < 5000) return false; // throttle
+    this.lastTopicRefresh.set(key, nowMs);
+    // Only refresh when EXACTLY ONE running agent owns this group (the PAG
+    // invariant). A legacy v1 shared-group can have multiple agents on one
+    // CHAT_ID — refreshing then could upsert the wrong agent's topics, so skip.
+    const owners = [...this.agents].filter(([, e]) => e.chatId !== undefined && String(e.chatId) === key);
+    if (owners.length !== 1) return false;
+    const [aname, entry] = owners[0];
+    try {
+      const cfg = this.loadAgentConfig(entry.process.getAgentDir()); // fresh read from disk
+      this.upsertTopicRegistry(aname, entry.chatId, entry.topicId, cfg);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Add/refresh a single agent's topic mapping. Used when an agent is started
    * dynamically (IPC enable / restart) AFTER the discoverAndStart pre-pass, so
    * its topic resolves immediately instead of falling back to the orchestrator
@@ -278,9 +363,12 @@ export class AgentManager {
     // second (e.g. when .env TOPIC_ID is also a project_topics key). [Codex CB1]
     const dupes = new Set<string>();
     if (topicId !== undefined) this.registerTopicKey(name, chatId, topicId, dupes);
-    for (const k of Object.keys(config?.project_topics ?? {})) {
+    for (const [k, label] of Object.entries(config?.project_topics ?? {})) {
       const pt = /^\d+$/.test(k) ? parseInt(k, 10) : NaN;
-      if (Number.isFinite(pt)) this.registerTopicKey(name, chatId, pt, dupes);
+      if (Number.isFinite(pt)) {
+        this.registerTopicKey(name, chatId, pt, dupes);
+        this.topicLabels.set(`${chatId}:${pt}`, label);
+      }
     }
   }
 
@@ -604,8 +692,23 @@ export class AgentManager {
 
       const REJECT_ALERT_THRESHOLD = 3;
       const REJECT_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+      // This agent's own bot user id (the numeric prefix of BOT_TOKEN). Used to
+      // exclude the agent's OWN messages (e.g. createForumTopic service msgs)
+      // from the ALLOWED_USER watchdog counter. Foreign senders still counted.
+      const ownBotId = botToken ? Number(botToken.split(':')[0]) : undefined;
 
       poller.onMessage((msg) => {
+        // Pre-gate filter: forum service messages + this agent's OWN bot's
+        // messages are dropped BEFORE the ALLOWED_USER gate so they never count
+        // toward the "unsolicited contact" watchdog. (Bot-authored topic-create
+        // service msgs were tripping a false alarm.) A FOREIGN sender still
+        // falls through to the gate below and still trips the watchdog.
+        const preSkip = shouldSkipBeforeWatchdog(msg, ownBotId);
+        if (preSkip) {
+          log(`[topic-routing] dropped ${preSkip} message (thread ${msg.message_thread_id ?? '?'}) — not counted by watchdog`);
+          return;
+        }
+
         // ALLOWED_USER gate: comma-separated list of numeric user IDs.
         // If configured, ignore messages from other users. Always log the
         // rejected user_id + name so operators can discover IDs to whitelist.
@@ -644,18 +747,8 @@ export class AgentManager {
         const msgChatId = msg.chat?.id;
         const effectiveChatId = msgChatId ?? chatId ?? '';
 
-        // Forum service messages (topic created/edited/closed/reopened, General
-        // hidden/unhidden) arrive on the ordinary `message` update carrying a
-        // message_thread_id but no human body. Filter them BEFORE routing —
-        // otherwise they inject as a blank prompt (and they fire during the
-        // migration's own topic-creation step). [Codex CB5]
-        if (
-          msg.forum_topic_created || msg.forum_topic_edited || msg.forum_topic_closed ||
-          msg.forum_topic_reopened || msg.general_forum_topic_hidden || msg.general_forum_topic_unhidden
-        ) {
-          log(`[topic-routing] ignoring forum service message (thread ${msg.message_thread_id ?? '?'})`);
-          return;
-        }
+        // (Forum service messages are already dropped by the pre-gate filter
+        // above, before the watchdog — see shouldSkipBeforeWatchdog.)
 
         // Chat-scope guard: a forum topic id is only meaningful within its own
         // chat. Never route on a thread id from a chat other than this agent's
@@ -666,13 +759,23 @@ export class AgentManager {
           return;
         }
 
-        // Resolve the topic owner. undefined thread = General → this (the
-        // polling orchestrator). A set-but-unmapped thread falls back to the
-        // orchestrator with a logged warning (single source of routing truth).
+        // Resolve the topic owner. undefined thread = General → this agent.
         const threadId = msg.message_thread_id;
-        const resolvedOwner = this.resolveTopicOwner(effectiveChatId, threadId);
+        let resolvedOwner = this.resolveTopicOwner(effectiveChatId, threadId);
         if (threadId !== undefined && resolvedOwner === null) {
-          log(`[topic-routing] unknown thread ${threadId} in chat ${effectiveChatId} → orchestrator fallback`);
+          // A topic added to a RUNNING group's config.json after the agent
+          // started won't be in the registry yet. Try one throttled, additive,
+          // disk-backed refresh for this group's owner, then re-resolve.
+          if (this.refreshTopicsForChat(effectiveChatId, Date.now())) {
+            resolvedOwner = this.resolveTopicOwner(effectiveChatId, threadId);
+          }
+          if (resolvedOwner === null) {
+            // Still unmapped: deliver to this agent (its own group / General).
+            // This is correct-by-design — an unmapped thread in the agent's own
+            // group still belongs to it; it just lacks a project label. Logged
+            // at info, NOT as an error (it self-heals once config is reloaded).
+            log(`[topic-routing] thread ${threadId} in chat ${effectiveChatId} not yet in project map — handling under ${name} (no project label)`);
+          }
         }
         const targetName = resolvedOwner ?? name;
         // Route state/history/inbound-log under the OWNER agent identity so a
@@ -761,8 +864,10 @@ export class AgentManager {
         const replyToText = buildReplyContext(msg.reply_to_message);
 
         const recentHistory = buildRecentHistory(this.ctxRoot, targetName, effectiveChatId, 6, threadId) ?? undefined;
-        // PAG: label the project topic from this agent's own config map.
-        const projectLabel = threadId !== undefined ? config?.project_topics?.[String(threadId)] : undefined;
+        // PAG: label the project topic from the manager-level label map (kept in
+        // lockstep with the registry + the on-demand refresh), NOT the agent's
+        // start-time config closure — so a topic added after start is labelled. [Codex CB1]
+        const projectLabel = threadId !== undefined ? this.topicLabels.get(`${effectiveChatId}:${threadId}`) : undefined;
         deliver(FastChecker.formatTelegramTextMessage(
           from,
           effectiveChatId,
@@ -826,6 +931,12 @@ export class AgentManager {
       });
 
       poller.onReaction((reaction) => {
+        // Don't count this agent's OWN bot's reactions toward the watchdog
+        // (symmetry with the message pre-gate filter). A foreign reactor still
+        // hits the gate below.
+        if (ownBotId !== undefined && reaction.user?.id === ownBotId) {
+          return;
+        }
         // ALLOWED_USER gate: same multi-user rule as message handler.
         if (allowedUserId) {
           const allowedIds = allowedUserId.split(',').map((s) => parseInt(s.trim(), 10));
