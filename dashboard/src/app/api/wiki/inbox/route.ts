@@ -5,6 +5,7 @@ import {
   getVaultRoot,
   parseFrontmatter,
   firstMeaningfulLine,
+  safeVaultDir,
 } from '@/lib/vault';
 
 export const dynamic = 'force-dynamic';
@@ -18,13 +19,15 @@ export async function GET(req: NextRequest) {
     return Response.json({ error: `Vault not found for org "${org}"` }, { status: 404 });
   }
 
-  const inboxDir = path.join(vaultRoot, '00-inbox');
-  if (!fs.existsSync(inboxDir)) {
+  // Realpath-contain the inbox dir (reject if it's a symlink escaping the vault).
+  const inboxDir = safeVaultDir(vaultRoot, '00-inbox');
+  if (!inboxDir || !fs.existsSync(inboxDir)) {
     return Response.json({ vaultRoot, items: [] });
   }
 
   const items = [];
   for (const entry of fs.readdirSync(inboxDir, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) continue;
     if (!entry.isFile()) continue;
     if (!entry.name.endsWith('.md')) continue;
     if (entry.name.startsWith('.')) continue;

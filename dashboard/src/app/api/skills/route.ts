@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { getFrameworkRoot } from '@/lib/config';
+import { assertSafeName, assertSafeOrg, assertContainedWithin } from '@/lib/path-safety';
 
 export const dynamic = 'force-dynamic';
 
@@ -90,16 +91,29 @@ export async function POST(request: Request) {
     if (!slug || !org || !agent) {
       return Response.json({ error: 'slug, org, and agent required' }, { status: 400 });
     }
+    let s: string, o: string, a: string;
+    try { s = assertSafeName(slug); o = assertSafeOrg(org); a = assertSafeName(agent); }
+    catch { return Response.json({ error: 'Invalid slug/org/agent' }, { status: 400 }); }
 
     const frameworkRoot = getFrameworkRoot();
-    const catalogDir = path.join(frameworkRoot, 'skills', slug);
+    const orgsRoot = path.join(frameworkRoot, 'orgs');
+    const catalogDir = assertContainedWithin(path.join(frameworkRoot, 'skills'), s);
     if (!fs.existsSync(catalogDir)) {
-      return Response.json({ error: `Skill not found: ${slug}` }, { status: 404 });
+      return Response.json({ error: `Skill not found: ${s}` }, { status: 404 });
     }
 
-    const skillsDir = path.join(frameworkRoot, 'orgs', org, 'agents', agent, 'skills');
-    fs.mkdirSync(skillsDir, { recursive: true });
-    const linkPath = path.join(skillsDir, slug);
+    // Contain against the FIXED orgs root (not skillsDir, which could itself be a
+    // planted symlink escaping the tree) BEFORE mkdir/link.
+    let skillsDir: string, linkPath: string;
+    try {
+      // Contain the PARENT skills dir (catches a symlinked skills/agent/org).
+      // The leaf is a validated [a-z0-9_-] slug joined plainly — do NOT
+      // assertContainedWithin the leaf itself: the installed skill IS a symlink
+      // (→ frameworkRoot/skills), so realpathing it would wrongly reject.
+      skillsDir = assertContainedWithin(orgsRoot, path.join(o, 'agents', a, 'skills'));
+      fs.mkdirSync(skillsDir, { recursive: true });
+      linkPath = path.join(skillsDir, s);
+    } catch { return Response.json({ error: 'Forbidden' }, { status: 403 }); }
 
     try { if (fs.lstatSync(linkPath).isSymbolicLink()) fs.unlinkSync(linkPath); } catch { /* doesn't exist */ }
     fs.symlinkSync(catalogDir, linkPath, 'dir');
@@ -117,16 +131,26 @@ export async function DELETE(request: Request) {
     if (!slug || !org || !agent) {
       return Response.json({ error: 'slug, org, and agent required' }, { status: 400 });
     }
+    let s: string, o: string, a: string;
+    try { s = assertSafeName(slug); o = assertSafeOrg(org); a = assertSafeName(agent); }
+    catch { return Response.json({ error: 'Invalid slug/org/agent' }, { status: 400 }); }
 
     const frameworkRoot = getFrameworkRoot();
-    const linkPath = path.join(frameworkRoot, 'orgs', org, 'agents', agent, 'skills', slug);
+    // Contain the PARENT skills dir against the FIXED orgs root (catches a
+    // planted symlinked skills/agent/org); leaf joined plainly — the installed
+    // skill IS a symlink, so don't realpath the leaf.
+    let linkPath: string;
+    try {
+      const skillsDir = assertContainedWithin(path.join(frameworkRoot, 'orgs'), path.join(o, 'agents', a, 'skills'));
+      linkPath = path.join(skillsDir, s);
+    } catch { return Response.json({ error: 'Forbidden' }, { status: 403 }); }
 
     try {
       const stat = fs.lstatSync(linkPath);
       if (stat.isSymbolicLink()) fs.unlinkSync(linkPath);
       else if (stat.isDirectory()) fs.rmSync(linkPath, { recursive: true });
     } catch {
-      return Response.json({ error: `Skill not installed: ${slug}` }, { status: 404 });
+      return Response.json({ error: `Skill not installed: ${s}` }, { status: 404 });
     }
 
     return Response.json({ success: true });

@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import fs from 'fs/promises';
 import path from 'path';
 import { getAgentPaths } from '@/lib/data/agents';
+import { assertSafeName, assertSafeOrg, assertContainedWithin } from '@/lib/path-safety';
 
 export const dynamic = 'force-dynamic';
 
@@ -15,20 +16,27 @@ export async function GET(
   { params }: { params: Promise<{ name: string }> },
 ) {
   const { name } = await params;
-  const decoded = decodeURIComponent(name);
+  let decoded: string;
+  try { decoded = assertSafeName(name); }
+  catch { return Response.json({ error: 'Invalid agent name' }, { status: 400 }); }
 
   const { searchParams } = request.nextUrl;
   const logType = searchParams.get('type') ?? 'activity';
   const lines = Math.min(Number(searchParams.get('lines') ?? '500'), 5000);
 
-  // Validate log type to prevent directory traversal
-  if (!/^[\w.-]+$/.test(logType)) {
+  // Validate log type to prevent directory traversal (reject `..` too — the
+  // [\w.-] class would otherwise allow it, though no separator is present).
+  if (!/^[\w.-]+$/.test(logType) || logType.includes('..')) {
     return Response.json({ error: 'Invalid log type' }, { status: 400 });
   }
 
-  const org = searchParams.get('org') || undefined;
+  let org: string | undefined;
+  try { org = searchParams.get('org') ? assertSafeOrg(searchParams.get('org')!) : undefined; }
+  catch { return Response.json({ error: 'Invalid org' }, { status: 400 }); }
   const paths = getAgentPaths(decoded, org);
-  const logFile = path.join(paths.logsDir, `${logType}.log`);
+  let logFile: string;
+  try { logFile = assertContainedWithin(paths.logsDir, `${logType}.log`); }
+  catch { return Response.json({ error: 'Forbidden' }, { status: 403 }); }
 
   try {
     const content = await fs.readFile(logFile, 'utf-8');

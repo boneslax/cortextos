@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { NextRequest } from 'next/server';
-import { getVaultRoot, PARA_DIRS } from '@/lib/vault';
+import { getVaultRoot, PARA_DIRS, safeVaultDir } from '@/lib/vault';
 
 export const dynamic = 'force-dynamic';
 
@@ -30,9 +30,11 @@ export async function GET(req: NextRequest) {
 
   const root: TreeNode[] = [];
   for (const dir of PARA_DIRS) {
-    const abs = path.join(vaultRoot, dir);
-    if (!fs.existsSync(abs)) continue;
-    if (!fs.statSync(abs).isDirectory()) continue;
+    // Realpath-contain (reject a symlinked PARA dir escaping the vault) and use
+    // lstatSync so a symlink isn't followed before walking.
+    const abs = safeVaultDir(vaultRoot, dir);
+    if (!abs || !fs.existsSync(abs)) continue;
+    if (!fs.lstatSync(abs).isDirectory()) continue;
 
     root.push({
       kind: 'dir',
@@ -56,6 +58,7 @@ function walkDir(
 
   for (const entry of entries) {
     if (entry.name.startsWith('.')) continue;
+    if (entry.isSymbolicLink()) continue; // never follow a symlinked entry out of the vault
     const childAbs = path.join(abs, entry.name);
     const relPath = path.relative(vaultRoot, childAbs);
 
