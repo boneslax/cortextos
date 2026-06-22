@@ -106,9 +106,13 @@ export async function POST(request: Request) {
     // planted symlink escaping the tree) BEFORE mkdir/link.
     let skillsDir: string, linkPath: string;
     try {
+      // Contain the PARENT skills dir (catches a symlinked skills/agent/org).
+      // The leaf is a validated [a-z0-9_-] slug joined plainly — do NOT
+      // assertContainedWithin the leaf itself: the installed skill IS a symlink
+      // (→ frameworkRoot/skills), so realpathing it would wrongly reject.
       skillsDir = assertContainedWithin(orgsRoot, path.join(o, 'agents', a, 'skills'));
       fs.mkdirSync(skillsDir, { recursive: true });
-      linkPath = assertContainedWithin(orgsRoot, path.join(o, 'agents', a, 'skills', s));
+      linkPath = path.join(skillsDir, s);
     } catch { return Response.json({ error: 'Forbidden' }, { status: 403 }); }
 
     try { if (fs.lstatSync(linkPath).isSymbolicLink()) fs.unlinkSync(linkPath); } catch { /* doesn't exist */ }
@@ -132,18 +136,21 @@ export async function DELETE(request: Request) {
     catch { return Response.json({ error: 'Invalid slug/org/agent' }, { status: 400 }); }
 
     const frameworkRoot = getFrameworkRoot();
-    // Contain against the FIXED orgs root (a planted symlinked skills/agent/org
-    // dir would escape if we trusted skillsDir as the base).
+    // Contain the PARENT skills dir against the FIXED orgs root (catches a
+    // planted symlinked skills/agent/org); leaf joined plainly — the installed
+    // skill IS a symlink, so don't realpath the leaf.
     let linkPath: string;
-    try { linkPath = assertContainedWithin(path.join(frameworkRoot, 'orgs'), path.join(o, 'agents', a, 'skills', s)); }
-    catch { return Response.json({ error: 'Forbidden' }, { status: 403 }); }
+    try {
+      const skillsDir = assertContainedWithin(path.join(frameworkRoot, 'orgs'), path.join(o, 'agents', a, 'skills'));
+      linkPath = path.join(skillsDir, s);
+    } catch { return Response.json({ error: 'Forbidden' }, { status: 403 }); }
 
     try {
       const stat = fs.lstatSync(linkPath);
       if (stat.isSymbolicLink()) fs.unlinkSync(linkPath);
       else if (stat.isDirectory()) fs.rmSync(linkPath, { recursive: true });
     } catch {
-      return Response.json({ error: `Skill not installed: ${slug}` }, { status: 404 });
+      return Response.json({ error: `Skill not installed: ${s}` }, { status: 404 });
     }
 
     return Response.json({ success: true });

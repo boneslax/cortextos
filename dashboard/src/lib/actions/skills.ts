@@ -163,12 +163,13 @@ export async function installSkill(
       return { success: false, error: `Agent not found: ${agent} in org ${org}` };
     }
 
-    // Contain against the FIXED orgs root before mkdir/link (a symlinked skills
-    // dir would escape if skillsDir itself were trusted as the base).
+    // Contain the PARENT skills dir against the FIXED orgs root before mkdir/link
+    // (a symlinked skills dir would escape if skillsDir itself were the base).
+    // Leaf joined plainly — the installed skill IS a symlink; don't realpath it.
     const skillsDir = assertContainedWithin(orgsRoot, path.join(org, 'agents', agent, 'skills'));
     fs.mkdirSync(skillsDir, { recursive: true });
 
-    const linkPath = assertContainedWithin(orgsRoot, path.join(org, 'agents', agent, 'skills', slug));
+    const linkPath = path.join(skillsDir, slug);
 
     // Remove existing link/dir if present
     try {
@@ -198,7 +199,9 @@ export async function uninstallSkill(
     try { slug = assertSafeName(slug); org = assertSafeOrg(org); agent = assertSafeName(agent); }
     catch { return { success: false, error: 'Invalid slug/org/agent' }; }
 
-    const linkPath = assertContainedWithin(path.join(getFrameworkRoot(), 'orgs'), path.join(org, 'agents', agent, 'skills', slug));
+    // Contain PARENT skills dir; leaf joined plainly (installed skill is a symlink).
+    const skillsDir = assertContainedWithin(path.join(getFrameworkRoot(), 'orgs'), path.join(org, 'agents', agent, 'skills'));
+    const linkPath = path.join(skillsDir, slug);
 
     try {
       const stat = fs.lstatSync(linkPath);

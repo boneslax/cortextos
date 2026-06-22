@@ -8,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { CTX_FRAMEWORK_ROOT } from './config';
+import { assertContainedWithin } from './path-safety';
 
 export const PARA_DIRS = [
   '00-inbox',
@@ -128,10 +129,14 @@ export function resolveVaultPath(
   const top = cleaned.split('/')[0];
   if (!PARA_DIRS.includes(top as ParaDir)) return null;
 
-  const abs = path.resolve(vaultRoot, cleaned);
-  // Defense in depth — confirm resolved path is inside the vault root
-  if (!abs.startsWith(path.resolve(vaultRoot) + path.sep)) return null;
-  return abs;
+  try {
+    // Realpath-contained against the vault root: rejects a symlink inside a
+    // PARA dir that points outside the vault (statSync/readFileSync follow
+    // symlinks, so a string-only startsWith check was insufficient).
+    return assertContainedWithin(vaultRoot, cleaned);
+  } catch {
+    return null;
+  }
 }
 
 /**

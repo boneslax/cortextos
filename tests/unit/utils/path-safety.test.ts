@@ -71,4 +71,15 @@ describe('assertContainedWithin', () => {
     expect(() => assertContainedWithin(base, 'link/secret')).toThrow();
     rmSync(root, { recursive: true, force: true });
   });
+  it('rejects a LEAF that is itself a symlink escaping (why F6 callers contain the PARENT, not the leaf)', () => {
+    // The realpath-walk follows the leaf too, so a skill linkPath (legitimately
+    // a symlink → catalog) must NOT be passed as the target; callers contain the
+    // parent skills dir and join the validated leaf plainly.
+    const root = mkdtempSync(join(tmpdir(), 'pc-'));
+    const base = join(root, 'base'); mkdirSync(base);
+    const outside = join(root, 'outside'); mkdirSync(outside);
+    symlinkSync(outside, join(base, 'leaf'), 'dir');
+    expect(() => assertContainedWithin(base, 'leaf')).toThrow();
+    rmSync(root, { recursive: true, force: true });
+  });
 });
