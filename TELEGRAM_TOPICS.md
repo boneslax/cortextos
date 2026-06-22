@@ -80,3 +80,83 @@ formatters. **Live inbound topic routing, callback unblocking, and the
 service-message filter are NOT auto-tested** — they need the live forum group
 above and are covered by the manual smoke checklist, pending the throwaway-group
 run.
+
+---
+
+# v2 — One Group Per Agent (per-agent-group mode)
+
+v1 above puts the whole fleet in ONE group (topic per agent, one shared bot, the
+orchestrator polls). **v2** generalizes it to Bones's settled model:
+
+- **Solo DM stays exactly as-is** (the orchestrator / command line). Never moves.
+- **One Telegram group per agent** = that agent's workspace.
+- **Topics inside an agent's group = that agent's projects** (Dev group → a topic
+  per app; Sales group → a topic per deal).
+- **Each agent owns + polls its own group**, via **its own bot** (bot-per-agent).
+
+## How it works (v2)
+- Each agent's `.env`: its own `BOT_TOKEN` (a distinct BotFather bot), its group's
+  negative `CHAT_ID`, `ALLOWED_USER`, and `TOPIC_ID` = its **default/standup
+  topic** (where proactive sends + permission/plan/ask prompts land). Polling on.
+- `config.json` `project_topics`: `{ "<topicId>": "<project label>", ... }` — every
+  project topic in the agent's group. This registers each topic to the agent (so
+  its own callbacks resolve to self, never dropped) and labels inbound messages
+  `[project: <label>]`.
+- Inbound message in topic X → injected to the agent with the project label; the
+  agent replies with `--thread X` (round-trips into the same topic). Proactive /
+  cron / status sends → the default `TOPIC_ID` topic.
+- Per-(chat,topic) last-sent + recent-history keep each project's conversation
+  isolated. The orchestrator's solo DM is byte-identical to today.
+
+## Bot model
+**One bot per agent.** Telegram allows one `getUpdates` holder per token, and each
+agent runs its own poller, so each needs its own token. Trade-off vs a shared bot
+with a central router: per-agent bots reuse the existing per-agent poller (zero new
+infra) and isolate blast radius; cost is N BotFather bots + N tokens.
+
+## Migration runbook (Bones, per agent — bots can't create groups)
+For EACH agent in the cabinet:
+1. **Create a bot** in @BotFather (one per agent); copy its token.
+2. **Create a forum supergroup** for the agent → enable **Topics**.
+3. **Add that agent's bot** to its group (member + send). **Disable BotFather
+   privacy** for the bot (`/setprivacy` → Disable) — mandatory.
+4. Create one topic per project; capture each `topic_id` (link trailing number =
+   message_thread_id). Pick one as the **default/standup** topic.
+5. Capture the group's negative `CHAT_ID`.
+6. Wire the agent's `.env`: its `BOT_TOKEN`, `CHAT_ID=<neg group>`,
+   `ALLOWED_USER=<Bones id>`, `TOPIC_ID=<default topic>`, polling on. Set
+   `config.json.project_topics` = every `(topicId → label)`.
+7. **Never enable a specialist's polling while it still shares the v1 bot token** —
+   N pollers on one token 409-conflict. Each agent needs its OWN token first.
+8. Validate the group `CHAT_ID` with that agent's bot, restart the daemon, run the
+   smoke checklist.
+The orchestrator's DM `.env` is untouched.
+
+## Manual smoke checklist (v2, per agent — live)
+- [ ] A message in agent A's group reaches A (not any other agent / the orchestrator).
+- [ ] A message in topic X carries `[project: <label>]` and the reply round-trips into topic X.
+- [ ] A permission/ask button in the agent's group unblocks THAT agent (response file in its state dir), never another agent.
+- [ ] Creating a topic injects no blank message; a foreign chat doesn't route.
+- [ ] Two project topics in one group don't bleed each other's history/last-sent.
+- [ ] Proactive/cron sends land in the default topic, not an arbitrary one.
+- [ ] Solo DM still works exactly as before.
+
+## Coverage boundary (honest)
+Unit + Codex 3-round + GLM gate the code: registry per-topic registration,
+thread-aware state isolation, project labelling, callback fail-safe (reused from
+v1), DM/v1 byte-compat. **Live per-agent-group routing — each agent polling its own
+real group, callbacks, the service-message filter — is NOT auto-tested** (needs N
+real forum groups + N bots + Bones's Telegram). Covered by the checklist above,
+pending the groups Bones provisions; driven with Bones after provisioning.
+
+## Known boundaries (v2)
+- Interactive hook prompts (permission/plan/ask) land in the agent's **default**
+  topic, not necessarily the originating project topic — carrying the live inbound
+  topic into a separate hook process is deferred. Inbound *replies* DO thread the
+  originating topic.
+- Media messages in a project topic are not yet labelled `[project:]` (text is);
+  minor, deferred.
+- Reactions self-route to the group-owning agent (no per-topic reaction routing) —
+  acceptable: a reaction is a no-action notification.
+- Dynamic project-topic add needs a daemon reload (registry is built at start /
+  agent-start); no runtime add yet.

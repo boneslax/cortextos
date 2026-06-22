@@ -209,6 +209,25 @@ export interface AgentConfig {
    * poller will be skipped regardless.
    */
   telegram_polling?: boolean;
+  /**
+   * Per-agent-group (v2) mode. Maps each forum topic id (as a string key) in
+   * THIS agent's own group to a project/workstream label. Presence of this map
+   * puts the agent in per-agent-group mode: it polls its own group (own bot +
+   * negative CHAT_ID), every listed topic is registered to this agent (so its
+   * own callbacks resolve to self, never dropped), and an inbound message in
+   * topic X is injected with a `[project: <label>]` context line.
+   *
+   * Distinct from v1 single-group mode (one shared bot, orchestrator routes to
+   * many agents by topic). Absent → v1/DM behavior unchanged.
+   *
+   * The agent's `.env TOPIC_ID` doubles as its DEFAULT/proactive topic: inbound
+   * replies thread the incoming topic via `--thread` (v1 reply symmetry), while
+   * proactive sends (cron/status/typing/hook prompts) go to `.env TOPIC_ID` —
+   * which for a PAG agent should be its "standup"/general project topic, NOT an
+   * arbitrary one. Single source of truth for "which topic"; project_topics is
+   * only the routing + label map.
+   */
+  project_topics?: Record<string, string>;
 }
 
 export interface CronEntry {
