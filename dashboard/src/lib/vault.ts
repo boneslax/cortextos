@@ -149,11 +149,20 @@ export function listAllNotes(vaultRoot: string): Array<{
 }> {
   const out: Array<{ relPath: string; absPath: string; mtimeMs: number }> = [];
   for (const dir of PARA_DIRS) {
-    const abs = path.join(vaultRoot, dir);
-    if (!fs.existsSync(abs)) continue;
+    const abs = safeVaultDir(vaultRoot, dir);
+    if (!abs || !fs.existsSync(abs)) continue;
     walk(abs, vaultRoot, out);
   }
   return out;
+}
+
+/**
+ * Realpath-contain a top-level vault dir. Returns the abs path, or null if the
+ * dir is a symlink escaping the vault (readdir/stat would otherwise follow it).
+ */
+export function safeVaultDir(vaultRoot: string, relDir: string): string | null {
+  try { return assertContainedWithin(vaultRoot, relDir); }
+  catch { return null; }
 }
 
 function walk(
@@ -163,6 +172,7 @@ function walk(
 ) {
   for (const entry of fs.readdirSync(abs, { withFileTypes: true })) {
     if (entry.name.startsWith('.')) continue;
+    if (entry.isSymbolicLink()) continue; // never follow a symlinked note/subdir out of the vault
     const child = path.join(abs, entry.name);
     if (entry.isDirectory()) {
       walk(child, vaultRoot, out);
