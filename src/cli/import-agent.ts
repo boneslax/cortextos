@@ -4,7 +4,7 @@ import { join, basename } from 'path';
 import { homedir, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { x as tarExtract } from 'tar';
-import { validateAgentName, assertSafeOrgSegment } from '../utils/validate.js';
+import { validateAgentName, assertSafeOrgSegment, validateInstanceId } from '../utils/validate.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { resolvePaths } from '../utils/paths.js';
 
@@ -44,8 +44,11 @@ export const importAgentCommand = new Command('import-agent')
     // an unvalidated --org would traverse out of orgs/).
     try {
       assertSafeOrgSegment(org);
+      // --instance is joined into ~/.cortextos/<instance>/config/... for both
+      // state-copy AND registration — validate it so it can't traverse.
+      validateInstanceId(options.instance);
     } catch {
-      console.error(`\n  Invalid org "${org}". Allowed: letters, numbers, hyphens, underscores.\n`);
+      console.error(`\n  Invalid org "${org}" or instance "${options.instance}". Allowed: letters, numbers, hyphens, underscores.\n`);
       process.exit(1);
     }
 

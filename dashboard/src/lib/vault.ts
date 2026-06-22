@@ -8,7 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { CTX_FRAMEWORK_ROOT } from './config';
-import { assertContainedWithin } from './path-safety';
+import { assertContainedWithin, assertSafeOrg } from './path-safety';
 
 export const PARA_DIRS = [
   '00-inbox',
@@ -26,6 +26,10 @@ const VAULT_FALLBACK = process.env.CTX_VAULT_PATH
   ?? path.join(os.homedir(), 'storage', 'Documents', 'Github', 'sondres-orchestrator', 'vault');
 
 export function getVaultRoot(org: string): string | null {
+  // Validate org centrally — search/inbox/tree pass the raw query param here,
+  // and an unvalidated `org` traverses out of orgs/ (e.g. ../) to read another
+  // vault. Invalid → null (callers already 404 on null).
+  try { org = assertSafeOrg(org); } catch { return null; }
   // 1. Try parsing orgs/<org>/knowledge.md for an "Obsidian vault" path entry
   const knowledgePath = path.join(CTX_FRAMEWORK_ROOT, 'orgs', org, 'knowledge.md');
   if (fs.existsSync(knowledgePath)) {
