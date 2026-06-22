@@ -127,7 +127,7 @@ describe('AgentProcess codex-app-server runtime', () => {
     ap.setTelegramHandle(api as any, '12345');
     await ap.start();
 
-    expect(mockCodexAppServerPty.setTelegramHandle).toHaveBeenCalledWith(api, '12345');
+    expect(mockCodexAppServerPty.setTelegramHandle).toHaveBeenCalledWith(api, '12345', undefined);
   });
 
   it('sends back-online Telegram directly from daemon on fresh start (issue #392)', async () => {
@@ -138,7 +138,7 @@ describe('AgentProcess codex-app-server runtime', () => {
     ap.setTelegramHandle(api as any, '12345');
     await ap.start();
 
-    expect(sendMessage).toHaveBeenCalledWith('12345', 'Agent codex-app-agent is back online');
+    expect(sendMessage).toHaveBeenCalledWith('12345', 'Agent codex-app-agent is back online', undefined, { messageThreadId: undefined });
   });
 
   it('skips back-online Telegram on handoff restart (issue #392)', async () => {

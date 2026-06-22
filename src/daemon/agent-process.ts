@@ -64,6 +64,7 @@ export class AgentProcess {
   // (each start() recreates the PTY, but the Telegram handle persists).
   private telegramApi: TelegramAPI | null = null;
   private telegramChatId: string | null = null;
+  private telegramTopicId: number | undefined = undefined;
   // Issue #392: tracks whether the most recently built startup prompt consumed
   // a handoff doc marker. start() reads this after spawn to decide whether the
   // daemon should fire the codex-app-server back-online Telegram directly
@@ -139,7 +140,7 @@ export class AgentProcess {
     // creates a fresh CodexAppServerPTY). Only CodexAppServerPTY uses this — Claude / Hermes
     // typing indicators flow through fast-checker.
     if (this.config.runtime === 'codex-app-server' && this.telegramApi && this.telegramChatId) {
-      (this.pty as CodexAppServerPTY).setTelegramHandle(this.telegramApi, this.telegramChatId);
+      (this.pty as CodexAppServerPTY).setTelegramHandle(this.telegramApi, this.telegramChatId, this.telegramTopicId);
     }
 
     // BUG-011 fix: create a fresh exit signal for this run. resolveExit is
@@ -388,11 +389,12 @@ export class AgentProcess {
    * fire sendChatAction directly from the JSONL stream. Safe to call before
    * or after start() — the handle is re-applied on every PTY (re)spawn.
    */
-  setTelegramHandle(api: TelegramAPI, chatId: string): void {
+  setTelegramHandle(api: TelegramAPI, chatId: string, topicId?: number): void {
     this.telegramApi = api;
     this.telegramChatId = chatId;
+    this.telegramTopicId = topicId;
     if (this.config.runtime === 'codex-app-server' && this.pty) {
-      (this.pty as CodexAppServerPTY).setTelegramHandle(api, chatId);
+      (this.pty as CodexAppServerPTY).setTelegramHandle(api, chatId, topicId);
     }
   }
 
@@ -819,7 +821,7 @@ export class AgentProcess {
     if (this.lastSpawnWasHandoff) return;
     if (!this.telegramApi || !this.telegramChatId) return;
     this.telegramApi
-      .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`)
+      .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`, undefined, { messageThreadId: this.telegramTopicId })
       .catch(() => { /* non-fatal: notification is observability only */ });
   }
 

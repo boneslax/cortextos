@@ -6,6 +6,7 @@
  */
 
 import { TelegramAPI } from '../telegram/api';
+import { recordPendingCallback } from '../telegram/pending-callback';
 import {
   readStdin,
   parseHookInput,
@@ -92,6 +93,7 @@ async function main(): Promise<void> {
   const uniqueId = generateId();
   mkdirSync(env.stateDir, { recursive: true });
   const responseFile = join(env.stateDir, `hook-response-${uniqueId}.json`);
+  recordPendingCallback(env.ctxRoot, uniqueId, env.agentName);
 
   // Register cleanup
   const cleanup = () => cleanupResponseFile(responseFile);
@@ -104,7 +106,7 @@ async function main(): Promise<void> {
   const api = new TelegramAPI(env.botToken);
 
   try {
-    await api.sendMessage(env.chatId, messageText, keyboard);
+    await api.sendMessage(env.chatId, messageText, keyboard, { messageThreadId: env.topicId });
   } catch {
     // If send fails, auto-approve so agent isn't blocked
     outputDecision('allow');
@@ -133,6 +135,8 @@ async function main(): Promise<void> {
       await api.sendMessage(
         env.chatId,
         `Plan review TIMED OUT (auto-approved): ${env.agentName}`,
+        undefined,
+        { messageThreadId: env.topicId },
       );
     } catch {
       // Ignore notification failure

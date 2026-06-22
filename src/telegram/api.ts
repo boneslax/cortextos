@@ -196,6 +196,12 @@ export class TelegramAPI {
     opts?: {
       parseMode?: 'HTML' | null;
       onParseFallback?: (reason: string) => void;
+      /**
+       * Forum-topic thread id. When set, the message posts into that topic of
+       * a forum supergroup. Omitted (undefined) → no message_thread_id key →
+       * payload is byte-identical to the pre-topics DM/General behavior.
+       */
+      messageThreadId?: number;
     },
   ): Promise<any> {
     const plainText = opts?.parseMode === null;
@@ -214,6 +220,7 @@ export class TelegramAPI {
         chunk,
         plainText ? null : 'HTML',
         isLastChunk ? replyMarkup : undefined,
+        opts?.messageThreadId,
       );
     }
     return lastResult;
@@ -227,11 +234,13 @@ export class TelegramAPI {
     text: string,
     parseMode: 'HTML' | null,
     replyMarkup: object | undefined,
+    messageThreadId?: number,
   ): Promise<any> {
     const basePayload: Record<string, unknown> = {
       chat_id: chatId,
       text,
       ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      ...(messageThreadId !== undefined ? { message_thread_id: messageThreadId } : {}),
     };
 
     const payload =
@@ -267,6 +276,7 @@ export class TelegramAPI {
     imagePath: string,
     caption?: string,
     replyMarkup?: object,
+    messageThreadId?: number,
   ): Promise<any> {
     if (!existsSync(imagePath)) {
       throw new Error(`Image file not found: ${imagePath}`);
@@ -280,6 +290,9 @@ export class TelegramAPI {
     // Build multipart form data using built-in FormData + Blob
     const formData = new FormData();
     formData.append('chat_id', String(chatId));
+    if (messageThreadId !== undefined) {
+      formData.append('message_thread_id', String(messageThreadId));
+    }
     formData.append('photo', new Blob([fileData]), fileName);
     if (caption) {
       formData.append('caption', caption);
@@ -319,6 +332,7 @@ export class TelegramAPI {
     filePath: string,
     caption?: string,
     replyMarkup?: object,
+    messageThreadId?: number,
   ): Promise<any> {
     if (!existsSync(filePath)) {
       throw new Error(`File not found: ${filePath}`);
@@ -331,6 +345,9 @@ export class TelegramAPI {
 
     const formData = new FormData();
     formData.append('chat_id', String(chatId));
+    if (messageThreadId !== undefined) {
+      formData.append('message_thread_id', String(messageThreadId));
+    }
     formData.append('document', new Blob([fileData]), fileName);
     if (caption) {
       formData.append('caption', caption);
@@ -574,10 +591,11 @@ export class TelegramAPI {
   /**
    * Send typing indicator.
    */
-  async sendChatAction(chatId: string | number, action: string = 'typing'): Promise<any> {
+  async sendChatAction(chatId: string | number, action: string = 'typing', messageThreadId?: number): Promise<any> {
     return this.post('sendChatAction', {
       chat_id: chatId,
       action,
+      ...(messageThreadId !== undefined ? { message_thread_id: messageThreadId } : {}),
     });
   }
 

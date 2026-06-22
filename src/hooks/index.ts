@@ -42,6 +42,7 @@ export function parseHookInput(input: string): { tool_name: string; tool_input: 
 export function loadEnv(): {
   botToken?: string;
   chatId?: string;
+  topicId?: number;
   agentName: string;
   stateDir: string;
   ctxRoot: string;
@@ -79,9 +80,13 @@ export function loadEnv(): {
     }
   }
 
+  const topicRaw = process.env.TOPIC_ID;
+  const topicId = topicRaw && /^\d+$/.test(topicRaw.trim()) ? parseInt(topicRaw.trim(), 10) : undefined;
+
   return {
     botToken: process.env.BOT_TOKEN,
     chatId: process.env.CHAT_ID,
+    topicId,
     agentName,
     stateDir,
     ctxRoot,

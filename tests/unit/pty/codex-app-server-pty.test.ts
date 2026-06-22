@@ -901,7 +901,7 @@ describe('CodexAppServerPTY event handling', () => {
       method: 'item/agentMessage/delta',
       params: { delta: 'hello' },
     });
-    expect(api.sendChatAction).toHaveBeenCalledWith('12345', 'typing');
+    expect(api.sendChatAction).toHaveBeenCalledWith('12345', 'typing', undefined);
     expect(pty.getOutputBuffer().getRecent()).toContain('hello');
   });
 

@@ -291,7 +291,7 @@ describe('FastChecker', () => {
 
       await sendTyping(api, '12345');
       expect(api.sendChatAction).toHaveBeenCalledTimes(1);
-      expect(api.sendChatAction).toHaveBeenCalledWith('12345', 'typing');
+      expect(api.sendChatAction).toHaveBeenCalledWith('12345', 'typing', undefined);
 
       // Immediate second call should be rate-limited
       await sendTyping(api, '12345');
