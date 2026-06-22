@@ -170,14 +170,6 @@ export function lastSentFileName(chatId: string | number, threadId?: number): st
 
 /**
  * Build a short recent conversation snippet for context injection.
- * Reads the last cputime         unlimited
-filesize        unlimited
-datasize        unlimited
-stacksize       7MB
-
-
-/**
- * Build a short recent conversation snippet for context injection.
  * Reads the last `limit` messages (combined inbound + outbound) for the
  * given agent/chatId, sorts by timestamp, and returns a formatted string.
  * Returns null if no history is available.
