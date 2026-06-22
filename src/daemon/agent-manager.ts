@@ -175,7 +175,7 @@ export class AgentManager {
     // WILL start, before starting any of them. This is race-free by
     // construction — the orchestrator's poller (started inside startAgent)
     // never resolves against a partial map.
-    this.buildTopicRegistry(willStart.map(({ name, dir }) => ({ name, dir })));
+    this.buildTopicRegistry(willStart.map(({ name, dir, config }) => ({ name, dir, config })));
 
     for (const { name, dir, org, config } of willStart) {
       // BUG-043 fix: pass the per-agent org so startAgent can use it instead
@@ -215,23 +215,42 @@ export class AgentManager {
    * Duplicate (chatId, topicId) across agents fails closed: BOTH owners are
    * dropped and a warning logged, so an ambiguous topic never mis-routes.
    */
-  private buildTopicRegistry(agents: Array<{ name: string; dir: string }>): void {
+  private buildTopicRegistry(agents: Array<{ name: string; dir: string; config?: AgentConfig }>): void {
     this.topicRegistry.clear();
     const dupes = new Set<string>();
-    for (const { name, dir } of agents) {
+    for (const { name, dir, config } of agents) {
       const { chatId, topicId } = this.readTopicEnv(dir);
-      if (chatId === undefined || topicId === undefined) continue; // no topic = General owner, not mapped
-      const key = `${chatId}:${topicId}`;
-      if (this.topicRegistry.has(key) || dupes.has(key)) {
-        const prev = this.topicRegistry.get(key);
-        console.warn(`[agent-manager] Duplicate TOPIC_ID ${topicId} in chat ${chatId} (agents: ${prev ?? '?'} and ${name}) — both unmapped, fail closed.`);
-        this.topicRegistry.delete(key);
-        dupes.add(key);
-        continue;
+      if (chatId === undefined) continue; // no group/chat → nothing to map
+      // v1 single-group: one .env TOPIC_ID per agent.
+      if (topicId !== undefined) this.registerTopicKey(name, chatId, topicId, dupes);
+      // v2 per-agent-group: every project topic in this agent's own group →
+      // this agent. Required so the agent's OWN topic callbacks resolve to self
+      // (an unregistered topic would drop ask callbacks, fail-closed).
+      for (const k of Object.keys(config?.project_topics ?? {})) {
+        const pt = /^\d+$/.test(k) ? parseInt(k, 10) : NaN;
+        if (Number.isFinite(pt)) this.registerTopicKey(name, chatId, pt, dupes);
       }
-      this.topicRegistry.set(key, name);
     }
     console.log(`[agent-manager] Topic registry built: ${this.topicRegistry.size} topic(s) mapped.`);
+  }
+
+  /**
+   * Register one (chatId, topicId) → agent mapping with duplicate fail-closed:
+   * a conflicting owner drops BOTH entries so an ambiguous topic never routes.
+   */
+  private registerTopicKey(name: string, chatId: string, topicId: number, dupes?: Set<string>): void {
+    const key = `${chatId}:${topicId}`;
+    if (dupes?.has(key)) return; // already poisoned by a cross-owner collision
+    const existing = this.topicRegistry.get(key);
+    if (existing === name) return; // same agent re-registering (e.g. .env TOPIC_ID also in project_topics) — idempotent
+    if (existing !== undefined) {
+      // A DIFFERENT agent already claims this (chat, topic) — ambiguous; fail closed.
+      console.warn(`[agent-manager] Duplicate topic ${topicId} in chat ${chatId} (${existing} vs ${name}) — both unmapped, fail closed.`);
+      this.topicRegistry.delete(key);
+      dupes?.add(key);
+      return;
+    }
+    this.topicRegistry.set(key, name);
   }
 
   /**
@@ -251,16 +270,18 @@ export class AgentManager {
    * its topic resolves immediately instead of falling back to the orchestrator
    * until the next daemon restart. Conflicting (chatId,topicId) fails closed.
    */
-  private upsertTopicRegistry(name: string, chatId?: string, topicId?: number): void {
-    if (!chatId || topicId === undefined) return;
-    const key = `${chatId}:${topicId}`;
-    const existing = this.topicRegistry.get(key);
-    if (existing && existing !== name) {
-      console.warn(`[agent-manager] Duplicate TOPIC_ID ${topicId} in chat ${chatId} (${existing} vs ${name}) — both unmapped, fail closed.`);
-      this.topicRegistry.delete(key);
-      return;
+  private upsertTopicRegistry(name: string, chatId?: string, topicId?: number, config?: AgentConfig): void {
+    if (!chatId) return;
+    // Share ONE dupes set across this agent's TOPIC_ID + project_topics calls so
+    // a cross-owner collision stays poisoned for the whole upsert. Without it, a
+    // collision deleted in the first call would be silently re-added by the
+    // second (e.g. when .env TOPIC_ID is also a project_topics key). [Codex CB1]
+    const dupes = new Set<string>();
+    if (topicId !== undefined) this.registerTopicKey(name, chatId, topicId, dupes);
+    for (const k of Object.keys(config?.project_topics ?? {})) {
+      const pt = /^\d+$/.test(k) ? parseInt(k, 10) : NaN;
+      if (Number.isFinite(pt)) this.registerTopicKey(name, chatId, pt, dupes);
     }
-    this.topicRegistry.set(key, name);
   }
 
   /** Drop any topic mapping owned by `name` (on stop/disable). */
@@ -539,7 +560,7 @@ export class AgentManager {
     this.agents.set(name, { process: agentProcess, checker, topicId, chatId });
     // Keep the topic registry current for agents started after the
     // discoverAndStart pre-pass (IPC enable / restart). [Codex R1 #3]
-    this.upsertTopicRegistry(name, chatId, topicId);
+    this.upsertTopicRegistry(name, chatId, topicId, config);
 
     // Start agent
     await agentProcess.start();
@@ -735,11 +756,13 @@ export class AgentManager {
 
         // Text message (non-media)
         const text = stripControlChars(msg.text || '');
-        const lastSent = FastChecker.readLastSent(targetStateDir, effectiveChatId);
+        const lastSent = FastChecker.readLastSent(targetStateDir, effectiveChatId, threadId);
         // Build reply context from the replied-to message.
         const replyToText = buildReplyContext(msg.reply_to_message);
 
-        const recentHistory = buildRecentHistory(this.ctxRoot, targetName, effectiveChatId, 6) ?? undefined;
+        const recentHistory = buildRecentHistory(this.ctxRoot, targetName, effectiveChatId, 6, threadId) ?? undefined;
+        // PAG: label the project topic from this agent's own config map.
+        const projectLabel = threadId !== undefined ? config?.project_topics?.[String(threadId)] : undefined;
         deliver(FastChecker.formatTelegramTextMessage(
           from,
           effectiveChatId,
@@ -749,6 +772,7 @@ export class AgentManager {
           lastSent ?? undefined,
           recentHistory,
           threadId,
+          projectLabel,
         ));
       });
 
