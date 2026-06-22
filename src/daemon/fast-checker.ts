@@ -252,12 +252,19 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
     lastSentText?: string,
     recentHistory?: string,
     threadId?: number,
+    projectLabel?: string,
   ): string {
     // Every externally-influenced field below is untrusted (the sender controls
     // text/display-name; reply-context, last-sent and recent-history are built
     // from prior external messages). Sanitize each so none can escape the fence
     // or forge a containment header. Unfenced context fields (reply/history) are
     // the weakest surface — they sit raw in [Replying to: "..."] / [Recent ...].
+    // projectLabel comes from the agent's own config.project_topics — trusted,
+    // but sanitize anyway (defense-in-depth against a malformed config).
+    let projectCx = '';
+    if (projectLabel) {
+      projectCx = `[project: ${sanitizeForPtyInjection(projectLabel.slice(0, 100))}]\n`;
+    }
     let replyCx = '';
     if (replyToText) {
       replyCx = `[Replying to: "${sanitizeForPtyInjection(replyToText.slice(0, 500))}"]\n`;
@@ -284,7 +291,7 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
       ? sanitizeForPtyInjection(text).trim()
       : wrapFenceSafe(text);
     return `=== TELEGRAM from [USER: ${sanitizeForPtyInjection(from)}] (chat_id:${chatId}) ===
-${replyCx}${historyCx}${body}
+${projectCx}${replyCx}${historyCx}${body}
 ${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${threadId !== undefined ? ` --thread ${threadId}` : ''}
 
 `;
@@ -450,8 +457,10 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${threadId !== 
    * Read the last-sent message file for conversation context.
    * Returns the content (up to 500 chars) or null if not available.
    */
-  static readLastSent(stateDir: string, chatId: string | number): string | null {
-    const filePath = join(stateDir, `last-telegram-${chatId}.txt`);
+  static readLastSent(stateDir: string, chatId: string | number, threadId?: number): string | null {
+    // Filename convention MUST match logging.ts lastSentFileName (per-(chat,topic)
+    // when a thread is present; bare-chat for DM/v1).
+    const filePath = join(stateDir, `last-telegram-${chatId}${threadId !== undefined ? `-t${threadId}` : ''}.txt`);
     try {
       if (!existsSync(filePath)) return null;
       const content = readFileSync(filePath, 'utf-8');

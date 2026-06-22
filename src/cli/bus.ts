@@ -1020,8 +1020,8 @@ busCommand
       if (env.agentName && env.ctxRoot) {
         logOutboundMessage(env.ctxRoot, env.agentName, chatId, message, sentMessageId, {
           parseMode: opts.plainText ? 'none' : 'html',
-        });
-        cacheLastSent(env.ctxRoot, env.agentName, chatId, message);
+        }, threadId);
+        cacheLastSent(env.ctxRoot, env.agentName, chatId, message, threadId);
         // Auto-emit activity event so dashboard sees every Telegram send,
         // even from agents that never call log-event directly.
         try {

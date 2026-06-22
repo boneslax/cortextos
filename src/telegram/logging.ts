@@ -33,6 +33,7 @@ export function logOutboundMessage(
   text: string,
   messageId: number,
   metadata?: OutboundLogMetadata,
+  threadId?: number,
 ): void {
   const logDir = join(ctxRoot, 'logs', agentName);
   mkdirSync(logDir, { recursive: true });
@@ -41,6 +42,9 @@ export function logOutboundMessage(
   // stays unchanged for callers that pass nothing (backwards compat).
   const meta: Record<string, unknown> = {};
   if (metadata?.parseMode !== undefined) meta.parse_mode = metadata.parseMode;
+  // thread_id recorded only when present (DM/v1 lines unchanged); lets
+  // buildRecentHistory isolate per-project-topic conversation context.
+  if (threadId !== undefined) meta.thread_id = threadId;
 
   const entry = JSON.stringify({
     timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
@@ -100,6 +104,9 @@ export function recordInboundTelegram(
     from: msg.from?.id,
     from_name: fromName,
     chat_id: msg.chat?.id,
+    // Record the forum topic so per-project history can be isolated. Absent
+    // for DM/General → unchanged log shape.
+    ...(msg.message_thread_id !== undefined ? { thread_id: msg.message_thread_id } : {}),
     text,
     timestamp: new Date().toISOString(),
   });
@@ -128,25 +135,37 @@ export function cacheLastSent(
   agentName: string,
   chatId: string | number,
   text: string,
+  threadId?: number,
 ): void {
   const stateDir = join(ctxRoot, 'state', agentName);
   mkdirSync(stateDir, { recursive: true });
-  writeFileSync(join(stateDir, `last-telegram-${chatId}.txt`), text, 'utf-8');
+  writeFileSync(join(stateDir, lastSentFileName(chatId, threadId)), text, 'utf-8');
 }
 
 /**
- * Read the last-sent text for a given chat, or null if not cached.
+ * Read the last-sent text for a given chat (+ optional forum topic), or null.
  */
 export function readLastSent(
   ctxRoot: string,
   agentName: string,
   chatId: string | number,
+  threadId?: number,
 ): string | null {
-  const filePath = join(ctxRoot, 'state', agentName, `last-telegram-${chatId}.txt`);
+  const filePath = join(ctxRoot, 'state', agentName, lastSentFileName(chatId, threadId));
   if (!existsSync(filePath)) {
     return null;
   }
   return readFileSync(filePath, 'utf-8');
+}
+
+/**
+ * Last-sent cache filename. Per (chat, topic) when a thread is present so two
+ * project topics in the same group don't overwrite each other's "your last
+ * message" context; bare-chat (DM/v1) filename is unchanged. MUST match
+ * FastChecker.readLastSent's filename convention.
+ */
+export function lastSentFileName(chatId: string | number, threadId?: number): string {
+  return `last-telegram-${chatId}${threadId !== undefined ? `-t${threadId}` : ''}.txt`;
 }
 
 /**
@@ -168,6 +187,7 @@ export function buildRecentHistory(
   agentName: string,
   chatId: string | number,
   limit: number = 6,
+  threadId?: number,
 ): string | null {
   const logDir = join(ctxRoot, 'logs', agentName);
   const inboundPath = join(logDir, 'inbound-messages.jsonl');
@@ -188,6 +208,14 @@ export function buildRecentHistory(
         try {
           const obj = JSON.parse(line);
           if (String(obj.chat_id) !== chatIdStr) continue;
+          // Isolate per-project-topic history: when a thread is requested, only
+          // entries from that thread; when none (DM/v1), only thread-less
+          // entries so a group's topic chatter never bleeds into the DM view.
+          if (threadId !== undefined) {
+            if (obj.thread_id !== threadId) continue;
+          } else if (obj.thread_id !== undefined) {
+            continue;
+          }
           const text = (obj.text || '').trim();
           if (!text) continue;
           entries.push({ ts: obj.timestamp || obj.archived_at || '', speaker, text });
