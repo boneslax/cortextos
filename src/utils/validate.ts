@@ -1,7 +1,7 @@
 import type { Priority, EventCategory, EventSeverity, ApprovalCategory } from '../types/index.js';
 import { VALID_PRIORITIES } from '../types/index.js';
 import { resolve as pathResolve, sep as pathSep, dirname as pathDirname } from 'path';
-import { existsSync, realpathSync } from 'fs';
+import { realpathSync } from 'fs';
 
 const AGENT_NAME_REGEX = /^[a-z0-9_-]+$/;
 // Org segments may preserve framework casing (e.g. AcmeCorp) — getOrgs() does
@@ -61,15 +61,31 @@ export function assertContainedWithin(baseDir: string, target: string): string {
   if (resolved !== base && !resolved.startsWith(base + pathSep)) {
     throw new Error(`Path escapes base: ${target}`);
   }
-  // Symlink defense: realpath the deepest EXISTING ancestor of resolved.
-  const realBase = existsSync(base) ? realpathSync(base) : base;
-  let probe = resolved;
-  while (!existsSync(probe) && probe !== pathDirname(probe)) probe = pathDirname(probe);
-  const realProbe = existsSync(probe) ? realpathSync(probe) : probe;
+  // Symlink defense via realpath of the deepest EXISTING ancestor. Use a
+  // realpath-walk (no existsSync→realpath gap — that was a TOCTOU race): the
+  // non-existing suffix can't be a symlink, so resolving the deepest existing
+  // prefix is sufficient. `baseDir` MUST be a FIXED trusted root (callers pass
+  // frameworkRoot/orgs, never an attacker-reachable dir) so a symlinked
+  // intermediate (e.g. a planted `skills -> /outside`) is caught here.
+  const realBase = realpathDeepest(base);
+  const realProbe = realpathDeepest(resolved);
   if (realProbe !== realBase && !realProbe.startsWith(realBase + pathSep)) {
     throw new Error(`Path escapes base via symlink: ${target}`);
   }
   return resolved;
+}
+
+/** realpath the deepest EXISTING ancestor of `p` (walks up on ENOENT). */
+function realpathDeepest(p: string): string {
+  let cur = p;
+  for (;;) {
+    try { return realpathSync(cur); }
+    catch {
+      const parent = pathDirname(cur);
+      if (parent === cur) return cur;
+      cur = parent;
+    }
+  }
 }
 // Task IDs are generated as `task_<epoch>_<rand>` (lowercase). Allow lowercase
 // letters, digits, underscores and hyphens — matching the generator and the

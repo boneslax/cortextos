@@ -96,18 +96,20 @@ export async function POST(request: Request) {
     catch { return Response.json({ error: 'Invalid slug/org/agent' }, { status: 400 }); }
 
     const frameworkRoot = getFrameworkRoot();
+    const orgsRoot = path.join(frameworkRoot, 'orgs');
     const catalogDir = assertContainedWithin(path.join(frameworkRoot, 'skills'), s);
     if (!fs.existsSync(catalogDir)) {
       return Response.json({ error: `Skill not found: ${s}` }, { status: 404 });
     }
 
-    const skillsDir = path.join(frameworkRoot, 'orgs', o, 'agents', a, 'skills');
-    fs.mkdirSync(skillsDir, { recursive: true });
-    // Containment-assert (symlink-safe) the link path before linking — defeats a
-    // pre-existing symlinked parent escaping the agent's skills dir.
-    let linkPath: string;
-    try { linkPath = assertContainedWithin(skillsDir, s); }
-    catch { return Response.json({ error: 'Forbidden' }, { status: 403 }); }
+    // Contain against the FIXED orgs root (not skillsDir, which could itself be a
+    // planted symlink escaping the tree) BEFORE mkdir/link.
+    let skillsDir: string, linkPath: string;
+    try {
+      skillsDir = assertContainedWithin(orgsRoot, path.join(o, 'agents', a, 'skills'));
+      fs.mkdirSync(skillsDir, { recursive: true });
+      linkPath = assertContainedWithin(orgsRoot, path.join(o, 'agents', a, 'skills', s));
+    } catch { return Response.json({ error: 'Forbidden' }, { status: 403 }); }
 
     try { if (fs.lstatSync(linkPath).isSymbolicLink()) fs.unlinkSync(linkPath); } catch { /* doesn't exist */ }
     fs.symlinkSync(catalogDir, linkPath, 'dir');
@@ -130,9 +132,10 @@ export async function DELETE(request: Request) {
     catch { return Response.json({ error: 'Invalid slug/org/agent' }, { status: 400 }); }
 
     const frameworkRoot = getFrameworkRoot();
-    const skillsDir = path.join(frameworkRoot, 'orgs', o, 'agents', a, 'skills');
+    // Contain against the FIXED orgs root (a planted symlinked skills/agent/org
+    // dir would escape if we trusted skillsDir as the base).
     let linkPath: string;
-    try { linkPath = assertContainedWithin(skillsDir, s); }
+    try { linkPath = assertContainedWithin(path.join(frameworkRoot, 'orgs'), path.join(o, 'agents', a, 'skills', s)); }
     catch { return Response.json({ error: 'Forbidden' }, { status: 403 }); }
 
     try {

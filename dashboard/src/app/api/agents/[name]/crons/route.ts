@@ -65,10 +65,11 @@ export async function PUT(
   { params }: { params: Promise<{ name: string }> },
 ) {
   const { name } = await params;
-  const decoded = decodeURIComponent(name);
 
   try {
     const { agentDir, org } = resolveAgent(name);
+    // Validated form for the bus-recipient lookup below (no second raw decode).
+    const decoded = assertSafeName(name);
     const configPath = path.join(agentDir, 'config.json');
     const raw = await fs.readFile(configPath, 'utf-8');
     const config: AgentConfig = JSON.parse(raw);

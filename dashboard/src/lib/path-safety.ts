@@ -54,12 +54,26 @@ export function assertContainedWithin(baseDir: string, target: string): string {
   if (resolved !== base && !resolved.startsWith(base + path.sep)) {
     throw new PathSafetyError(`Path escapes base`);
   }
-  const realBase = fs.existsSync(base) ? fs.realpathSync(base) : base;
-  let probe = resolved;
-  while (!fs.existsSync(probe) && probe !== path.dirname(probe)) probe = path.dirname(probe);
-  const realProbe = fs.existsSync(probe) ? fs.realpathSync(probe) : probe;
+  // realpath-walk (no existsSync→realpath TOCTOU). baseDir MUST be a FIXED
+  // trusted root so a symlinked intermediate (planted skills -> /outside) is
+  // caught — callers pass frameworkRoot/orgs, never the attacker-reachable dir.
+  const realBase = realpathDeepest(base);
+  const realProbe = realpathDeepest(resolved);
   if (realProbe !== realBase && !realProbe.startsWith(realBase + path.sep)) {
     throw new PathSafetyError(`Path escapes base via symlink`);
   }
   return resolved;
+}
+
+/** realpath the deepest EXISTING ancestor of `p` (walks up on ENOENT). */
+function realpathDeepest(p: string): string {
+  let cur = p;
+  for (;;) {
+    try { return fs.realpathSync(cur); }
+    catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return cur;
+      cur = parent;
+    }
+  }
 }
