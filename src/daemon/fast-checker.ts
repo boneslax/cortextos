@@ -8,6 +8,7 @@ import { checkInbox, ackInbox } from '../bus/message.js';
 import { updateApproval } from '../bus/approval.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
+import { clearPendingCallback } from '../telegram/pending-callback.js';
 import { KEYS } from '../pty/inject.js';
 import { stripControlChars, sanitizeForPtyInjection, wrapFenceSafe } from '../utils/validate.js';
 
@@ -34,6 +35,10 @@ export class FastChecker {
   private telegramApi?: TelegramAPI;
   private chatId?: string;
   private allowedUserId?: number;
+  // Forum-topic id this agent owns (from .env TOPIC_ID). When set, the agent's
+  // proactive sends (typing indicator, AskUserQuestion prompts) target this
+  // topic instead of General. Unset = General / DM.
+  private topicId?: number;
 
   // External Telegram handler (set by daemon)
   private telegramMessages: Array<{ formatted: string; ackIds: string[] }> = [];
@@ -63,7 +68,7 @@ export class FastChecker {
     agent: AgentProcess,
     paths: BusPaths,
     frameworkRoot: string,
-    options: { pollInterval?: number; log?: LogFn; telegramApi?: TelegramAPI; chatId?: string; allowedUserId?: number } = {},
+    options: { pollInterval?: number; log?: LogFn; telegramApi?: TelegramAPI; chatId?: string; allowedUserId?: number; topicId?: number } = {},
   ) {
     this.agent = agent;
     this.paths = paths;
@@ -73,6 +78,7 @@ export class FastChecker {
     this.telegramApi = options.telegramApi;
     this.chatId = options.chatId;
     this.allowedUserId = options.allowedUserId;
+    this.topicId = options.topicId;
 
     // Initialize persistent dedup
     this.dedupFilePath = join(paths.stateDir, '.message-dedup-hashes');
@@ -245,6 +251,7 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
     replyToText?: string,
     lastSentText?: string,
     recentHistory?: string,
+    threadId?: number,
   ): string {
     // Every externally-influenced field below is untrusted (the sender controls
     // text/display-name; reply-context, last-sent and recent-history are built
@@ -278,7 +285,7 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
       : wrapFenceSafe(text);
     return `=== TELEGRAM from [USER: ${sanitizeForPtyInjection(from)}] (chat_id:${chatId}) ===
 ${replyCx}${historyCx}${body}
-${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${threadId !== undefined ? ` --thread ${threadId}` : ''}
 
 `;
   }
@@ -323,12 +330,13 @@ ${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     chatId: string | number,
     caption: string,
     imagePath: string,
+    threadId?: number,
   ): string {
     return `=== TELEGRAM PHOTO from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
 caption:
 ${wrapFenceSafe(caption)}
 local_file: ${imagePath}
-Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${threadId !== undefined ? ` --thread ${threadId}` : ''}
 
 `;
   }
@@ -343,13 +351,14 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     caption: string,
     filePath: string,
     fileName: string,
+    threadId?: number,
   ): string {
     return `=== TELEGRAM DOCUMENT from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
 caption:
 ${wrapFenceSafe(caption)}
 local_file: ${filePath}
 file_name: ${sanitizeForPtyInjection(fileName)}
-Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${threadId !== undefined ? ` --thread ${threadId}` : ''}
 
 `;
   }
@@ -369,6 +378,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     filePath: string,
     duration: number | undefined,
     transcript?: string,
+    threadId?: number,
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
     const transcriptBlock = transcript && transcript.trim()
@@ -377,7 +387,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     return `=== TELEGRAM VOICE from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
 duration: ${dur}s
 local_file: ${filePath}
-${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${threadId !== undefined ? ` --thread ${threadId}` : ''}
 
 `;
   }
@@ -393,6 +403,7 @@ ${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your repl
     filePath: string,
     fileName: string,
     duration: number | undefined,
+    threadId?: number,
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
     return `=== TELEGRAM VIDEO from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
@@ -401,7 +412,7 @@ ${wrapFenceSafe(caption)}
 duration: ${dur}s
 local_file: ${filePath}
 file_name: ${sanitizeForPtyInjection(fileName)}
-Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${threadId !== undefined ? ` --thread ${threadId}` : ''}
 
 `;
   }
@@ -427,7 +438,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     const now = Date.now();
     if (now - this.typingLastSent >= 4000) {
       try {
-        await api.sendChatAction(chatId, 'typing');
+        await api.sendChatAction(chatId, 'typing', this.topicId);
       } catch {
         // Ignore typing indicator failures (matches bash: || true)
       }
@@ -579,6 +590,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       const hookDecision = decision === 'continue' ? 'deny' : decision;
       const responseFile = join(this.paths.stateDir, `hook-response-${hexId}.json`);
       writeFileSync(responseFile, JSON.stringify({ decision: hookDecision }) + '\n', 'utf-8');
+      clearPendingCallback(this.paths.ctxRoot, hexId);
 
       if (this.telegramApi) {
         try { await this.telegramApi.answerCallbackQuery(callbackQueryId, 'Got it'); } catch { /* ignore */ }
@@ -597,6 +609,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       const [, decision, hexId] = restartMatch;
       const responseFile = join(this.paths.stateDir, `restart-response-${hexId}.json`);
       writeFileSync(responseFile, JSON.stringify({ decision }) + '\n', 'utf-8');
+      clearPendingCallback(this.paths.ctxRoot, hexId);
 
       if (this.telegramApi) {
         try { await this.telegramApi.answerCallbackQuery(callbackQueryId, 'Got it'); } catch { /* ignore */ }
@@ -855,7 +868,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         }]);
       }
 
-      await this.telegramApi.sendMessage(this.chatId, msg, { inline_keyboard: keyboard });
+      await this.telegramApi.sendMessage(this.chatId, msg, { inline_keyboard: keyboard }, { messageThreadId: this.topicId });
       this.log(`Sent question ${questionIdx + 1}/${totalQ} to Telegram`);
     } catch (err) {
       this.log(`sendNextQuestion error: ${err}`);
@@ -1044,7 +1057,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       const msg = `Context circuit breaker TRIPPED for ${this.agent.name}: 3 restarts in 15min. Watchdog paused 30min. Check logs/${this.agent.name}/restarts.log for details.`;
       this.log(msg);
       if (this.telegramApi && this.chatId) {
-        this.telegramApi.sendMessage(this.chatId, msg).catch(() => {});
+        this.telegramApi.sendMessage(this.chatId, msg, undefined, { messageThreadId: this.topicId }).catch(() => {});
       }
       return;
     }

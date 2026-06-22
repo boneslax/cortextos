@@ -955,7 +955,8 @@ busCommand
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean }) => {
+  .option('--thread <id>', 'Forum-topic thread id (message_thread_id). Posts into that topic of a forum supergroup. Overrides TOPIC_ID from the agent .env / env. Omit for a plain DM / General-topic post.')
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean; thread?: string }) => {
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
@@ -963,8 +964,9 @@ busCommand
     // Resolve bot token: agent .env first, then process.env
     const env = resolveEnv();
     let botToken = '';
+    let envTopicId = '';
 
-    // 1. Check agent .env (most specific)
+    // 1. Check agent .env (most specific) for both BOT_TOKEN and TOPIC_ID
     if (env.agentDir) {
       const { readFileSync, existsSync } = require('fs');
       const { join } = require('path');
@@ -973,6 +975,8 @@ busCommand
         const content = readFileSync(agentEnv, 'utf-8');
         const match = content.match(/^BOT_TOKEN=(.+)$/m);
         if (match && match[1].trim()) botToken = match[1].trim();
+        const topicMatch = content.match(/^TOPIC_ID=(.+)$/m);
+        if (topicMatch && topicMatch[1].trim()) envTopicId = topicMatch[1].trim();
       }
     }
 
@@ -980,24 +984,33 @@ busCommand
     if (!botToken) {
       botToken = process.env.BOT_TOKEN || '';
     }
+    if (!envTopicId) {
+      envTopicId = process.env.TOPIC_ID || '';
+    }
 
     if (!botToken) {
       console.error('Error: BOT_TOKEN not configured. Set it in your agent .env file or as an environment variable to enable Telegram.');
       process.exit(1);
     }
 
+    // Thread precedence: --thread flag > .env TOPIC_ID > process.env.TOPIC_ID.
+    // Parse to a number; an unparseable value is ignored (treated as no thread).
+    const threadRaw = opts.thread ?? envTopicId;
+    const threadId = threadRaw && /^\d+$/.test(threadRaw.trim()) ? parseInt(threadRaw.trim(), 10) : undefined;
+
     const api = new TelegramAPI(botToken);
     try {
       let sentMessageId = 0;
       if (opts.image) {
-        const result = await api.sendPhoto(chatId, opts.image, message);
+        const result = await api.sendPhoto(chatId, opts.image, message, undefined, threadId);
         sentMessageId = result?.result?.message_id ?? 0;
       } else if (opts.file) {
-        const result = await api.sendDocument(chatId, opts.file, message);
+        const result = await api.sendDocument(chatId, opts.file, message, undefined, threadId);
         sentMessageId = result?.result?.message_id ?? 0;
       } else {
         const result = await api.sendMessage(chatId, message, undefined, {
           parseMode: opts.plainText ? null : 'HTML',
+          messageThreadId: threadId,
         });
         sentMessageId = result?.result?.message_id ?? 0;
       }

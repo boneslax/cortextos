@@ -7,6 +7,7 @@
  */
 
 import { TelegramAPI } from '../telegram/api';
+import { recordPendingCallback } from '../telegram/pending-callback';
 import {
   readStdin,
   parseHookInput,
@@ -52,6 +53,9 @@ async function main(): Promise<void> {
   const uniqueId = generateId();
   mkdirSync(env.stateDir, { recursive: true });
   const responseFile = join(env.stateDir, `hook-response-${uniqueId}.json`);
+  // Record owner so the orchestrator can route this callback back to us even
+  // if Telegram omits message_thread_id on the button press.
+  recordPendingCallback(env.ctxRoot, uniqueId, env.agentName);
 
   // Register cleanup
   const cleanup = () => cleanupResponseFile(responseFile);
@@ -71,7 +75,7 @@ async function main(): Promise<void> {
   const api = new TelegramAPI(env.botToken);
 
   try {
-    await api.sendMessage(env.chatId, message, keyboard);
+    await api.sendMessage(env.chatId, message, keyboard, { messageThreadId: env.topicId });
   } catch {
     outputDecision('deny', 'Failed to send permission request to Telegram');
     return;
@@ -99,6 +103,8 @@ async function main(): Promise<void> {
       await api.sendMessage(
         env.chatId,
         `Permission request TIMED OUT (auto-denied): ${tool_name}`,
+        undefined,
+        { messageThreadId: env.topicId },
       );
     } catch {
       // Ignore notification failure

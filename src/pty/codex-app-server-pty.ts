@@ -120,6 +120,7 @@ export class CodexAppServerPTY {
   private _threadId: string | null = null;
   private _telegramApi: TelegramAPI | null = null;
   private _chatId: string | null = null;
+  private _telegramTopicId: number | undefined = undefined;
   private _typingLastSent = 0;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string) {
@@ -217,9 +218,10 @@ export class CodexAppServerPTY {
     return this._outputBuffer;
   }
 
-  setTelegramHandle(api: TelegramAPI, chatId: string): void {
+  setTelegramHandle(api: TelegramAPI, chatId: string, topicId?: number): void {
     this._telegramApi = api;
     this._chatId = chatId;
+    this._telegramTopicId = topicId;
   }
 
   private async handleInput(content: string): Promise<void> {
@@ -570,7 +572,7 @@ export class CodexAppServerPTY {
   private replyLocal(text: string): void {
     this._outputBuffer.push(text + '\n');
     if (this._telegramApi && this._chatId) {
-      this._telegramApi.sendMessage(this._chatId, text, undefined, { parseMode: null }).catch(() => {});
+      this._telegramApi.sendMessage(this._chatId, text, undefined, { parseMode: null, messageThreadId: this._telegramTopicId }).catch(() => {});
     }
   }
 
@@ -930,7 +932,7 @@ export class CodexAppServerPTY {
     const now = Date.now();
     if (now - this._typingLastSent < 4000) return;
     this._typingLastSent = now;
-    this._telegramApi.sendChatAction(this._chatId, 'typing').catch(() => { /* non-fatal */ });
+    this._telegramApi.sendChatAction(this._chatId, 'typing', this._telegramTopicId).catch(() => { /* non-fatal */ });
   }
 
   private buildEnv(): Record<string, string> {
