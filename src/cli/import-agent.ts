@@ -4,7 +4,7 @@ import { join, basename } from 'path';
 import { homedir, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { x as tarExtract } from 'tar';
-import { validateAgentName, assertSafeOrgSegment, validateInstanceId } from '../utils/validate.js';
+import { validateAgentName, assertSafeOrgSegment, validateInstanceId, assertContainedWithin } from '../utils/validate.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { resolvePaths } from '../utils/paths.js';
 
@@ -171,9 +171,17 @@ export const importAgentCommand = new Command('import-agent')
         console.log('  Imported tasks.');
       }
 
-      // Agent state (heartbeat, etc.)
-      const exportedAgentState = join(exportedStateDir, importedConfig?.agent_name || agentName);
-      if (existsSync(exportedAgentState)) {
+      // Agent state (heartbeat, etc.). importedConfig.agent_name comes from the
+      // tarball — contain the joined source against exportedStateDir so a
+      // crafted `../..` name can't make cpSync read from outside the unpack dir.
+      let exportedAgentState: string;
+      try {
+        exportedAgentState = assertContainedWithin(exportedStateDir, importedConfig?.agent_name || agentName);
+      } catch {
+        console.error('  Invalid agent_name in export manifest — skipping state import.');
+        exportedAgentState = '';
+      }
+      if (exportedAgentState && existsSync(exportedAgentState)) {
         mkdirSync(paths.stateDir, { recursive: true });
         cpSync(exportedAgentState, paths.stateDir, { recursive: true });
         console.log('  Imported agent state.');
