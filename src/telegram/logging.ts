@@ -203,10 +203,14 @@ export function buildRecentHistory(
       const raw = readFileSync(filePath, 'utf-8').trim();
       if (!raw) return;
       const lines = raw.split('\n').filter(Boolean);
-      const tail = lines.slice(-(limit * 2));
-      for (const line of tail) {
+      // Filter by chat/thread FIRST, then keep the most recent `limit` matches.
+      // (Do NOT tail raw lines before filtering — a busy SIBLING topic in the
+      // same group would push this topic's entries out of the window and return
+      // nothing. [Codex CB2]) Scan from the end, collect matches up to limit.
+      const matched: Entry[] = [];
+      for (let i = lines.length - 1; i >= 0 && matched.length < limit; i--) {
         try {
-          const obj = JSON.parse(line);
+          const obj = JSON.parse(lines[i]);
           if (String(obj.chat_id) !== chatIdStr) continue;
           // Isolate per-project-topic history: when a thread is requested, only
           // entries from that thread; when none (DM/v1), only thread-less
@@ -218,9 +222,10 @@ export function buildRecentHistory(
           }
           const text = (obj.text || '').trim();
           if (!text) continue;
-          entries.push({ ts: obj.timestamp || obj.archived_at || '', speaker, text });
+          matched.push({ ts: obj.timestamp || obj.archived_at || '', speaker, text });
         } catch { /* skip malformed */ }
       }
+      for (const e of matched) entries.push(e);
     } catch { /* skip unreadable */ }
   };
 

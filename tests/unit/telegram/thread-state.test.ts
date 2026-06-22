@@ -54,4 +54,12 @@ describe('thread-aware recent history', () => {
     expect(hDm).not.toContain('topic 2 message A');
     expect(hDm).not.toContain('topic 5 message B');
   });
+
+  it('a busy sibling topic does not starve this topic out of the window [CB2]', () => {
+    inbound('OLD topic-2 message', 2);          // the one entry we want back
+    for (let i = 0; i < 40; i++) inbound(`sibling topic-5 spam ${i}`, 5); // floods after it
+    const h2 = buildRecentHistory(ctxRoot, 'dev', CHAT, 6, 2) ?? '';
+    expect(h2).toContain('OLD topic-2 message');
+    expect(h2).not.toContain('sibling topic-5 spam');
+  });
 });

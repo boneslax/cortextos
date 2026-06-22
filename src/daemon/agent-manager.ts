@@ -272,10 +272,15 @@ export class AgentManager {
    */
   private upsertTopicRegistry(name: string, chatId?: string, topicId?: number, config?: AgentConfig): void {
     if (!chatId) return;
-    if (topicId !== undefined) this.registerTopicKey(name, chatId, topicId);
+    // Share ONE dupes set across this agent's TOPIC_ID + project_topics calls so
+    // a cross-owner collision stays poisoned for the whole upsert. Without it, a
+    // collision deleted in the first call would be silently re-added by the
+    // second (e.g. when .env TOPIC_ID is also a project_topics key). [Codex CB1]
+    const dupes = new Set<string>();
+    if (topicId !== undefined) this.registerTopicKey(name, chatId, topicId, dupes);
     for (const k of Object.keys(config?.project_topics ?? {})) {
       const pt = /^\d+$/.test(k) ? parseInt(k, 10) : NaN;
-      if (Number.isFinite(pt)) this.registerTopicKey(name, chatId, pt);
+      if (Number.isFinite(pt)) this.registerTopicKey(name, chatId, pt, dupes);
     }
   }
 

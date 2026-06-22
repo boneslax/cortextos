@@ -9,6 +9,7 @@ import { updateApproval } from '../bus/approval.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { clearPendingCallback } from '../telegram/pending-callback.js';
+import { lastSentFileName } from '../telegram/logging.js';
 import { KEYS } from '../pty/inject.js';
 import { stripControlChars, sanitizeForPtyInjection, wrapFenceSafe } from '../utils/validate.js';
 
@@ -458,9 +459,8 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${threadId !== 
    * Returns the content (up to 500 chars) or null if not available.
    */
   static readLastSent(stateDir: string, chatId: string | number, threadId?: number): string | null {
-    // Filename convention MUST match logging.ts lastSentFileName (per-(chat,topic)
-    // when a thread is present; bare-chat for DM/v1).
-    const filePath = join(stateDir, `last-telegram-${chatId}${threadId !== undefined ? `-t${threadId}` : ''}.txt`);
+    // Use the shared filename helper so reader + writer can never drift.
+    const filePath = join(stateDir, lastSentFileName(chatId, threadId));
     try {
       if (!existsSync(filePath)) return null;
       const content = readFileSync(filePath, 'utf-8');

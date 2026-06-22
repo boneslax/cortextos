@@ -71,4 +71,14 @@ describe('PAG topic registry (project_topics)', () => {
     ]);
     expect(mgr.resolveTopicOwner(DEV, 2)).toBeNull();
   });
+
+  it('dynamic upsert with TOPIC_ID==a project_topics key cannot resurrect a cross-owner collision [CB1]', () => {
+    const dev = agentDir('dev', { CHAT_ID: DEV });
+    (mgr as any).buildTopicRegistry([{ ...dev, config: { project_topics: { '2': 'standup' } } }]);
+    expect(mgr.resolveTopicOwner(DEV, 2)).toBe('dev');
+    // Agent B dynamically starts claiming the same (group, topic 2), with its
+    // .env TOPIC_ID=2 ALSO present in project_topics. Must stay unmapped, not B.
+    (mgr as any).upsertTopicRegistry('intruder', DEV, 2, { project_topics: { '2': 'poach' } });
+    expect(mgr.resolveTopicOwner(DEV, 2)).toBeNull();
+  });
 });
