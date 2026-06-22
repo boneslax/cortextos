@@ -8,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { CTX_FRAMEWORK_ROOT } from './config';
+import { assertContainedWithin, assertSafeOrg } from './path-safety';
 
 export const PARA_DIRS = [
   '00-inbox',
@@ -25,6 +26,10 @@ const VAULT_FALLBACK = process.env.CTX_VAULT_PATH
   ?? path.join(os.homedir(), 'storage', 'Documents', 'Github', 'sondres-orchestrator', 'vault');
 
 export function getVaultRoot(org: string): string | null {
+  // Validate org centrally — search/inbox/tree pass the raw query param here,
+  // and an unvalidated `org` traverses out of orgs/ (e.g. ../) to read another
+  // vault. Invalid → null (callers already 404 on null).
+  try { org = assertSafeOrg(org); } catch { return null; }
   // 1. Try parsing orgs/<org>/knowledge.md for an "Obsidian vault" path entry
   const knowledgePath = path.join(CTX_FRAMEWORK_ROOT, 'orgs', org, 'knowledge.md');
   if (fs.existsSync(knowledgePath)) {
@@ -128,10 +133,14 @@ export function resolveVaultPath(
   const top = cleaned.split('/')[0];
   if (!PARA_DIRS.includes(top as ParaDir)) return null;
 
-  const abs = path.resolve(vaultRoot, cleaned);
-  // Defense in depth — confirm resolved path is inside the vault root
-  if (!abs.startsWith(path.resolve(vaultRoot) + path.sep)) return null;
-  return abs;
+  try {
+    // Realpath-contained against the vault root: rejects a symlink inside a
+    // PARA dir that points outside the vault (statSync/readFileSync follow
+    // symlinks, so a string-only startsWith check was insufficient).
+    return assertContainedWithin(vaultRoot, cleaned);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -144,11 +153,20 @@ export function listAllNotes(vaultRoot: string): Array<{
 }> {
   const out: Array<{ relPath: string; absPath: string; mtimeMs: number }> = [];
   for (const dir of PARA_DIRS) {
-    const abs = path.join(vaultRoot, dir);
-    if (!fs.existsSync(abs)) continue;
+    const abs = safeVaultDir(vaultRoot, dir);
+    if (!abs || !fs.existsSync(abs)) continue;
     walk(abs, vaultRoot, out);
   }
   return out;
+}
+
+/**
+ * Realpath-contain a top-level vault dir. Returns the abs path, or null if the
+ * dir is a symlink escaping the vault (readdir/stat would otherwise follow it).
+ */
+export function safeVaultDir(vaultRoot: string, relDir: string): string | null {
+  try { return assertContainedWithin(vaultRoot, relDir); }
+  catch { return null; }
 }
 
 function walk(
@@ -158,6 +176,7 @@ function walk(
 ) {
   for (const entry of fs.readdirSync(abs, { withFileTypes: true })) {
     if (entry.name.startsWith('.')) continue;
+    if (entry.isSymbolicLink()) continue; // never follow a symlinked note/subdir out of the vault
     const child = path.join(abs, entry.name);
     if (entry.isDirectory()) {
       walk(child, vaultRoot, out);

@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { homedir } from 'os';
 import { getAgentDir, getOrgs, getAgentsForOrg } from '@/lib/config';
+import { assertSafeName, assertSafeOrg, assertContainedWithin } from '@/lib/path-safety';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,7 +17,11 @@ export async function GET(
   { params }: { params: Promise<{ name: string }> },
 ) {
   const { name } = await params;
-  const decoded = decodeURIComponent(name);
+  // Validate the agent name (decodes to fixed-point so a double-encoded
+  // %252e%252e can't survive as ../). Do NOT manually decodeURIComponent again.
+  let decoded: string;
+  try { decoded = assertSafeName(name); }
+  catch { return Response.json({ error: 'Invalid agent name' }, { status: 400 }); }
   const { searchParams } = request.nextUrl;
   const filePath = searchParams.get('path');
 
@@ -26,12 +31,17 @@ export async function GET(
       return Response.json({ error: 'Invalid file path' }, { status: 400 });
     }
 
-    // Security (C3): Confine path reads to this agent's own directory.
-    // path.resolve() neutralizes any ../ traversal before startsWith comparison.
+    // Confine reads to this agent's own dir. The base is built ONLY from a
+    // validated org + name (an unvalidated org was the real F2 escape — base
+    // segments controlled the path, defeating the old startsWith check), and
+    // assertContainedWithin resolves + symlink-checks against that fixed base.
     const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT ?? homedir();
     // Auto-discover org if not provided — avoids 403 when org param is missing
     let orgName = searchParams.get('org');
-    if (!orgName) {
+    if (orgName) {
+      try { orgName = assertSafeOrg(orgName); }
+      catch { return Response.json({ error: 'Invalid org' }, { status: 400 }); }
+    } else {
       for (const org of getOrgs()) {
         if (getAgentsForOrg(org).includes(decoded)) {
           orgName = org;
@@ -41,11 +51,9 @@ export async function GET(
       orgName = orgName ?? getOrgs()[0] ?? 'default';
     }
     const agentDir = path.resolve(frameworkRoot, 'orgs', orgName, 'agents', decoded);
-    const resolved = path.resolve(agentDir, filePath);
-
-    if (!resolved.startsWith(agentDir + path.sep)) {
-      return Response.json({ error: 'Forbidden' }, { status: 403 });
-    }
+    let resolved: string;
+    try { resolved = assertContainedWithin(agentDir, filePath); }
+    catch { return Response.json({ error: 'Forbidden' }, { status: 403 }); }
 
     try {
       const content = await fs.readFile(resolved, 'utf-8');

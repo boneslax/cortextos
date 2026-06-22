@@ -1,6 +1,7 @@
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { assertSafeName, assertSafeOrg } from '@/lib/path-safety';
 
 // Expand tilde in paths (Node.js doesn't do this automatically)
 function expandTilde(p: string): string {
@@ -106,6 +107,12 @@ export function getLogDir(agent: string): string {
 // -- Agent dir within org (IDENTITY.md, SOUL.md, MEMORY.md, .env) --
 
 export function getAgentDir(name: string, org?: string): string {
+  // Defense-in-depth chokepoint: every API route SHOULD validate before calling
+  // here, but validate name/org again so an unguarded/future caller can never
+  // traverse out of the agents tree. Trusted callers pass scanned [A-Za-z0-9_-]
+  // values → no behavior change; only malicious/raw input throws.
+  assertSafeName(name);
+  if (org) assertSafeOrg(org);
   // Check project root first (where agent markdown files live), then state dir
   if (org) {
     const projectPath = path.join(CTX_FRAMEWORK_ROOT, 'orgs', org, 'agents', name);

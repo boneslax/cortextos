@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import fs from 'fs/promises';
 import { getAgentDetail, getAgentPaths } from '@/lib/data/agents';
+import { assertSafeName, assertSafeOrg } from '@/lib/path-safety';
 import {
   parseIdentityMd,
   serializeIdentityMd,
@@ -20,7 +21,9 @@ export async function GET(
   { params }: { params: Promise<{ name: string }> },
 ) {
   const { name } = await params;
-  const decoded = decodeURIComponent(name);
+  let decoded: string;
+  try { decoded = assertSafeName(name); }
+  catch { return Response.json({ error: 'Invalid agent name' }, { status: 400 }); }
 
   try {
     const detail = await getAgentDetail(decoded);
@@ -40,7 +43,9 @@ export async function PATCH(
   { params }: { params: Promise<{ name: string }> },
 ) {
   const { name } = await params;
-  const decoded = decodeURIComponent(name);
+  let decoded: string;
+  try { decoded = assertSafeName(name); }
+  catch { return Response.json({ error: 'Invalid agent name' }, { status: 400 }); }
 
   let body: Record<string, unknown>;
   try {
@@ -49,7 +54,9 @@ export async function PATCH(
     return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  const org = (body.org as string) || undefined;
+  let org: string | undefined;
+  try { org = body.org ? assertSafeOrg(body.org as string) : undefined; }
+  catch { return Response.json({ error: 'Invalid org' }, { status: 400 }); }
   const paths = getAgentPaths(decoded, org);
 
   const results: { identity?: boolean; soul?: boolean } = {};

@@ -1,7 +1,92 @@
 import type { Priority, EventCategory, EventSeverity, ApprovalCategory } from '../types/index.js';
 import { VALID_PRIORITIES } from '../types/index.js';
+import { resolve as pathResolve, sep as pathSep, dirname as pathDirname } from 'path';
+import { realpathSync } from 'fs';
 
 const AGENT_NAME_REGEX = /^[a-z0-9_-]+$/;
+// Org segments may preserve framework casing (e.g. AcmeCorp) — getOrgs() does
+// NOT lowercase them — so the path-safety org check allows mixed case. (This is
+// separate from validateOrgName, which gates lowercase org CREATION via the CLI.)
+const ORG_SEGMENT_REGEX = /^[A-Za-z0-9_-]+$/;
+
+// ---------------------------------------------------------------------------
+// Path-safety helpers (dashboard + import-agent path traversal hardening)
+// ---------------------------------------------------------------------------
+
+/**
+ * Decode a URL-encoded path segment to a FIXED POINT. Next.js route params are
+ * already decoded once by the router; several API routes then decode AGAIN —
+ * so `%252e%252e%252f` survives as `../`. Decoding to a fixed point (then
+ * validating) collapses any depth of encoding so the regex sees the real value.
+ * Throws on malformed encoding (caller should map to HTTP 400, not 500).
+ */
+export function decodeToFixedPoint(s: string): string {
+  let cur = s;
+  for (let i = 0; i < 6; i++) {
+    let next: string;
+    try { next = decodeURIComponent(cur); }
+    catch { throw new Error(`Malformed URL encoding in '${s}'`); }
+    if (next === cur) return cur;
+    cur = next;
+  }
+  throw new Error(`Excessively-encoded value '${s}'`);
+}
+
+/** Validate an agent/skill name segment (lowercase id), after full decode. */
+export function assertSafeName(name: string): string {
+  const decoded = decodeToFixedPoint(String(name ?? ''));
+  if (!decoded || !AGENT_NAME_REGEX.test(decoded)) {
+    throw new Error(`Invalid name segment '${name}'. Allowed: [a-z0-9_-].`);
+  }
+  return decoded;
+}
+
+/** Validate an org segment (mixed-case allowed), after full decode. */
+export function assertSafeOrgSegment(org: string): string {
+  const decoded = decodeToFixedPoint(String(org ?? ''));
+  if (!decoded || !ORG_SEGMENT_REGEX.test(decoded)) {
+    throw new Error(`Invalid org segment '${org}'. Allowed: [A-Za-z0-9_-].`);
+  }
+  return decoded;
+}
+
+/**
+ * Assert `target` resolves INSIDE `baseDir`. Defeats both base-segment escape
+ * (string startsWith against a FIXED base) AND symlinked ancestors (realpath the
+ * deepest existing ancestor and re-check). Throws if it escapes.
+ */
+export function assertContainedWithin(baseDir: string, target: string): string {
+  const base = pathResolve(baseDir);
+  const resolved = pathResolve(base, target);
+  if (resolved !== base && !resolved.startsWith(base + pathSep)) {
+    throw new Error(`Path escapes base: ${target}`);
+  }
+  // Symlink defense via realpath of the deepest EXISTING ancestor. Use a
+  // realpath-walk (no existsSync→realpath gap — that was a TOCTOU race): the
+  // non-existing suffix can't be a symlink, so resolving the deepest existing
+  // prefix is sufficient. `baseDir` MUST be a FIXED trusted root (callers pass
+  // frameworkRoot/orgs, never an attacker-reachable dir) so a symlinked
+  // intermediate (e.g. a planted `skills -> /outside`) is caught here.
+  const realBase = realpathDeepest(base);
+  const realProbe = realpathDeepest(resolved);
+  if (realProbe !== realBase && !realProbe.startsWith(realBase + pathSep)) {
+    throw new Error(`Path escapes base via symlink: ${target}`);
+  }
+  return resolved;
+}
+
+/** realpath the deepest EXISTING ancestor of `p` (walks up on ENOENT). */
+function realpathDeepest(p: string): string {
+  let cur = p;
+  for (;;) {
+    try { return realpathSync(cur); }
+    catch {
+      const parent = pathDirname(cur);
+      if (parent === cur) return cur;
+      cur = parent;
+    }
+  }
+}
 // Task IDs are generated as `task_<epoch>_<rand>` (lowercase). Allow lowercase
 // letters, digits, underscores and hyphens — matching the generator and the
 // rest of the codebase's identifier convention — while rejecting path
