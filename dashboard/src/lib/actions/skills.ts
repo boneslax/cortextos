@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { revalidatePath } from 'next/cache';
 import { getFrameworkRoot, CTX_ROOT, getOrgs, getAgentsForOrg } from '@/lib/config';
+import { assertSafeName, assertSafeOrg, assertContainedWithin } from '@/lib/path-safety';
 import type { ActionResult } from '@/lib/types';
 
 // ---------------------------------------------------------------------------
@@ -141,8 +142,11 @@ export async function installSkill(
   agent: string,
 ): Promise<ActionResult> {
   try {
+    try { slug = assertSafeName(slug); org = assertSafeOrg(org); agent = assertSafeName(agent); }
+    catch { return { success: false, error: 'Invalid slug/org/agent' }; }
+
     const frameworkRoot = getFrameworkRoot();
-    const catalogDir = path.join(frameworkRoot, 'skills', slug);
+    const catalogDir = assertContainedWithin(path.join(frameworkRoot, 'skills'), slug);
 
     if (!fs.existsSync(catalogDir)) {
       return { success: false, error: `Skill not found: ${slug}` };
@@ -161,7 +165,7 @@ export async function installSkill(
     const skillsDir = path.join(frameworkRoot, 'orgs', org, 'agents', agent, 'skills');
     fs.mkdirSync(skillsDir, { recursive: true });
 
-    const linkPath = path.join(skillsDir, slug);
+    const linkPath = assertContainedWithin(skillsDir, slug);
 
     // Remove existing link/dir if present
     try {
@@ -188,7 +192,11 @@ export async function uninstallSkill(
   agent: string,
 ): Promise<ActionResult> {
   try {
-    const linkPath = path.join(getFrameworkRoot(), 'orgs', org, 'agents', agent, 'skills', slug);
+    try { slug = assertSafeName(slug); org = assertSafeOrg(org); agent = assertSafeName(agent); }
+    catch { return { success: false, error: 'Invalid slug/org/agent' }; }
+
+    const skillsDir = path.join(getFrameworkRoot(), 'orgs', org, 'agents', agent, 'skills');
+    const linkPath = assertContainedWithin(skillsDir, slug);
 
     try {
       const stat = fs.lstatSync(linkPath);

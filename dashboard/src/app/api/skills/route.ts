@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { getFrameworkRoot } from '@/lib/config';
+import { assertSafeName, assertSafeOrg, assertContainedWithin } from '@/lib/path-safety';
 
 export const dynamic = 'force-dynamic';
 
@@ -90,16 +91,23 @@ export async function POST(request: Request) {
     if (!slug || !org || !agent) {
       return Response.json({ error: 'slug, org, and agent required' }, { status: 400 });
     }
+    let s: string, o: string, a: string;
+    try { s = assertSafeName(slug); o = assertSafeOrg(org); a = assertSafeName(agent); }
+    catch { return Response.json({ error: 'Invalid slug/org/agent' }, { status: 400 }); }
 
     const frameworkRoot = getFrameworkRoot();
-    const catalogDir = path.join(frameworkRoot, 'skills', slug);
+    const catalogDir = assertContainedWithin(path.join(frameworkRoot, 'skills'), s);
     if (!fs.existsSync(catalogDir)) {
-      return Response.json({ error: `Skill not found: ${slug}` }, { status: 404 });
+      return Response.json({ error: `Skill not found: ${s}` }, { status: 404 });
     }
 
-    const skillsDir = path.join(frameworkRoot, 'orgs', org, 'agents', agent, 'skills');
+    const skillsDir = path.join(frameworkRoot, 'orgs', o, 'agents', a, 'skills');
     fs.mkdirSync(skillsDir, { recursive: true });
-    const linkPath = path.join(skillsDir, slug);
+    // Containment-assert (symlink-safe) the link path before linking — defeats a
+    // pre-existing symlinked parent escaping the agent's skills dir.
+    let linkPath: string;
+    try { linkPath = assertContainedWithin(skillsDir, s); }
+    catch { return Response.json({ error: 'Forbidden' }, { status: 403 }); }
 
     try { if (fs.lstatSync(linkPath).isSymbolicLink()) fs.unlinkSync(linkPath); } catch { /* doesn't exist */ }
     fs.symlinkSync(catalogDir, linkPath, 'dir');
@@ -117,9 +125,15 @@ export async function DELETE(request: Request) {
     if (!slug || !org || !agent) {
       return Response.json({ error: 'slug, org, and agent required' }, { status: 400 });
     }
+    let s: string, o: string, a: string;
+    try { s = assertSafeName(slug); o = assertSafeOrg(org); a = assertSafeName(agent); }
+    catch { return Response.json({ error: 'Invalid slug/org/agent' }, { status: 400 }); }
 
     const frameworkRoot = getFrameworkRoot();
-    const linkPath = path.join(frameworkRoot, 'orgs', org, 'agents', agent, 'skills', slug);
+    const skillsDir = path.join(frameworkRoot, 'orgs', o, 'agents', a, 'skills');
+    let linkPath: string;
+    try { linkPath = assertContainedWithin(skillsDir, s); }
+    catch { return Response.json({ error: 'Forbidden' }, { status: 403 }); }
 
     try {
       const stat = fs.lstatSync(linkPath);

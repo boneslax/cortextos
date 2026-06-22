@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { getAgentDir, getAllAgents, CTX_FRAMEWORK_ROOT } from '@/lib/config';
 import { spawnSync } from 'child_process';
+import { assertSafeName } from '@/lib/path-safety';
 
 export const dynamic = 'force-dynamic';
 
@@ -26,7 +27,11 @@ interface AgentConfig {
 }
 
 function resolveAgent(name: string): { agentDir: string; org?: string } {
-  const decoded = decodeURIComponent(name);
+  // Validate (decode-to-fixed-point + [a-z0-9_-]) BEFORE any path is built —
+  // the systemName fallback below used the raw name, so an unmatched traversal
+  // name reached getAgentDir → config.json write takeover (F5). Throws on bad
+  // input; callers' try/catch return an error without touching the filesystem.
+  const decoded = assertSafeName(name);
   const allAgents = getAllAgents();
   const entry = allAgents.find(
     a => a.name.toLowerCase() === decoded.toLowerCase()

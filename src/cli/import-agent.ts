@@ -1,9 +1,10 @@
 import { Command } from 'commander';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, cpSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, cpSync } from 'fs';
 import { join, basename } from 'path';
 import { homedir, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
-import { validateAgentName } from '../utils/validate.js';
+import { x as tarExtract } from 'tar';
+import { validateAgentName, assertSafeOrgSegment } from '../utils/validate.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { resolvePaths } from '../utils/paths.js';
 
@@ -39,15 +40,37 @@ export const importAgentCommand = new Command('import-agent')
       console.error('\n  Error: could not detect org. Pass --org <name>\n');
       process.exit(1);
     }
+    // Validate org before it is ever joined into a filesystem path (F3 sibling:
+    // an unvalidated --org would traverse out of orgs/).
+    try {
+      assertSafeOrgSegment(org);
+    } catch {
+      console.error(`\n  Invalid org "${org}". Allowed: letters, numbers, hyphens, underscores.\n`);
+      process.exit(1);
+    }
 
-    // Unpack into a temp dir
-    const tmpDir = join(tmpdir(), `cortextos-import-${Date.now()}`);
-    mkdirSync(tmpDir, { recursive: true });
+    // Unpack into a FRESH private temp dir.
+    const tmpDir = mkdtempSync(join(tmpdir(), 'cortextos-import-'));
 
     console.log(`\n  Unpacking ${basename(tarball)}...`);
-    const untar = spawnSync('tar', ['-xzf', tarball, '-C', tmpDir], { stdio: 'pipe' });
-    if (untar.status !== 0) {
-      console.error('  Failed to unpack tarball:', untar.stderr?.toString() || '');
+    // node-tar extract with a strict member filter (F3 tar-slip → RCE fix):
+    // reject symlink/hardlink members (the real escape vector) and any absolute
+    // or `..` path. In-process — no second file read (no TOCTOU), no text-parse
+    // ambiguity. node-tar additionally strips leading `/` and refuses `..` by
+    // default; the explicit filter is defense-in-depth.
+    try {
+      await tarExtract({
+        file: tarball,
+        cwd: tmpDir,
+        filter: (entryPath: string, entry: unknown) => {
+          const t = (entry as { type?: string })?.type;
+          if (t === 'SymbolicLink' || t === 'Link') return false;
+          if (entryPath.startsWith('/') || entryPath.split(/[/\\]/).includes('..')) return false;
+          return true;
+        },
+      });
+    } catch (err) {
+      console.error('  Failed to unpack tarball:', err instanceof Error ? err.message : String(err));
       cleanup(tmpDir);
       process.exit(1);
     }
