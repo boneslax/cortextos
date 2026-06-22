@@ -102,6 +102,13 @@ export class AgentManager {
    * unknown threads can't storm the poller hot path.
    */
   private lastTopicRefresh: Map<string, number> = new Map();
+  /**
+   * Project label per "${chatId}:${topicId}" (from config.project_topics),
+   * kept in lockstep with topicRegistry + the on-demand refresh. onMessage
+   * reads the label from HERE, not the agent's start-time config closure, so a
+   * topic added after start gets its [project: ...] label without a restart.
+   */
+  private topicLabels: Map<string, string> = new Map();
   /** Daemon-level cron scheduler registry: one CronScheduler per enabled agent. */
   private cronSchedulers: Map<string, CronScheduler> = new Map();
   // Tracks agents that received a start request while still stopping.
@@ -257,6 +264,7 @@ export class AgentManager {
    */
   private buildTopicRegistry(agents: Array<{ name: string; dir: string; config?: AgentConfig }>): void {
     this.topicRegistry.clear();
+    this.topicLabels.clear();
     const dupes = new Set<string>();
     for (const { name, dir, config } of agents) {
       const { chatId, topicId } = this.readTopicEnv(dir);
@@ -266,9 +274,12 @@ export class AgentManager {
       // v2 per-agent-group: every project topic in this agent's own group →
       // this agent. Required so the agent's OWN topic callbacks resolve to self
       // (an unregistered topic would drop ask callbacks, fail-closed).
-      for (const k of Object.keys(config?.project_topics ?? {})) {
+      for (const [k, label] of Object.entries(config?.project_topics ?? {})) {
         const pt = /^\d+$/.test(k) ? parseInt(k, 10) : NaN;
-        if (Number.isFinite(pt)) this.registerTopicKey(name, chatId, pt, dupes);
+        if (Number.isFinite(pt)) {
+          this.registerTopicKey(name, chatId, pt, dupes);
+          this.topicLabels.set(`${chatId}:${pt}`, label);
+        }
       }
     }
     console.log(`[agent-manager] Topic registry built: ${this.topicRegistry.size} topic(s) mapped.`);
@@ -323,19 +334,19 @@ export class AgentManager {
     const key = String(chatId);
     if (nowMs - (this.lastTopicRefresh.get(key) ?? 0) < 5000) return false; // throttle
     this.lastTopicRefresh.set(key, nowMs);
-    for (const [aname, entry] of this.agents) {
-      if (entry.chatId !== undefined && String(entry.chatId) === key) {
-        try {
-          const dir = entry.process.getAgentDir();
-          const cfg = this.loadAgentConfig(dir); // fresh read from disk
-          this.upsertTopicRegistry(aname, entry.chatId, entry.topicId, cfg);
-          return true;
-        } catch {
-          return false;
-        }
-      }
+    // Only refresh when EXACTLY ONE running agent owns this group (the PAG
+    // invariant). A legacy v1 shared-group can have multiple agents on one
+    // CHAT_ID — refreshing then could upsert the wrong agent's topics, so skip.
+    const owners = [...this.agents].filter(([, e]) => e.chatId !== undefined && String(e.chatId) === key);
+    if (owners.length !== 1) return false;
+    const [aname, entry] = owners[0];
+    try {
+      const cfg = this.loadAgentConfig(entry.process.getAgentDir()); // fresh read from disk
+      this.upsertTopicRegistry(aname, entry.chatId, entry.topicId, cfg);
+      return true;
+    } catch {
+      return false;
     }
-    return false;
   }
 
   /**
@@ -352,9 +363,12 @@ export class AgentManager {
     // second (e.g. when .env TOPIC_ID is also a project_topics key). [Codex CB1]
     const dupes = new Set<string>();
     if (topicId !== undefined) this.registerTopicKey(name, chatId, topicId, dupes);
-    for (const k of Object.keys(config?.project_topics ?? {})) {
+    for (const [k, label] of Object.entries(config?.project_topics ?? {})) {
       const pt = /^\d+$/.test(k) ? parseInt(k, 10) : NaN;
-      if (Number.isFinite(pt)) this.registerTopicKey(name, chatId, pt, dupes);
+      if (Number.isFinite(pt)) {
+        this.registerTopicKey(name, chatId, pt, dupes);
+        this.topicLabels.set(`${chatId}:${pt}`, label);
+      }
     }
   }
 
@@ -850,8 +864,10 @@ export class AgentManager {
         const replyToText = buildReplyContext(msg.reply_to_message);
 
         const recentHistory = buildRecentHistory(this.ctxRoot, targetName, effectiveChatId, 6, threadId) ?? undefined;
-        // PAG: label the project topic from this agent's own config map.
-        const projectLabel = threadId !== undefined ? config?.project_topics?.[String(threadId)] : undefined;
+        // PAG: label the project topic from the manager-level label map (kept in
+        // lockstep with the registry + the on-demand refresh), NOT the agent's
+        // start-time config closure — so a topic added after start is labelled. [Codex CB1]
+        const projectLabel = threadId !== undefined ? this.topicLabels.get(`${effectiveChatId}:${threadId}`) : undefined;
         deliver(FastChecker.formatTelegramTextMessage(
           from,
           effectiveChatId,

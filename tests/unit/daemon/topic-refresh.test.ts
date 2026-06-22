@@ -48,6 +48,14 @@ describe('refreshTopicsForChat (Bug 1 narrow gap)', () => {
     expect(ran).toBe(true);
     expect(mgr.resolveTopicOwner(GROUP, 11)).toBe('dev');
     expect(mgr.resolveTopicOwner(GROUP, 10)).toBe('dev'); // additive: existing kept
+    // [Codex CB1] the project LABEL is also refreshed (not stuck on stale config)
+    expect((mgr as any).topicLabels.get(`${GROUP}:11`)).toBe('auditflow');
+  });
+
+  it('does NOT refresh when two running agents share the chat (legacy shared-group)', () => {
+    fakeRunningAgent('a', GROUP, { '1': 'x' });
+    fakeRunningAgent('b', GROUP, { '2': 'y' });
+    expect((mgr as any).refreshTopicsForChat(GROUP, 2_000_000)).toBe(false);
   });
 
   it('throttles repeat refreshes within the 5s window', () => {
