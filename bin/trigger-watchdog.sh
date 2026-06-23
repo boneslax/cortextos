@@ -88,6 +88,7 @@ send_alert() {
     # passing everything through a 0600 curl --config file, removed immediately.
     local cfg; cfg="$(mktemp "${TMPDIR:-/tmp}/twd-XXXXXX")" || return 1
     chmod 600 "$cfg"
+    trap 'rm -f "$cfg"' RETURN   # never leave a token-bearing temp on signal/return
     {
       printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$BOT_TOKEN_FALLBACK"
       printf 'data-urlencode = "chat_id=%s"\n' "$CHAT_ID"
@@ -97,7 +98,7 @@ send_alert() {
     } > "$cfg"
     local ok=1
     "$CURL" --config "$cfg" >/dev/null 2>&1 && ok=0
-    rm -f "$cfg"
+    rm -f "$cfg"   # (also covered by the RETURN trap)
     if [ "$ok" = 0 ]; then log "alert sent via raw-curl fallback"; return 0; fi
   fi
   log "ALERT DELIVERY FAILED (both bus CLI and raw curl)"
