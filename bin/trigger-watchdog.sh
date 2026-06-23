@@ -52,7 +52,12 @@ export CTX_AGENT_NAME="$BUS_AGENT"
 export CTX_AGENT_DIR="$CTX_FRAMEWORK_ROOT/orgs/$CTX_ORG/agents/$BUS_AGENT"
 
 CORTEXTOS="${CORTEXTOS_BIN:-/usr/bin/cortextos}"
-JQ="${JQ_BIN:-jq}"
+JQ="${JQ_BIN:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
+CURL="${CURL_BIN:-$(command -v curl 2>/dev/null || echo /usr/bin/curl)}"
+# Hard prereqs — fail loudly (in the log), never silently mis-classify.
+if ! command -v "$JQ" >/dev/null 2>&1 || ! command -v "$CURL" >/dev/null 2>&1; then
+  log "FATAL: jq or curl not found (jq=$JQ curl=$CURL) — cannot run watchdog"; exit 0
+fi
 
 # Resolve the alert chat + (optional) topic + raw-curl-fallback token from the
 # agent .env unless overridden. Read without sourcing (values may contain spaces).
@@ -79,16 +84,32 @@ send_alert() {
   fi
   log "bus CLI send failed — raw-curl Telegram fallback"
   if [ -n "$BOT_TOKEN_FALLBACK" ]; then
-    local form=(--data-urlencode "chat_id=$CHAT_ID" --data-urlencode "text=$msg")
-    [ -n "$THREAD_ID" ] && form+=(--data-urlencode "message_thread_id=$THREAD_ID")
-    if curl -fsS --max-time 15 "https://api.telegram.org/bot${BOT_TOKEN_FALLBACK}/sendMessage" \
-         "${form[@]}" >/dev/null 2>&1; then
-      log "alert sent via raw-curl fallback"
-      return 0
-    fi
+    # Token MUST go in the Telegram URL path. Keep it OUT of argv (ps-visible) by
+    # passing everything through a 0600 curl --config file, removed immediately.
+    local cfg; cfg="$(mktemp "${TMPDIR:-/tmp}/twd-XXXXXX")" || return 1
+    chmod 600 "$cfg"
+    {
+      printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$BOT_TOKEN_FALLBACK"
+      printf 'data-urlencode = "chat_id=%s"\n' "$CHAT_ID"
+      printf 'data-urlencode = "text=%s"\n' "$msg"
+      [ -n "$THREAD_ID" ] && printf 'data-urlencode = "message_thread_id=%s"\n' "$THREAD_ID"
+      printf 'max-time = 15\nsilent\nshow-error\nfail\n'
+    } > "$cfg"
+    local ok=1
+    "$CURL" --config "$cfg" >/dev/null 2>&1 && ok=0
+    rm -f "$cfg"
+    if [ "$ok" = 0 ]; then log "alert sent via raw-curl fallback"; return 0; fi
   fi
   log "ALERT DELIVERY FAILED (both bus CLI and raw curl)"
   return 1
+}
+
+# Atomic marker write (jq-escaped, temp+rename) — never corrupts on overlap/odd chars.
+write_marker() {
+  local since="$1" reason="$2" tmp
+  tmp="$(mktemp "$STATE_DIR/.marker-XXXXXX")" || return 1
+  "$JQ" -n --arg since "$since" --arg last "$(ts)" --arg reason "$reason" \
+    '{since:$since,last:$last,reason:$reason}' > "$tmp" && mv -f "$tmp" "$MARKER"
 }
 
 # ---------------------------------------------------------------------------
@@ -96,7 +117,7 @@ send_alert() {
 # ---------------------------------------------------------------------------
 fetch_status() {
   if [ -n "$STATUS_FIXTURE" ]; then cat "$STATUS_FIXTURE" 2>/dev/null; return $?; fi
-  curl -fsS --max-time 20 "$STATUS_URL" 2>/dev/null
+  "$CURL" -fsS --max-time 20 "$STATUS_URL" 2>/dev/null
 }
 
 JSON="$(fetch_status)"
@@ -133,22 +154,37 @@ log "check: aggregate=$AGG decision=$DECISION ${REASON:+($REASON)}"
 [ "$DRY_RUN" = "1" ] && echo "DECISION=$DECISION REASON=$REASON"
 
 DASH="https://status.trigger.dev"
+PENDING="$STATE_DIR/pending.count"
 if [ "$DECISION" = "PAGE" ]; then
   if [ -f "$MARKER" ]; then
-    # Already alerted this incident — re-derive each run, just refresh the marker ts.
-    [ "$DRY_RUN" = "1" ] || echo "{\"since\":\"$($JQ -r .since "$MARKER" 2>/dev/null || ts)\",\"last\":\"$(ts)\",\"reason\":\"$REASON\"}" > "$MARKER"
+    # Already alerted this incident — re-derive each run, refresh the marker ts.
+    [ "$DRY_RUN" = "1" ] || write_marker "$("$JQ" -r .since "$MARKER" 2>/dev/null || ts)" "$REASON"
     log "incident ongoing (already alerted): $REASON"
   else
-    if send_alert "🔴 Trigger.dev outage detected ($REASON). Hub automations (RFC classify, budget extension, syncs) may be stalled. Check $DASH . The Solo watchdog will say when it recovers."; then
-      [ "$DRY_RUN" = "1" ] || echo "{\"since\":\"$(ts)\",\"last\":\"$(ts)\",\"reason\":\"$REASON\"}" > "$MARKER"
+    # Debounce flapping: require the PAGE condition on >=2 consecutive cycles
+    # before the first alert (one transient blip shouldn't page).
+    cnt=0; [ -f "$PENDING" ] && cnt="$(cat "$PENDING" 2>/dev/null || echo 0)"
+    cnt=$((cnt + 1))
+    [ "$DRY_RUN" = "1" ] || echo "$cnt" > "$PENDING"
+    if [ "$cnt" -lt 2 ]; then
+      log "PAGE condition seen (cycle $cnt/2) — debouncing before alert: $REASON"
+    elif send_alert "🔴 Trigger.dev outage detected ($REASON). Hub automations (RFC classify, budget extension, syncs) may be stalled. Check $DASH . The Solo watchdog will say when it recovers."; then
+      [ "$DRY_RUN" = "1" ] || { write_marker "$(ts)" "$REASON"; rm -f "$PENDING"; }
     fi
   fi
 else
+  # Healthy cycle: reset the debounce counter.
+  [ "$DRY_RUN" = "1" ] || rm -f "$PENDING"
   if [ -f "$MARKER" ]; then
-    local_since="$($JQ -r .since "$MARKER" 2>/dev/null)"
-    send_alert "🟢 Trigger.dev recovered (aggregate_state=$AGG). Outage started $local_since. Hub automations should be flowing again."
-    [ "$DRY_RUN" = "1" ] || rm -f "$MARKER"
-    log "incident cleared (recovery sent), was since $local_since"
+    since="$("$JQ" -r .since "$MARKER" 2>/dev/null)"
+    # Only clear the marker if the recovery message actually delivered — else a
+    # transient send failure would permanently suppress the recovery notice.
+    if send_alert "🟢 Trigger.dev recovered (aggregate_state=$AGG). Outage started $since. Hub automations should be flowing again."; then
+      [ "$DRY_RUN" = "1" ] || rm -f "$MARKER"
+      log "incident cleared (recovery sent), was since $since"
+    else
+      log "recovery send FAILED — keeping marker, will retry next tick"
+    fi
   fi
 fi
 
