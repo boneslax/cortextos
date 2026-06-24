@@ -242,7 +242,8 @@ fi
 STALLED_NOW=(); CONTEXT_LINES=""
 for spec in "${PROJECTS[@]}"; do
   label="${spec%%:*}"; rest="${spec#*:}"; field="${rest##*:}"   # projref is implied by the project-scoped key
-  fixset="$(eval echo "\${WATCHDOG_RUNS_FIXTURE_${label}_EXECUTING:-}")"
+  fixvar="WATCHDOG_RUNS_FIXTURE_${label}_EXECUTING"; fixset=""   # guarded indirect, no eval
+  [ -n "${!fixvar:+x}" ] && fixset="${!fixvar}"
   if [ -n "$fixset" ]; then key="FIXTURE"; else key="$(get_key "$field")"; fi
   if [ -z "$key" ]; then
     log "[$label] no read key (1Password $field) — impact-check unavailable; NOT paging"
