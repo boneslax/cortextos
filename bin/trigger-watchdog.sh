@@ -169,10 +169,9 @@ if echo "$SJSON" | "$JQ" -e . >/dev/null 2>&1; then
 fi
 
 # ---- 1b impact check across both projects ----
-PAGE_PROJECTS=""; CONTEXT_LINES=""
+STALLED_NOW=(); CONTEXT_LINES=""
 for spec in "${PROJECTS[@]}"; do
-  label="${spec%%:*}"; rest="${spec#*:}"; projref="${rest%%:*}"; field="${rest##*:}"
-  # fixtures bypass the key; else pull it
+  label="${spec%%:*}"; rest="${spec#*:}"; field="${rest##*:}"   # projref is implied by the project-scoped key
   fixset="$(eval echo "\${WATCHDOG_RUNS_FIXTURE_${label}_EXECUTING:-}")"
   if [ -n "$fixset" ]; then key="FIXTURE"; else key="$(get_key "$field")"; fi
   if [ -z "$key" ]; then
@@ -181,40 +180,44 @@ for spec in "${PROJECTS[@]}"; do
     continue
   fi
   res="$(project_check "$label" "$key")"
-  verdict="${res%% *}"
   log "[$label] $res ($STATUS_CTX)"
   CONTEXT_LINES="$CONTEXT_LINES\n$label: $res"
-  [ "$verdict" = "STALL" ] && PAGE_PROJECTS="$PAGE_PROJECTS $label"
+  [ "${res%% *}" = "STALL" ] && STALLED_NOW+=("$label")
 done
-PAGE_PROJECTS="${PAGE_PROJECTS# }"
-[ "$DRY_RUN" = "1" ] && echo "DECISION=$([ -n "$PAGE_PROJECTS" ] && echo PAGE || echo OK) STALLED=[$PAGE_PROJECTS] $STATUS_CTX"
+[ "$DRY_RUN" = "1" ] && echo "DECISION=$([ "${#STALLED_NOW[@]}" -gt 0 ] && echo PAGE || echo OK) STALLED=[${STALLED_NOW[*]:-}] $STATUS_CTX"
 
-# ---- decide: PAGE only on a sustained impact stall (per-project debounce) ----
-MARKER="$STATE_DIR/incident-active.json"
-PENDING="$STATE_DIR/pending.count"
-if [ -n "$PAGE_PROJECTS" ]; then
-  if [ -f "$MARKER" ]; then
-    [ "$DRY_RUN" = "1" ] || { tmp="$(mktemp "$STATE_DIR/.m-XXXXXX")"; "$JQ" -n --arg s "$("$JQ" -r .since "$MARKER" 2>/dev/null||ts)" --arg l "$(ts)" --arg p "$PAGE_PROJECTS" '{since:$s,last:$l,projects:$p}' >"$tmp" && mv -f "$tmp" "$MARKER"; }
-    log "impact stall ongoing (already alerted): $PAGE_PROJECTS"
-  else
-    cnt=0; [ -f "$PENDING" ] && cnt="$(cat "$PENDING" 2>/dev/null || echo 0)"; cnt=$((cnt+1))
-    [ "$DRY_RUN" = "1" ] || echo "$cnt" > "$PENDING"
-    if [ "$cnt" -lt 2 ]; then
-      log "impact stall seen (cycle $cnt/2) — debouncing: $PAGE_PROJECTS"
-    elif send_alert "$(printf '🔴 Hub automations STALLED in Trigger.dev prod: %s. His prod has no executing runs + an aging queued backlog (>%dm) + nothing completing. Context %s.%b\nThe watchdog will report recovery.' "$PAGE_PROJECTS" "$STALL_MIN" "$STATUS_CTX" "$CONTEXT_LINES")"; then
-      [ "$DRY_RUN" = "1" ] || { "$JQ" -n --arg s "$(ts)" --arg l "$(ts)" --arg p "$PAGE_PROJECTS" '{since:$s,last:$l,projects:$p}' >"$MARKER"; rm -f "$PENDING"; }
-    fi
-  fi
-else
-  [ "$DRY_RUN" = "1" ] || rm -f "$PENDING"
-  if [ -f "$MARKER" ]; then
-    since="$("$JQ" -r .since "$MARKER" 2>/dev/null)"
-    if send_alert "🟢 Hub automations RECOVERED — Trigger.dev prod is executing again (was stalled since $since). $STATUS_CTX."; then
-      [ "$DRY_RUN" = "1" ] || rm -f "$MARKER"
-      log "impact stall cleared (recovery sent), was since $since"
+# ---- decide: PER-PROJECT debounce (>=2 consecutive cycles) + per-project marker ----
+# Each project alerts/recovers independently — a hubapp-then-helpdesk flap across two
+# cycles must NOT page (neither stalled 2 cycles in a row).
+is_stalled() { local x; for x in "${STALLED_NOW[@]:-}"; do [ "$x" = "$1" ] && return 0; done; return 1; }
+NEWLY=(); RECOVERED=()
+for spec in "${PROJECTS[@]}"; do
+  label="${spec%%:*}"; pend="$STATE_DIR/pending.$label"; mk="$STATE_DIR/incident.$label.json"
+  if is_stalled "$label"; then
+    if [ -f "$mk" ]; then
+      log "[$label] stall ongoing (already alerted)"
     else
-      log "recovery send FAILED — keeping marker, retry next tick"
+      cnt=0; [ -f "$pend" ] && cnt="$(cat "$pend" 2>/dev/null || echo 0)"; cnt=$((cnt+1))
+      [ "$DRY_RUN" = "1" ] || echo "$cnt" > "$pend"
+      if [ "$cnt" -ge 2 ]; then NEWLY+=("$label"); else log "[$label] stall cycle $cnt/2 — debouncing"; fi
     fi
+  else
+    [ "$DRY_RUN" = "1" ] || rm -f "$pend"
+    [ -f "$mk" ] && RECOVERED+=("$label")
+  fi
+done
+
+if [ "${#NEWLY[@]}" -gt 0 ]; then
+  if send_alert "$(printf '🔴 Hub automations STALLED in Trigger.dev prod: %s. No executing runs + an aging queued backlog (>%dm) + nothing completing. Context %s.%b\nThe watchdog will report recovery.' "${NEWLY[*]}" "$STALL_MIN" "$STATUS_CTX" "$CONTEXT_LINES")"; then
+    [ "$DRY_RUN" = "1" ] || for l in "${NEWLY[@]}"; do "$JQ" -n --arg s "$(ts)" --arg ll "$(ts)" '{since:$s,last:$ll}' > "$STATE_DIR/incident.$l.json"; rm -f "$STATE_DIR/pending.$l"; done
+  fi
+fi
+if [ "${#RECOVERED[@]}" -gt 0 ]; then
+  if send_alert "🟢 Hub automations RECOVERED in Trigger.dev prod: ${RECOVERED[*]} — executing again. $STATUS_CTX."; then
+    [ "$DRY_RUN" = "1" ] || for l in "${RECOVERED[@]}"; do rm -f "$STATE_DIR/incident.$l.json"; done
+    log "recovery sent: ${RECOVERED[*]}"
+  else
+    log "recovery send FAILED — keeping markers, retry next tick"
   fi
 fi
 exit 0

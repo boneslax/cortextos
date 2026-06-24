@@ -47,14 +47,17 @@ recovery sent only if the recovery message actually delivers.
 ```
 Defaults target the Solo deployment (`CTX_ROOT=/home/bones/.cortextos/default`,
 `CTX_ORG=vault`, bus agent `solo`); the alert chat + raw-curl token are read from
-the `solo` agent `.env` (`CHAT_ID`/`TOPIC_ID`/`BOT_TOKEN`). Override via
-`WATCHDOG_CHAT_ID` / `WATCHDOG_THREAD_ID` / `WATCHDOG_CRITICAL`. Dry-run +
-fixtures: `WATCHDOG_DRY_RUN=1 TRIGGER_STATUS_FIXTURE=<file> bin/trigger-watchdog.sh`.
+the `solo` agent `.env` (`CHAT_ID`/`TOPIC_ID`/`BOT_TOKEN`); the per-project prod read
+keys come from 1Password at runtime (service account). Tunables: `WATCHDOG_STALL_MIN`
+(default 10), `WATCHDOG_MIN_QUEUED`, `WATCHDOG_CHAT_ID`, `WATCHDOG_THREAD_ID`.
+**Re-enable the muted cron only with this impact-gate in place.** Test isolation:
+runs are fixture-injectable (`WATCHDOG_RUNS_FIXTURE_<label>_<STATUS>=<file>`,
+`WATCHDOG_STATUS_FIXTURE`), and tests force `TELEGRAM_API_BASE` at a dead endpoint +
+`CORTEXTOS_BIN`/`OP_SA_TOKEN_FILE=/nonexistent` so a real send is structurally
+impossible (a 2026-06-24 non-dry test leaked the real token + false-paged Bones —
+never run the watchdog non-dry against the real env outside an announced smoke test).
 
 ## Follow-ons (not in this PR)
-- **1b — runs-API execution check:** needs a Hub-scoped prod read key (Bones mints
-  in the Hub project's API keys). Adds the "0 EXECUTING + aging QUEUED backlog
-  across ≥2 cycles" tell for a silent stall the status page hasn't posted yet.
 - **Auto-failover:** per-run `.trigger(payload, { region })` override on the
   critical interactive Hub tasks; Solo writes a "healthy region" to a **Hub-side**
   store (Railway stays up during a Trigger outage). Hub-repo, Talha-coordinated.

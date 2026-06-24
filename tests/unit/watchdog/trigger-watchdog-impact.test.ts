@@ -73,12 +73,12 @@ describe('trigger-watchdog 1b impact classification', () => {
     const st = state();
     // cycle 1 (non-dry; send fails w/o token but state logic runs) → pending, no marker
     run(st, emptyExec, oldQ, oldDone, '0');
-    expect(existsSync(join(st, 'state/trigger-watchdog/incident-active.json'))).toBe(false);
-    expect(readFileSync(join(st, 'state/trigger-watchdog/pending.count'), 'utf-8').trim()).toBe('1');
+    expect(existsSync(join(st, 'state/trigger-watchdog/incident.hubapp.json'))).toBe(false);
+    expect(readFileSync(join(st, 'state/trigger-watchdog/pending.hubapp'), 'utf-8').trim()).toBe('1');
     // cycle 2 → attempts the page (send fails → marker only written on success, so still none,
     // but pending advances to 2 = past the debounce gate). Assert the debounce counted.
     run(st, emptyExec, oldQ, oldDone, '0');
-    expect(readFileSync(join(st, 'state/trigger-watchdog/pending.count'), 'utf-8').trim()).toBe('2');
+    expect(readFileSync(join(st, 'state/trigger-watchdog/pending.hubapp'), 'utf-8').trim()).toBe('2');
   });
 
   it('ISOLATION GUARD: a non-dry stall NEVER makes a real send (log shows delivery-failed, never "alert sent")', () => {
@@ -89,6 +89,6 @@ describe('trigger-watchdog 1b impact classification', () => {
     expect(logTxt).toContain('ALERT DELIVERY FAILED');   // it tried…
     expect(logTxt).not.toContain('alert sent');          // …and provably could NOT reach a live endpoint
     // and no marker was written (send never succeeded), so nothing was "delivered"
-    expect(existsSync(join(st, 'state/trigger-watchdog/incident-active.json'))).toBe(false);
+    expect(existsSync(join(st, 'state/trigger-watchdog/incident.hubapp.json'))).toBe(false);
   });
 });
