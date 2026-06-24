@@ -56,6 +56,11 @@ PROJECTS=(
 
 STATE_DIR="$CTX_ROOT/state/trigger-watchdog"
 LOG="$STATE_DIR/watchdog.log"
+KEYCACHE_DIR="$STATE_DIR/keycache"      # 0600 cached read keys (avoid op-per-tick rate limit)
+KEY_TTL="${WATCHDOG_KEY_TTL:-3600}"     # seconds before a cached key is refreshed from op
+HTTP_CODE_FILE="$STATE_DIR/.lasthttp.$$" # fetch_runs writes the HTTP status here (survives
+                                        # command-substitution subshells so the loop can read it);
+                                        # per-PID so overlapping runs can't clobber each other's code
 mkdir -p "$STATE_DIR"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "[$(ts)] $*" >> "$LOG"; }
@@ -113,18 +118,36 @@ age_secs() { # iso8601 -> seconds ago (echo big number if empty/unparseable)
 
 # Fetch a project's runs for a status. Honors WATCHDOG_RUNS_FIXTURE_<LABEL>_<STATUS>
 # (a file path) for tests so no key/network is needed.
+LAST_HTTP_CODE=""   # set by fetch_runs; the project loop busts the key cache on 401/403
+# Record an HTTP status to HTTP_CODE_FILE, but let an auth failure (401/403) STICK across the
+# three per-project fetches — a later 200 (COMPLETED) must not erase a 401 seen on an earlier
+# status query (EXECUTING/QUEUED), or the key-rotation bust would be missed.
+record_http_code() {
+  grep -qE '^(401|403)$' "$HTTP_CODE_FILE" 2>/dev/null && return 0
+  printf '%s' "$1" > "$HTTP_CODE_FILE" 2>/dev/null && chmod 600 "$HTTP_CODE_FILE" 2>/dev/null
+}
 fetch_runs() {
   local label="$1" key="$2" status="$3"
-  local fix; fix="$(eval echo "\${WATCHDOG_RUNS_FIXTURE_${label}_${status}:-}")"
-  if [ -n "$fix" ]; then cat "$fix" 2>/dev/null; return 0; fi
-  local cfg; cfg="$(mktemp "${TMPDIR:-/tmp}/twr-XXXXXX")" || return 1
-  chmod 600 "$cfg"; trap 'rm -f "$cfg"' RETURN
+  LAST_HTTP_CODE=""
+  local varname="WATCHDOG_RUNS_FIXTURE_${label}_${status}" fix=""   # indirect, no eval
+  [ -n "${!varname:+x}" ] && fix="${!varname}"                       # (:- form trips some bash; :+ is safe)
+  if [ -n "$fix" ]; then LAST_HTTP_CODE=200; record_http_code 200; cat "$fix" 2>/dev/null; return 0; fi
+  local cfg body; cfg="$(mktemp "${TMPDIR:-/tmp}/twr-XXXXXX")" || return 1
+  body="$(mktemp "${TMPDIR:-/tmp}/twb-XXXXXX")" || { rm -f "$cfg"; return 1; }
+  chmod 600 "$cfg"; trap 'rm -f "$cfg" "$body"' RETURN
   {
     printf 'url = "https://api.trigger.dev/api/v1/runs?filter[status]=%s&page[size]=20"\n' "$status"
     printf 'header = "Authorization: Bearer %s"\n' "$key"
-    printf 'globoff\nmax-time = 20\nsilent\nfail\n'
+    # No `fail` — we want the body+status even on an HTTP error so we can detect 401/403.
+    printf 'globoff\nmax-time = 20\nsilent\noutput = "%s"\nwrite-out = "%%{http_code}"\n' "$body"
   } > "$cfg"
-  "$CURL" --config "$cfg" 2>/dev/null; rm -f "$cfg"
+  chmod 600 "$body" 2>/dev/null
+  LAST_HTTP_CODE="$("$CURL" --config "$cfg" 2>/dev/null)"
+  # fetch_runs usually runs inside a command substitution, so a bare global wouldn't reach the
+  # caller — persist the code to a file the parent loop reads after project_check returns (401-sticky).
+  record_http_code "$LAST_HTTP_CODE"
+  cat "$body" 2>/dev/null
+  rm -f "$cfg" "$body"
 }
 
 # Per-project impact check. Echoes: "<VERDICT> exec=<n> queued=<n> doneAgeMin=<n>"
@@ -141,6 +164,7 @@ project_check() {
   local label="$1" key="$2"
   local execJson queuedJson doneJson exec queued doneNewest doneAge thr
   thr=$((STALL_MIN * 60))
+  : > "$HTTP_CODE_FILE" 2>/dev/null   # reset per project so a prior label's 401 doesn't leak in
   execJson="$(fetch_runs "$label" "$key" EXECUTING)"
   queuedJson="$(fetch_runs "$label" "$key" QUEUED)"
   doneJson="$(fetch_runs "$label" "$key" COMPLETED)"
@@ -159,13 +183,51 @@ project_check() {
   echo "$verdict exec=$exec queued=$queued doneAgeMin=$((doneAge/60))"
 }
 
-# Resolve both project read keys from 1Password (unless a fixture is supplying runs).
+# Drop a key's cache so the next run re-fetches from op (called on a runs-API 401/403 =
+# the key may have rotated).
+bust_key_cache() { rm -f "$KEYCACHE_DIR/$1.key" 2>/dev/null; }
+
+# Resolve a project read key, CACHED. Calling `op item get` every 3-min tick (2/run, ~40/hr)
+# tripped the 1Password SA rate limit and blinded the watchdog. So: serve a fresh cached key
+# (age < KEY_TTL) WITHOUT touching op; only call op when the cache is missing/stale; and on ANY
+# op failure (throttle/rate-limit) fall back to the LAST-GOOD cached key — stale-but-present beats
+# blind. Cache files are 0600. Returns "" only when op fails AND there's no cache at all.
 get_key() {
   local field="$1"
-  [ -f "$OP_SA_TOKEN_FILE" ] || { echo ""; return; }
-  OP_SERVICE_ACCOUNT_TOKEN="$(cat "$OP_SA_TOKEN_FILE")" "$OP" --vault="PKM Automation" \
-    item get "$OP_ITEM" --fields "$field" --reveal 2>/dev/null
+  local cache="$KEYCACHE_DIR/$field.key" cached="" age=99999999 mt now
+  if [ -f "$cache" ]; then
+    cached="$(cat "$cache" 2>/dev/null)"
+    mt="$(stat -c %Y "$cache" 2>/dev/null || echo 0)"; now="$(date -u +%s)"; age=$(( now - mt ))
+  fi
+  # Fresh cache hit — reuse, no op call.
+  if [ -n "$cached" ] && [ "$age" -lt "$KEY_TTL" ]; then echo "$cached"; return; fi
+  # Stale/missing — try op.
+  local fresh="" rc=1
+  if [ -f "$OP_SA_TOKEN_FILE" ]; then
+    fresh="$(OP_SERVICE_ACCOUNT_TOKEN="$(cat "$OP_SA_TOKEN_FILE")" "$OP" --vault="PKM Automation" \
+      item get "$OP_ITEM" --fields "$field" --reveal 2>/dev/null)"; rc=$?
+  fi
+  # Only trust op output when op actually SUCCEEDED — a nonzero exit that still printed to stdout
+  # (a wrapper, a future CLI quirk) must not poison the cache.
+  [ "$rc" -ne 0 ] && fresh=""
+  if [ -n "$fresh" ]; then
+    mkdir -p "$KEYCACHE_DIR" 2>/dev/null; chmod 700 "$KEYCACHE_DIR" 2>/dev/null
+    local t; t="$(mktemp "$KEYCACHE_DIR/.k-XXXXXX" 2>/dev/null)" \
+      && printf '%s' "$fresh" > "$t" && chmod 600 "$t" && mv -f "$t" "$cache"
+    echo "$fresh"; return
+  fi
+  # op failed (rate-limit/throttle/missing token). Don't go blind — serve last-good if we have it.
+  if [ -n "$cached" ]; then
+    log "[keycache] op fetch failed for $field — using last-good cached key (age ${age}s)"
+    echo "$cached"; return
+  fi
+  log "[keycache] op fetch failed for $field + no cache — key unavailable"
+  echo ""
 }
+
+# Test seam: sourcing with WATCHDOG_LIB_ONLY=1 loads the functions (get_key, fetch_runs,
+# bust_key_cache, …) WITHOUT running the monitor, so they can be unit-tested in isolation.
+if [ "${WATCHDOG_LIB_ONLY:-0}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
 
 # ---- 1a status.trigger.dev as CONTEXT (never the trigger) ----
 STATUS_CTX="status:unknown"
@@ -180,7 +242,8 @@ fi
 STALLED_NOW=(); CONTEXT_LINES=""
 for spec in "${PROJECTS[@]}"; do
   label="${spec%%:*}"; rest="${spec#*:}"; field="${rest##*:}"   # projref is implied by the project-scoped key
-  fixset="$(eval echo "\${WATCHDOG_RUNS_FIXTURE_${label}_EXECUTING:-}")"
+  fixvar="WATCHDOG_RUNS_FIXTURE_${label}_EXECUTING"; fixset=""   # guarded indirect, no eval
+  [ -n "${!fixvar:+x}" ] && fixset="${!fixvar}"
   if [ -n "$fixset" ]; then key="FIXTURE"; else key="$(get_key "$field")"; fi
   if [ -z "$key" ]; then
     log "[$label] no read key (1Password $field) — impact-check unavailable; NOT paging"
@@ -188,6 +251,13 @@ for spec in "${PROJECTS[@]}"; do
     continue
   fi
   res="$(project_check "$label" "$key")"
+  # Auth failure on the runs API => the cached key may have rotated. Bust it so the next
+  # run re-fetches from op (don't keep serving a dead key from cache). The code comes from
+  # HTTP_CODE_FILE because project_check/fetch_runs ran in subshells (a global wouldn't survive).
+  http_code="$(cat "$HTTP_CODE_FILE" 2>/dev/null || echo)"
+  case "$http_code" in
+    401|403) [ "$key" != "FIXTURE" ] && { bust_key_cache "$field"; log "[$label] runs API $http_code — busted key cache (rotated?)"; } ;;
+  esac
   log "[$label] $res ($STATUS_CTX)"
   CONTEXT_LINES="$CONTEXT_LINES\n$label: $res"
   [ "${res%% *}" = "STALL" ] && STALLED_NOW+=("$label")
@@ -228,4 +298,5 @@ if [ "${#RECOVERED[@]}" -gt 0 ]; then
     log "recovery send FAILED — keeping markers, retry next tick"
   fi
 fi
+rm -f "$HTTP_CODE_FILE" 2>/dev/null   # per-PID scratch; don't accumulate
 exit 0
