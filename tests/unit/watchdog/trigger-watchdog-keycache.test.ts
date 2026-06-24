@@ -29,6 +29,10 @@ beforeAll(() => {
   chmodSync(opStub, 0o755);
   // curl stub: for a runs fetch (--config <cfg>) it writes a body to the cfg's `output` path and
   // prints $STUB_HTTP (the write-out code); for the status GET (no --config) it prints nothing.
+  // curl stub: for a runs fetch (--config <cfg>) it writes a body to the cfg's `output` path and
+  // prints the write-out code. STUB_HTTP sets the code; STUB_HTTP_MIXED=1 returns 401 ONLY for the
+  // EXECUTING query and 200 otherwise (to prove a 401 on an early status still busts). No --config
+  // (the status GET) prints nothing.
   curlStub = join(d, 'curl');
   writeFileSync(curlStub,
     '#!/bin/bash\n' +
@@ -36,7 +40,9 @@ beforeAll(() => {
     'if [ -n "$cfg" ]; then\n' +
     '  body="$(sed -n \'s/.*output = "\\([^"]*\\)".*/\\1/p\' "$cfg")"\n' +
     '  [ -n "$body" ] && echo \'{"error":"unauthorized"}\' > "$body"\n' +
-    '  printf "%s" "${STUB_HTTP:-200}"\n' +
+    '  code="${STUB_HTTP:-200}"\n' +
+    '  if [ "${STUB_HTTP_MIXED:-0}" = "1" ]; then grep -q "EXECUTING" "$cfg" && code=401 || code=200; fi\n' +
+    '  printf "%s" "$code"\n' +
     'fi\n');
   chmodSync(curlStub, 0o755);
 });
@@ -128,26 +134,43 @@ describe('trigger-watchdog get_key cache', () => {
     execFileSync('bash', ['-c', `source "${SCRIPT}"; fetch_runs hubapp KEY EXECUTING >/dev/null`], {
       env: { ...process.env, WATCHDOG_LIB_ONLY: '1', CTX_ROOT: state, CURL_BIN: curlStub, STUB_HTTP: '401' }, encoding: 'utf-8',
     });
-    expect(readFileSync(join(state, 'state/trigger-watchdog/.lasthttp'), 'utf-8').trim()).toBe('401');
+    const dir = join(state, 'state/trigger-watchdog');
+    const codeFile = execFileSync('bash', ['-c', `cat "${dir}"/.lasthttp.* 2>/dev/null`], { encoding: 'utf-8' }).trim();
+    expect(codeFile).toBe('401');
   });
 
-  it('full run: a 401 on the runs API BUSTS the cached key (so next tick re-fetches)', () => {
-    // seed a fresh cache for both projects so get_key serves them with NO op (op token absent)
-    const state = mkdtempSync(join(tmpdir(), 'wdkc-401-'));
+  // helper: seed a fresh cache for both projects + run the full monitor with the curl stub
+  function fullRunWithSeededCache(env: Record<string, string>) {
+    const state = mkdtempSync(join(tmpdir(), 'wdkc-full-'));
     const kc = join(state, 'state/trigger-watchdog/keycache');
     execFileSync('mkdir', ['-p', kc]);
     for (const f of ['hubapp_prod_read_key', 'helpdesk_prod_read_key']) writeFileSync(join(kc, `${f}.key`), 'tr_prod_SEEDED');
     execFileSync('bash', [SCRIPT], {
       env: {
-        ...process.env, CTX_ROOT: state, WATCHDOG_STATUS_FIXTURE: '/dev/null', CURL_BIN: curlStub, STUB_HTTP: '401',
-        // never reach op or a real send
+        ...process.env, CTX_ROOT: state, WATCHDOG_STATUS_FIXTURE: '/dev/null', CURL_BIN: curlStub,
         OP_SA_TOKEN_FILE: '/nonexistent', CTX_FRAMEWORK_ROOT: isoFwRoot, CORTEXTOS_BIN: '/nonexistent',
-        WATCHDOG_CHAT_ID: '000', TELEGRAM_API_BASE: 'http://127.0.0.1:9', WATCHDOG_KEY_TTL: '3600',
+        WATCHDOG_CHAT_ID: '000', TELEGRAM_API_BASE: 'http://127.0.0.1:9', WATCHDOG_KEY_TTL: '3600', ...env,
       },
       encoding: 'utf-8',
     });
-    // both cache files busted by the 401
-    expect(existsSync(join(kc, 'hubapp_prod_read_key.key'))).toBe(false);
-    expect(existsSync(join(kc, 'helpdesk_prod_read_key.key'))).toBe(false);
+    return { hub: join(kc, 'hubapp_prod_read_key.key'), help: join(kc, 'helpdesk_prod_read_key.key') };
+  }
+
+  it('full run: a 401 on the runs API BUSTS the cached key (so next tick re-fetches)', () => {
+    const r = fullRunWithSeededCache({ STUB_HTTP: '401' });
+    expect(existsSync(r.hub)).toBe(false);
+    expect(existsSync(r.help)).toBe(false);
+  });
+
+  it('full run: 401 on EXECUTING but 200 on COMPLETED STILL busts (401-sticky across fetches)', () => {
+    const r = fullRunWithSeededCache({ STUB_HTTP_MIXED: '1' });
+    expect(existsSync(r.hub)).toBe(false); // the early 401 must not be erased by the later 200
+    expect(existsSync(r.help)).toBe(false);
+  });
+
+  it('full run: healthy 200s do NOT bust the cache', () => {
+    const r = fullRunWithSeededCache({ STUB_HTTP: '200' });
+    expect(existsSync(r.hub)).toBe(true);
+    expect(existsSync(r.help)).toBe(true);
   });
 });

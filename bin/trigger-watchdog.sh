@@ -58,8 +58,9 @@ STATE_DIR="$CTX_ROOT/state/trigger-watchdog"
 LOG="$STATE_DIR/watchdog.log"
 KEYCACHE_DIR="$STATE_DIR/keycache"      # 0600 cached read keys (avoid op-per-tick rate limit)
 KEY_TTL="${WATCHDOG_KEY_TTL:-3600}"     # seconds before a cached key is refreshed from op
-HTTP_CODE_FILE="$STATE_DIR/.lasthttp"   # fetch_runs writes the last HTTP status here (survives
-                                        # command-substitution subshells so the loop can read it)
+HTTP_CODE_FILE="$STATE_DIR/.lasthttp.$$" # fetch_runs writes the HTTP status here (survives
+                                        # command-substitution subshells so the loop can read it);
+                                        # per-PID so overlapping runs can't clobber each other's code
 mkdir -p "$STATE_DIR"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "[$(ts)] $*" >> "$LOG"; }
@@ -118,11 +119,19 @@ age_secs() { # iso8601 -> seconds ago (echo big number if empty/unparseable)
 # Fetch a project's runs for a status. Honors WATCHDOG_RUNS_FIXTURE_<LABEL>_<STATUS>
 # (a file path) for tests so no key/network is needed.
 LAST_HTTP_CODE=""   # set by fetch_runs; the project loop busts the key cache on 401/403
+# Record an HTTP status to HTTP_CODE_FILE, but let an auth failure (401/403) STICK across the
+# three per-project fetches — a later 200 (COMPLETED) must not erase a 401 seen on an earlier
+# status query (EXECUTING/QUEUED), or the key-rotation bust would be missed.
+record_http_code() {
+  grep -qE '^(401|403)$' "$HTTP_CODE_FILE" 2>/dev/null && return 0
+  printf '%s' "$1" > "$HTTP_CODE_FILE" 2>/dev/null && chmod 600 "$HTTP_CODE_FILE" 2>/dev/null
+}
 fetch_runs() {
   local label="$1" key="$2" status="$3"
   LAST_HTTP_CODE=""
-  local fix; fix="$(eval echo "\${WATCHDOG_RUNS_FIXTURE_${label}_${status}:-}")"
-  if [ -n "$fix" ]; then LAST_HTTP_CODE=200; printf '200' > "$HTTP_CODE_FILE" 2>/dev/null; cat "$fix" 2>/dev/null; return 0; fi
+  local varname="WATCHDOG_RUNS_FIXTURE_${label}_${status}" fix=""   # indirect, no eval
+  [ -n "${!varname:+x}" ] && fix="${!varname}"                       # (:- form trips some bash; :+ is safe)
+  if [ -n "$fix" ]; then LAST_HTTP_CODE=200; record_http_code 200; cat "$fix" 2>/dev/null; return 0; fi
   local cfg body; cfg="$(mktemp "${TMPDIR:-/tmp}/twr-XXXXXX")" || return 1
   body="$(mktemp "${TMPDIR:-/tmp}/twb-XXXXXX")" || { rm -f "$cfg"; return 1; }
   chmod 600 "$cfg"; trap 'rm -f "$cfg" "$body"' RETURN
@@ -132,10 +141,11 @@ fetch_runs() {
     # No `fail` — we want the body+status even on an HTTP error so we can detect 401/403.
     printf 'globoff\nmax-time = 20\nsilent\noutput = "%s"\nwrite-out = "%%{http_code}"\n' "$body"
   } > "$cfg"
+  chmod 600 "$body" 2>/dev/null
   LAST_HTTP_CODE="$("$CURL" --config "$cfg" 2>/dev/null)"
   # fetch_runs usually runs inside a command substitution, so a bare global wouldn't reach the
-  # caller — persist the code to a file the parent loop reads after project_check returns.
-  printf '%s' "$LAST_HTTP_CODE" > "$HTTP_CODE_FILE" 2>/dev/null
+  # caller — persist the code to a file the parent loop reads after project_check returns (401-sticky).
+  record_http_code "$LAST_HTTP_CODE"
   cat "$body" 2>/dev/null
   rm -f "$cfg" "$body"
 }
@@ -154,6 +164,7 @@ project_check() {
   local label="$1" key="$2"
   local execJson queuedJson doneJson exec queued doneNewest doneAge thr
   thr=$((STALL_MIN * 60))
+  : > "$HTTP_CODE_FILE" 2>/dev/null   # reset per project so a prior label's 401 doesn't leak in
   execJson="$(fetch_runs "$label" "$key" EXECUTING)"
   queuedJson="$(fetch_runs "$label" "$key" QUEUED)"
   doneJson="$(fetch_runs "$label" "$key" COMPLETED)"
@@ -286,4 +297,5 @@ if [ "${#RECOVERED[@]}" -gt 0 ]; then
     log "recovery send FAILED — keeping markers, retry next tick"
   fi
 fi
+rm -f "$HTTP_CODE_FILE" 2>/dev/null   # per-PID scratch; don't accumulate
 exit 0
