@@ -58,6 +58,8 @@ STATE_DIR="$CTX_ROOT/state/trigger-watchdog"
 LOG="$STATE_DIR/watchdog.log"
 KEYCACHE_DIR="$STATE_DIR/keycache"      # 0600 cached read keys (avoid op-per-tick rate limit)
 KEY_TTL="${WATCHDOG_KEY_TTL:-3600}"     # seconds before a cached key is refreshed from op
+HTTP_CODE_FILE="$STATE_DIR/.lasthttp"   # fetch_runs writes the last HTTP status here (survives
+                                        # command-substitution subshells so the loop can read it)
 mkdir -p "$STATE_DIR"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "[$(ts)] $*" >> "$LOG"; }
@@ -120,7 +122,7 @@ fetch_runs() {
   local label="$1" key="$2" status="$3"
   LAST_HTTP_CODE=""
   local fix; fix="$(eval echo "\${WATCHDOG_RUNS_FIXTURE_${label}_${status}:-}")"
-  if [ -n "$fix" ]; then LAST_HTTP_CODE=200; cat "$fix" 2>/dev/null; return 0; fi
+  if [ -n "$fix" ]; then LAST_HTTP_CODE=200; printf '200' > "$HTTP_CODE_FILE" 2>/dev/null; cat "$fix" 2>/dev/null; return 0; fi
   local cfg body; cfg="$(mktemp "${TMPDIR:-/tmp}/twr-XXXXXX")" || return 1
   body="$(mktemp "${TMPDIR:-/tmp}/twb-XXXXXX")" || { rm -f "$cfg"; return 1; }
   chmod 600 "$cfg"; trap 'rm -f "$cfg" "$body"' RETURN
@@ -131,6 +133,9 @@ fetch_runs() {
     printf 'globoff\nmax-time = 20\nsilent\noutput = "%s"\nwrite-out = "%%{http_code}"\n' "$body"
   } > "$cfg"
   LAST_HTTP_CODE="$("$CURL" --config "$cfg" 2>/dev/null)"
+  # fetch_runs usually runs inside a command substitution, so a bare global wouldn't reach the
+  # caller — persist the code to a file the parent loop reads after project_check returns.
+  printf '%s' "$LAST_HTTP_CODE" > "$HTTP_CODE_FILE" 2>/dev/null
   cat "$body" 2>/dev/null
   rm -f "$cfg" "$body"
 }
@@ -186,11 +191,14 @@ get_key() {
   # Fresh cache hit — reuse, no op call.
   if [ -n "$cached" ] && [ "$age" -lt "$KEY_TTL" ]; then echo "$cached"; return; fi
   # Stale/missing — try op.
-  local fresh=""
+  local fresh="" rc=1
   if [ -f "$OP_SA_TOKEN_FILE" ]; then
     fresh="$(OP_SERVICE_ACCOUNT_TOKEN="$(cat "$OP_SA_TOKEN_FILE")" "$OP" --vault="PKM Automation" \
-      item get "$OP_ITEM" --fields "$field" --reveal 2>/dev/null)"
+      item get "$OP_ITEM" --fields "$field" --reveal 2>/dev/null)"; rc=$?
   fi
+  # Only trust op output when op actually SUCCEEDED — a nonzero exit that still printed to stdout
+  # (a wrapper, a future CLI quirk) must not poison the cache.
+  [ "$rc" -ne 0 ] && fresh=""
   if [ -n "$fresh" ]; then
     mkdir -p "$KEYCACHE_DIR" 2>/dev/null; chmod 700 "$KEYCACHE_DIR" 2>/dev/null
     local t; t="$(mktemp "$KEYCACHE_DIR/.k-XXXXXX" 2>/dev/null)" \
@@ -232,9 +240,11 @@ for spec in "${PROJECTS[@]}"; do
   fi
   res="$(project_check "$label" "$key")"
   # Auth failure on the runs API => the cached key may have rotated. Bust it so the next
-  # run re-fetches from op (don't keep serving a dead key from cache).
-  case "$LAST_HTTP_CODE" in
-    401|403) [ "$key" != "FIXTURE" ] && { bust_key_cache "$field"; log "[$label] runs API $LAST_HTTP_CODE — busted key cache (rotated?)"; } ;;
+  # run re-fetches from op (don't keep serving a dead key from cache). The code comes from
+  # HTTP_CODE_FILE because project_check/fetch_runs ran in subshells (a global wouldn't survive).
+  http_code="$(cat "$HTTP_CODE_FILE" 2>/dev/null || echo)"
+  case "$http_code" in
+    401|403) [ "$key" != "FIXTURE" ] && { bust_key_cache "$field"; log "[$label] runs API $http_code — busted key cache (rotated?)"; } ;;
   esac
   log "[$label] $res ($STATUS_CTX)"
   CONTEXT_LINES="$CONTEXT_LINES\n$label: $res"
