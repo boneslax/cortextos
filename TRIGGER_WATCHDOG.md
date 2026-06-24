@@ -8,20 +8,37 @@ survives both a Trigger.dev outage and the cortextOS daemon/LLM being down.
 
 `bin/trigger-watchdog.sh` — pure shell, no npm deps, never spawns Claude.
 
-## Layer 1a (this PR): status-page detection (no credential)
-Curls `https://status.trigger.dev/index.json` (Better Stack) each run and pages
-Bones on Telegram when:
-- `aggregate_state == downtime`, OR
-- a **CRITICAL** component (`Trigger.dev cloud`, `Trigger.dev API`) is `downtime`/`degraded`.
+## Trigger = IMPACT (1b): does HIS prod actually stall
+**Why impact-not-status (first-fire learning, 2026-06-24):** the 1a status-only
+version paged on `aggregate_state=downtime` — but that fired on a **non-used region
+(eu-central-1) flapping** while Bones's prod (us-east-1) executed fine. So
+`status=downtime ≠ his-automations-impacted`. Bones's requirement: *"check if MY
+automations are impacted before alerting."*
 
-Non-critical components (`Realtime`, `OpenTelemetry`, `Deployments`) degraded =
-context only, **no page** (avoids the false-page the 2026-06-22 live state would
-have caused: Realtime down while the API was operational).
+So the **page trigger is the runs-API impact check** across BOTH Hub prod Trigger
+projects (`hubapp` = primary `proj_luyejwcyhjfojxxgwlit`; `helpdesk` = secondary
+`proj_dmalyhsdqqxehlagufef`). A project is **STALLED** only when, in its prod:
+`EXECUTING == 0` **AND** an aging `QUEUED` backlog (oldest > `WATCHDOG_STALL_MIN`,
+default 10m) **AND** nothing `COMPLETED` within `STALL_MIN` — the exact 2026-06-22
+signature. PAGE on a STALL in **either** project, sustained ≥2 cycles (debounce);
+recovery message on clear. A **momentary 0-EXECUTING snapshot is NORMAL** (per-minute
+cron ticks) and does NOT page — the age + last-completed gates + the debounce kill it.
 
-Alert path: `cortextos bus send-telegram … --plain-text`, with a **raw-curl
-Telegram fallback** if the cortextOS CLI itself is broken. Dedup via a timestamped
-marker (`$CTX_ROOT/state/trigger-watchdog/incident-active.json`); state is
-re-derived from the status page every run; a recovery message is sent on clear.
+**status.trigger.dev is CONTEXT, never the trigger** — fetched + included in the
+page/log for color; status-degraded-while-his-prod-executes is INFO only.
+**Region-aware for free:** if his runs execute, no page, whatever region the status
+page flags.
+
+**Credential:** per-project prod READ keys from 1Password item `Trigger.dev`
+(`chagb6unxtfqljbcrxu4pxmqxe`, fields `hubapp_prod_read_key` / `helpdesk_prod_read_key`),
+pulled at runtime via the service account, passed to `curl` through a **0600
+`--config`** file (Bearer never in argv; `--globoff` for the `[ ]` filter params).
+If a key is unavailable → that project's check is skipped + logged, **never paged**.
+
+Alert path: `cortextos bus send-telegram … --plain-text`, with a **raw-curl Telegram
+fallback** if the cortextOS CLI itself is broken. Per-incident timestamped marker
+(`$CTX_ROOT/state/trigger-watchdog/incident-active.json`); state re-derived every run;
+recovery sent only if the recovery message actually delivers.
 
 ## Install (run on Solo, with solo)
 ```bash
