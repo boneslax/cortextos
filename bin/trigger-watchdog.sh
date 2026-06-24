@@ -19,8 +19,8 @@
 # execute, no page, regardless of which region the status page flags.
 #
 # Tunables (env):
-#   WATCHDOG_STALL_MIN     minutes: oldest-queued-age AND last-completed-age must BOTH
-#                          exceed this to call a project STALLED (default 10)
+#   WATCHDOG_STALL_MIN     minutes: a project is STALLED when nothing has COMPLETED in this
+#                          window AND there's 0 executing + a queued backlog (default 10)
 #   WATCHDOG_MIN_QUEUED    queued count that counts as a backlog (default 1)
 #   WATCHDOG_DRY_RUN       "1" => classify + log + print DECISION, skip send + state writes
 #   WATCHDOG_STATUS_FIXTURE / WATCHDOG_RUNS_FIXTURE_<LABEL>_<STATUS>  test injection (read a
