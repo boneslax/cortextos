@@ -23,7 +23,9 @@
 #                          exceed this to call a project STALLED (default 10)
 #   WATCHDOG_MIN_QUEUED    queued count that counts as a backlog (default 1)
 #   WATCHDOG_DRY_RUN       "1" => classify + log + print DECISION, skip send + state writes
-#   WATCHDOG_STATUS_FIXTURE / WATCHDOG_TEST_<LABEL>  test injection (see below)
+#   WATCHDOG_STATUS_FIXTURE / WATCHDOG_RUNS_FIXTURE_<LABEL>_<STATUS>  test injection (read a
+#                          local JSON fixture instead of curling status / a project's runs)
+#   TELEGRAM_API_BASE      override the Telegram API base (tests point it at a dead endpoint)
 #   WATCHDOG_CHAT_ID / WATCHDOG_THREAD_ID            alert target (default: solo agent .env)
 #   OP_SA_TOKEN_FILE       1Password service-account token (default ~/.config/opbot/sa-token)
 #   CTX_ROOT/CTX_FRAMEWORK_ROOT/CTX_ORG/WATCHDOG_BUS_AGENT  cortextOS context (Solo defaults)
@@ -125,30 +127,36 @@ fetch_runs() {
   "$CURL" --config "$cfg" 2>/dev/null; rm -f "$cfg"
 }
 
-# Per-project impact check. Echoes: "<VERDICT> exec=<n> queued=<n> qAgeMin=<n> doneAgeMin=<n>"
-# VERDICT=STALL|OK|UNKNOWN. STALL = exec==0 AND queued>=MIN AND oldest-queued-age>STALL AND
-# last-completed-age>STALL (his prod is not executing + a real aging backlog + nothing finishing).
+# Per-project impact check. Echoes: "<VERDICT> exec=<n> queued=<n> doneAgeMin=<n>"
+# VERDICT=STALL|OK|UNKNOWN. STALL = exec==0 AND queued>=MIN AND last-completed-age>STALL_MIN
+# (his prod has nothing executing, a queued backlog, and nothing has finished in STALL_MIN).
+# NOTE on pagination (gate review): we deliberately gate on LAST-COMPLETED age, not oldest-
+# queued age. COMPLETED is returned newest-first, so max(finishedAt) over the first page is the
+# true newest completion (accurate regardless of how deep the backlog is). "oldest queued age"
+# would need the true oldest, which a newest-first page of a >page-size backlog can't give —
+# so it's dropped from the gate (kept out to avoid a false-negative). The >=2-cycle debounce
+# rejects a fresh queued burst (it would start completing by cycle 2). queued>=MIN only needs
+# "is there a backlog at all", which a page reports accurately.
 project_check() {
   local label="$1" key="$2"
-  local execJson queuedJson doneJson exec queued qOldest doneNewest qAge doneAge thr
+  local execJson queuedJson doneJson exec queued doneNewest doneAge thr
   thr=$((STALL_MIN * 60))
   execJson="$(fetch_runs "$label" "$key" EXECUTING)"
   queuedJson="$(fetch_runs "$label" "$key" QUEUED)"
   doneJson="$(fetch_runs "$label" "$key" COMPLETED)"
   # any fetch unparseable -> UNKNOWN (don't page on a bad read)
   for j in "$execJson" "$queuedJson" "$doneJson"; do
-    echo "$j" | "$JQ" -e '.data' >/dev/null 2>&1 || { echo "UNKNOWN exec=- queued=- qAgeMin=- doneAgeMin=-"; return; }
+    echo "$j" | "$JQ" -e '.data' >/dev/null 2>&1 || { echo "UNKNOWN exec=- queued=- doneAgeMin=-"; return; }
   done
   exec="$(echo "$execJson" | "$JQ" '.data | length')"
   queued="$(echo "$queuedJson" | "$JQ" '.data | length')"
-  qOldest="$(echo "$queuedJson" | "$JQ" -r '[.data[].createdAt] | min // ""')"
   doneNewest="$(echo "$doneJson" | "$JQ" -r '[.data[].finishedAt] | max // ""')"
-  qAge="$(age_secs "$qOldest")"; doneAge="$(age_secs "$doneNewest")"
+  doneAge="$(age_secs "$doneNewest")"
   local verdict="OK"
-  if [ "$exec" -eq 0 ] && [ "$queued" -ge "$MIN_QUEUED" ] && [ "$qAge" -gt "$thr" ] && [ "$doneAge" -gt "$thr" ]; then
+  if [ "$exec" -eq 0 ] && [ "$queued" -ge "$MIN_QUEUED" ] && [ "$doneAge" -gt "$thr" ]; then
     verdict="STALL"
   fi
-  echo "$verdict exec=$exec queued=$queued qAgeMin=$((qAge/60)) doneAgeMin=$((doneAge/60))"
+  echo "$verdict exec=$exec queued=$queued doneAgeMin=$((doneAge/60))"
 }
 
 # Resolve both project read keys from 1Password (unless a fixture is supplying runs).
@@ -209,7 +217,7 @@ done
 
 if [ "${#NEWLY[@]}" -gt 0 ]; then
   if send_alert "$(printf '🔴 Hub automations STALLED in Trigger.dev prod: %s. No executing runs + an aging queued backlog (>%dm) + nothing completing. Context %s.%b\nThe watchdog will report recovery.' "${NEWLY[*]}" "$STALL_MIN" "$STATUS_CTX" "$CONTEXT_LINES")"; then
-    [ "$DRY_RUN" = "1" ] || for l in "${NEWLY[@]}"; do "$JQ" -n --arg s "$(ts)" --arg ll "$(ts)" '{since:$s,last:$ll}' > "$STATE_DIR/incident.$l.json"; rm -f "$STATE_DIR/pending.$l"; done
+    [ "$DRY_RUN" = "1" ] || for l in "${NEWLY[@]}"; do mt="$(mktemp "$STATE_DIR/.m-XXXXXX")"; "$JQ" -n --arg s "$(ts)" --arg ll "$(ts)" '{since:$s,last:$ll}' > "$mt" && mv -f "$mt" "$STATE_DIR/incident.$l.json"; rm -f "$STATE_DIR/pending.$l"; done
   fi
 fi
 if [ "${#RECOVERED[@]}" -gt 0 ]; then
