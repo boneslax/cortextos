@@ -51,7 +51,12 @@ log() { echo "[$(ts)] $*" >> "$LOG"; }
 # Validate numeric tunables — a typo'd env var must NOT blind the watchdog (a non-numeric
 # threshold would break the `-ge` compare → false-negative) or break arithmetic under set -u
 # (exit 1, violating the exit-0-always cron contract). Fall back to the documented default.
-numdef() { case "$2" in ''|*[!0-9]*) log "WARN: $1='$2' is not a positive integer — using default $3"; printf '%s' "$3" ;; *) printf '%s' "$2" ;; esac; }
+numdef() {
+  case "$2" in
+    ''|*[!0-9]*) log "WARN: $1='$2' is not a positive integer — using default $3"; printf '%s' "$3"; return ;;
+  esac
+  if [ "$2" -gt 0 ]; then printf '%s' "$2"; else log "WARN: $1='$2' must be > 0 — using default $3"; printf '%s' "$3"; fi
+}
 PAGE_PCT="$(numdef DISK_PAGE_PCT "$PAGE_PCT" 90)"
 WARN_PCT="$(numdef DISK_WARN_PCT "$WARN_PCT" 80)"
 RUNAWAY_GB="$(numdef RUNAWAY_GB "$RUNAWAY_GB" 25)"
@@ -122,8 +127,9 @@ if [ "${DISK_WATCHDOG_LIB_ONLY:-0}" = "1" ]; then return 0 2>/dev/null || exit 0
 # Serialize the state machine: a non-blocking flock so two overlapping cron runs can't race the
 # pending counter / marker (double-send or a lost debounce increment). If a run is already
 # holding it, skip this tick (the next one covers it). flock is optional — degrade if absent.
-exec 9>"$STATE_DIR/.lock" 2>/dev/null || true
-if command -v flock >/dev/null 2>&1; then
+# Only engage the lock when flock exists AND the lock file opens — if the lock can't be opened
+# we run UNLOCKED (degrade) rather than mislabel it as contention and skip a real tick.
+if command -v flock >/dev/null 2>&1 && exec 9>"$STATE_DIR/.lock" 2>/dev/null; then
   flock -n 9 || { log "another disk-watchdog run holds the lock — skipping this tick"; exit 0; }
 fi
 
