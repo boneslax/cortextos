@@ -72,6 +72,18 @@ describe('disk-watchdog classification', () => {
     expect(logOf(ctx)).not.toContain('integer expression');
   });
 
+  it('a typo\'d numeric tunable falls back to its default — never blinds the watchdog', () => {
+    // DISK_PAGE_PCT=abc must NOT break the `-ge` compare; it falls back to 90 so 95% still PAGEs.
+    const out = run({ df: '95', logsize: '1 /x', extra: { DISK_PAGE_PCT: 'abc' } });
+    expect(out).toContain('DECISION=PAGE');
+  });
+
+  it('a typo\'d RUNAWAY_GB exits 0 (cron contract), does not throw', () => {
+    // non-numeric RUNAWAY_GB would break arithmetic under set -u → exit 1; must fall back instead
+    const ctx = state();
+    expect(() => run({ df: '50', logsize: '1 /x', ctx, extra: { RUNAWAY_GB: 'abc' } })).not.toThrow();
+  });
+
   it('non-numeric df → FATAL exit, no crash, no decision', () => {
     const out = run({ df: 'N/A', logsize: '1000 /x' });
     expect(out).not.toContain('DECISION=');
@@ -116,7 +128,7 @@ describe('disk-watchdog state machine', () => {
     expect(logOf(ctx)).not.toContain('recovery sent');
   });
 
-  it('recovery: with an active marker, < warn% (80) clears the marker (attempts recovery)', () => {
+  it('recovery: with an active marker, < warn% (80) takes the recovery path (send isolated → attempted, marker kept)', () => {
     const ctx = state();
     const mdir = join(ctx, 'state/disk-watchdog');
     mkdirSync(mdir, { recursive: true });
