@@ -4,8 +4,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, existsSync, readFile
 import { join } from 'path';
 import { tmpdir } from 'os';
 
-// BLIND-RISK key-refresh-staleness self-alert for bin/trigger-watchdog.NEW.sh (the GATED copy —
-// NOT the live trigger-watchdog.sh; the orchestrator moves the copy into place after this passes).
+// BLIND-RISK key-refresh-staleness self-alert for bin/trigger-watchdog.sh (now LIVE —
+// deployed via atomic swap after Codex+GLM gate).
 //
 // Gap it closes (watcher-unwatched, 2026-07-07): op key-refresh can fail for hours → get_key
 // serves a last-good STALE cached key → Trigger reads go UNKNOWN — while the watchdog says NOTHING.
@@ -20,7 +20,7 @@ import { tmpdir } from 'os';
 // CORTEXTOS_BIN=/nonexistent, and TELEGRAM_API_BASE at a dead localhost endpoint. The ISOLATION
 // GUARD test asserts the alert path resolves to "ALERT DELIVERY FAILED" — never an actual send.
 
-const SCRIPT = join(__dirname, '../../../bin/trigger-watchdog.NEW.sh');
+const SCRIPT = join(__dirname, '../../../bin/trigger-watchdog.sh');
 const FIELDS = ['hubapp_prod_read_key', 'helpdesk_prod_read_key'];
 let isoFwRoot: string;
 

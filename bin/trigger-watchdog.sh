@@ -18,6 +18,29 @@
 # non-used-region flap on 2026-06-24). Region-awareness falls out for free: if his runs
 # execute, no page, regardless of which region the status page flags.
 #
+# ALERT SEND-PATH (send_alert) — 3 tiers, each a fallback for the one before:
+#   tier 1  bus CLI (cortextos bus send-telegram)         — DNS-dependent
+#   tier 2  raw-curl to ${TELEGRAM_API_BASE}/bot.../sendMessage — DNS-dependent
+#   tier 3  DNS-BYPASS raw-curl: same send, but pinned to a cached last-good IP via
+#           `curl --resolve <host>:443:<cachedIP>` so NO resolver is consulted. Closes the
+#           2026-07-07 blind spot where a link-up-but-DNS-flaky window (a flapping WiFi NIC)
+#           took DNS + BOTH send tiers down together, so a BLIND-RISK/prod-stall alert fired
+#           but could NOT be delivered — the alert rode the very resolver that was broken.
+#     - The cached IP is ONLY a ROUTING HINT; the api.telegram.org TLS cert is the IDENTITY
+#       guarantee and stays FULLY validated — NEVER -k/--insecure. A stale/rotated IP that now
+#       fronts a different host → cert mismatch → TLS fails → the send fails CLOSED and falls
+#       through, so tier 3 can NEVER mis-deliver an alert to a wrong host.
+#     - On each SUCCESSFUL tier-1/tier-2 send, the current api.telegram.org IP is resolved and
+#       written 0600+atomic to $STATE_DIR/telegram-api-ip.cache (a successful send means DNS is
+#       healthy this tick) — a self-updating last-good IP. Cold cache (no prior success) → tier 3
+#       can't fire → the delivery failure is logged LOUDLY, never swallowed.
+#     - The cached value is format-validated against a strict single-IP-literal regex before it is
+#       ever fed to curl (anti corrupt-cache/injection); a bad value skips tier 3 and logs loud.
+#   This covers "Mode 1" (link up, DNS flaky). "Mode 2" (Solo totally dark, no route at all) is
+#   uncoverable by ANY local send — the backstop is the EXTERNAL vault-memory-health heartbeat:
+#   when Solo's 30-min heartbeat POSTs STOP, checkVaultMemoryHealth() (src/lib/watchdog-checks.ts)
+#   fires a cloud-side (Trigger.dev→Teams) critical alert on heartbeat ABSENCE. See [[watchdog-resilience]].
+#
 # Tunables (env):
 #   WATCHDOG_STALL_MIN     minutes: a project is STALLED when nothing has COMPLETED in this
 #                          window AND there's 0 executing + a queued backlog (default 10)
@@ -109,31 +132,155 @@ CHAT_ID="${WATCHDOG_CHAT_ID:-$(env_get CHAT_ID)}"
 THREAD_ID="${WATCHDOG_THREAD_ID:-$(env_get TOPIC_ID)}"
 BOT_TOKEN_FALLBACK="$(env_get BOT_TOKEN)"
 
+GETENT="${GETENT_BIN:-$(command -v getent 2>/dev/null || echo /usr/bin/getent)}"
+TIMEOUT="${TIMEOUT_BIN:-$(command -v timeout 2>/dev/null || echo /usr/bin/timeout)}"
+RESOLVE_TIMEOUT="${WATCHDOG_RESOLVE_TIMEOUT:-3}"   # hard cap (sec) on the cache-warm resolve (never block a tick)
+
+# Derive the Telegram API HOST from TELEGRAM_API_BASE (default real). ONE source of truth shared by
+# tier-2/tier-3's curl config, the cache-write resolve, AND the per-tick cache warm — so the tier-3
+# `--resolve` host can NEVER drift from the host the cache is warmed/read for. Drift would break both
+# tier-3 routing AND test isolation (a test's dead base must neutralize EVERY path, tick-warm included).
+telegram_api_host() {
+  local b="${TELEGRAM_API_BASE:-https://api.telegram.org}"
+  b="${b#*://}"; b="${b%%/*}"; b="${b%%:*}"; printf '%s' "$b"
+}
+
+# Strict single-IP-literal validator — ONE IPv4 dotted-quad (octets 0-255) OR one IPv6
+# hex:colon literal, and NOTHING else: no newlines, no spaces, no extra tokens, no comments,
+# no shell/curl-config metacharacters. Used BOTH before writing telegram-api-ip.cache AND before
+# feeding a cached value to `curl --resolve` (anti corrupt-cache / anti injection). A value that
+# does not pass this MUST NEVER reach curl. (The cache read strips a trailing newline via command
+# substitution; an INTERNAL newline / multi-line file trips the charset reject below.)
+valid_ip_literal() {
+  local ip="$1"
+  # fast reject: empty, or any char outside the IP-literal alphabet (catches spaces, newlines,
+  # ';', '"', backslashes, '=', etc. — so a corrupt/tampered cache can never inject curl-config).
+  case "$ip" in
+    ''|*[!0-9a-fA-F:.]*) return 1 ;;
+  esac
+  # exactly one IPv4 dotted-quad, each octet 0-255
+  if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    local o1 o2 o3 o4
+    IFS=. read -r o1 o2 o3 o4 <<< "$ip"
+    [ "$o1" -le 255 ] && [ "$o2" -le 255 ] && [ "$o3" -le 255 ] && [ "$o4" -le 255 ]
+    return
+  fi
+  # one IPv6 literal (hex + colons; must contain at least one colon). Not exhaustively RFC-valid,
+  # but metacharacter-free so it can't inject; curl rejects a truly malformed one → fail closed.
+  if [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then return 0; fi
+  return 1
+}
+
+# BEST-EFFORT cache write: resolve the Telegram API host's current IP and store it 0600+atomic in
+# $STATE_DIR/telegram-api-ip.cache as a self-updating last-good DNS-bypass hint for tier 3. Called on
+# BOTH (1) a successful tier-1/tier-2 send (DNS is healthy that tick → captures a known-good IP) and
+# (2) every healthy monitor tick (preheat, so the FIRST alert of an incident is protected even if it
+# lands during a DNS flap). Host derives from TELEGRAM_API_BASE (same knob as tiers 2+3) so a test
+# pointing it at a dead base stays fully isolated. Best-effort — always returns 0, so a failed cache
+# write can NEVER undo an already-delivered alert nor affect a tick.
+#
+# TWO hardening invariants (both send + tick paths inherit them, since both call this one function):
+#   * TIMEOUT-BOUND the resolve — a flaky/hung resolver must not make this hang. `timeout` caps the
+#     getent at RESOLVE_TIMEOUT sec; on timeout/failure the resolve yields empty → the write is SKIPPED.
+#   * ONLY-WRITE-ON-SUCCESS — validate FIRST, then write via temp + atomic mv. A failed/empty/timed-out
+#     resolve or a non-IP result leaves the existing last-good cache UNTOUCHED (the real file is never
+#     opened for truncation), so a flap can NEVER clobber/empty the very last-good IP tier-3 needs then.
+cache_telegram_ip() {
+  local host="$1" ip cf t
+  [ -n "$host" ] || return 0
+  # TIMEOUT-BOUND resolve (first A record). If `timeout` is unavailable, fall back to a bare resolve.
+  if command -v "$TIMEOUT" >/dev/null 2>&1; then
+    ip="$("$TIMEOUT" "$RESOLVE_TIMEOUT" "$GETENT" ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')"
+  else
+    ip="$("$GETENT" ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')"
+  fi
+  # ONLY-WRITE-ON-SUCCESS: bail (leaving last-good intact) on an empty/timed-out or non-IP resolve.
+  [ -n "$ip" ] || return 0
+  valid_ip_literal "$ip" || return 0
+  cf="$STATE_DIR/telegram-api-ip.cache"
+  t="$(mktemp "$STATE_DIR/.tgip-XXXXXX" 2>/dev/null)" || return 0
+  printf '%s' "$ip" > "$t" 2>/dev/null && chmod 600 "$t" 2>/dev/null && mv -f "$t" "$cf" 2>/dev/null
+  rm -f "$t" 2>/dev/null
+  return 0
+}
+
 send_alert() {
   local msg="$1"
   if [ "$DRY_RUN" = "1" ]; then log "DRY_RUN alert: $msg"; return 0; fi
+
+  # ONE knob drives tiers 2 AND 3 (and the cache-resolve): the API base + its derived host. Tests
+  # point TELEGRAM_API_BASE at a dead endpoint to make EVERY send structurally impossible — incl.
+  # tier 3, because the `--resolve <api_host>:443:...` directive only takes effect for the API host
+  # on 443, and against a dead base (different host/port) it is a no-op. NEVER hardcode
+  # api.telegram.org below, or a test could escape isolation and hit the real Telegram API.
+  local api_base api_host
+  api_base="${TELEGRAM_API_BASE:-https://api.telegram.org}"
+  api_host="$(telegram_api_host)"   # SAME derivation the tick-warm uses — can't drift
+
+  # ---- tier 1: bus CLI (DNS-dependent) ----
   local args=("$CHAT_ID" "$msg" --plain-text)
   [ -n "$THREAD_ID" ] && args+=(--thread "$THREAD_ID")
   if [ -x "$CORTEXTOS" ] && "$CORTEXTOS" bus send-telegram "${args[@]}" >/dev/null 2>&1; then
-    log "alert sent via bus CLI"; return 0
+    log "alert sent via bus CLI"; cache_telegram_ip "$api_host"; return 0
   fi
+
   log "bus CLI send failed — raw-curl Telegram fallback"
+  # ---- tier 2: raw-curl (DNS-dependent) ----
   if [ -n "$BOT_TOKEN_FALLBACK" ]; then
     local cfg; cfg="$(mktemp "${TMPDIR:-/tmp}/twd-XXXXXX")" || return 1
     chmod 600 "$cfg"; trap 'rm -f "$cfg"' RETURN
     {
       # TELEGRAM_API_BASE override (default real) lets tests point the raw-curl
       # fallback at a dead endpoint so a send is structurally impossible.
-      printf 'url = "%s/bot%s/sendMessage"\n' "${TELEGRAM_API_BASE:-https://api.telegram.org}" "$BOT_TOKEN_FALLBACK"
+      printf 'url = "%s/bot%s/sendMessage"\n' "$api_base" "$BOT_TOKEN_FALLBACK"
       printf 'data-urlencode = "chat_id=%s"\n' "$CHAT_ID"
       printf 'data-urlencode = "text=%s"\n' "$msg"
       [ -n "$THREAD_ID" ] && printf 'data-urlencode = "message_thread_id=%s"\n' "$THREAD_ID"
       printf 'max-time = 15\nsilent\nshow-error\nfail\n'
     } > "$cfg"
     local ok=1; "$CURL" --config "$cfg" >/dev/null 2>&1 && ok=0; rm -f "$cfg"
-    [ "$ok" = 0 ] && { log "alert sent via raw-curl fallback"; return 0; }
+    [ "$ok" = 0 ] && { log "alert sent via raw-curl fallback"; cache_telegram_ip "$api_host"; return 0; }
   fi
-  log "ALERT DELIVERY FAILED (both bus CLI and raw curl)"; return 1
+
+  # ---- tier 3: DNS-BYPASS via cached last-good IP (closes Mode 1: link up, resolver flaky) ----
+  # Tiers 1+2 both failed — the resolver is likely misbehaving. Retry the SAME send pinned to the
+  # cached last-good IP via `curl --resolve <host>:443:<ip>`, so NO DNS lookup is needed. The cached
+  # IP is ONLY a ROUTING HINT; the api.telegram.org TLS certificate stays FULLY validated and is the
+  # IDENTITY guarantee. NEVER -k/--insecure here: a stale/rotated IP now fronting a different host →
+  # cert mismatch → TLS handshake fails → the send fails CLOSED and falls through, so an alert can
+  # NEVER be mis-delivered to the wrong host. A stale-IP TLS failure is CORRECT fail-closed behavior.
+  local cache="$STATE_DIR/telegram-api-ip.cache"
+  if [ -n "$BOT_TOKEN_FALLBACK" ] && [ -f "$cache" ]; then
+    local cip; cip="$(cat "$cache" 2>/dev/null)"   # command-sub strips a trailing newline
+    if valid_ip_literal "$cip"; then
+      local raddr="$cip"; case "$cip" in *:*) raddr="[$cip]" ;; esac   # bracket IPv6 for --resolve
+      local cfg3; cfg3="$(mktemp "${TMPDIR:-/tmp}/twd3-XXXXXX")" || return 1
+      chmod 600 "$cfg3"; trap 'rm -f "$cfg3"' RETURN
+      {
+        printf 'url = "%s/bot%s/sendMessage"\n' "$api_base" "$BOT_TOKEN_FALLBACK"
+        # Pin the route to the cached IP on 443 while keeping SNI/Host/cert validation for api_host.
+        # NO `insecure` line — TLS identity is enforced; a wrong IP fails the handshake (fail closed).
+        printf 'resolve = "%s:443:%s"\n' "$api_host" "$raddr"
+        printf 'data-urlencode = "chat_id=%s"\n' "$CHAT_ID"
+        printf 'data-urlencode = "text=%s"\n' "$msg"
+        [ -n "$THREAD_ID" ] && printf 'data-urlencode = "message_thread_id=%s"\n' "$THREAD_ID"
+        printf 'max-time = 15\nsilent\nshow-error\nfail\n'
+      } > "$cfg3"
+      local ok3=1; "$CURL" --config "$cfg3" >/dev/null 2>&1 && ok3=0; rm -f "$cfg3"
+      [ "$ok3" = 0 ] && { log "alert sent via tier-3 DNS-bypass (cached IP, TLS-validated)"; return 0; }
+      log "tier-3 DNS-bypass send FAILED (cached IP $cip — cert mismatch fails CLOSED, or still no route)"
+    else
+      log "ALERT DELIVERY FAILED — cached Telegram IP failed format validation (corrupt cache; tier-3 skipped, nothing fed to curl)"
+    fi
+  fi
+
+  # ---- all tiers exhausted — degrade LOUD, never silent ----
+  if [ ! -f "$cache" ]; then
+    log "ALERT DELIVERY FAILED (both bus CLI and raw curl; no cached IP — tier-3 DNS-bypass cold, cannot fire)"
+  else
+    log "ALERT DELIVERY FAILED (bus CLI, raw curl, and tier-3 DNS-bypass all failed)"
+  fi
+  return 1
 }
 
 age_secs() { # iso8601 -> seconds ago (echo big number if empty/unparseable)
@@ -349,6 +496,24 @@ check_key_refresh_staleness() {
 # bust_key_cache, check_key_refresh_staleness, …) WITHOUT running the monitor, so they can be
 # unit-tested in isolation.
 if [ "${WATCHDOG_LIB_ONLY:-0}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
+
+# ---- PREHEAT the tier-3 DNS-bypass cache (every healthy tick, BEFORE any alert can fire) ----
+# On-successful-send warming alone can't protect the FIRST alert of a NEW incident if it lands during
+# a DNS-flaky window (no prior send this incident → cold cache → tier-3 can't fire) — and that first
+# stall/blind-risk page is the highest-value message a live watchdog sends. So preheat the cache on
+# every normal tick while DNS is healthy. It is TRULY FREE and CAN'T HARM THE TICK:
+#   * BACKGROUNDED (&) — the tick's real work (status fetch + stall check + blind-risk self-alert)
+#     proceeds immediately and is NEVER blocked/delayed, even if the resolver hangs during a flap.
+#   * TIMEOUT-BOUND inside cache_telegram_ip (RESOLVE_TIMEOUT, default 3s) — a hung resolve self-reaps
+#     instead of lingering as an orphan.
+#   * ONLY-WRITES-ON-SUCCESS — a failed/empty/timed-out resolve leaves the last-good cache UNTOUCHED,
+#     so a flap can never clobber the very last-good IP tier-3 depends on during that flap.
+# Host derives from TELEGRAM_API_BASE via the SAME helper tier-3 uses, so a test's dead base resolves a
+# harmless test host into the temp state dir — never the real API (isolation preserved). Skipped under
+# DRY_RUN (the file's state-write convention). Runs ONLY on the real-run path, never under LIB_ONLY.
+if [ "$DRY_RUN" != "1" ]; then
+  cache_telegram_ip "$(telegram_api_host)" >/dev/null 2>&1 &
+fi
 
 # ---- 1a status.trigger.dev as CONTEXT (never the trigger) ----
 STATUS_CTX="status:unknown"
