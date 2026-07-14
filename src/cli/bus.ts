@@ -197,6 +197,10 @@ busCommand
       // far above any real instruction, and if it ever is, it says so. A cut instruction must
       // never read as a whole one, at any size. (seo agent, 2026-07-14: "the two fixes are not
       // alternatives; the structural one is the primary and the loud-truncation one is the floor.")
+      // The correlation is ADVERSARIAL, not random: truncation now only bites the LONGEST
+      // descriptions, which are the most caveated, most conditional, highest-stakes tasks — the
+      // ones you least want cut are the ones most likely to overflow. Selection, not chance.
+      // That is precisely why the banner below is not optional. (seo agent, 2026-07-14.)
       const HARD_CEILING = 16000;
       const raw = opts.desc ?? '';
       const desc = raw
