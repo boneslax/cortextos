@@ -171,7 +171,22 @@ busCommand
     // Auto-notify assignee so the task is visible immediately (issue #78)
     if (opts.assignee && opts.assignee !== env.agentName) {
       const assigneePaths = resolvePaths(opts.assignee, env.instanceId, env.org);
-      const desc = opts.desc ? ` — ${opts.desc.slice(0, 120)}` : '';
+      // The description was silently truncated to 120 chars here. A task whose desc carried a
+      // safety instruction ("Do NOT change the GBP categories unilaterally") delivered a
+      // notification that cut off mid-sentence at "Do not " — the negation arrived without its
+      // object. An agent acting on that fragment does the exact thing it was told not to do.
+      // The full text was always in the task JSON; only the notification was lossy, which is the
+      // worst shape: it LOOKS complete. So: keep the preview short, but make the truncation
+      // LOUD and tell the reader where the authoritative copy is. Never let a cut-off instruction
+      // read as a whole one. (Found 2026-07-14 by the seo agent, which pulled the task JSON
+      // rather than act on the fragment — the correct instinct, and the reason this is a near-miss
+      // and not an incident.)
+      const PREVIEW = 120;
+      const raw = opts.desc ?? '';
+      const truncated = raw.length > PREVIEW;
+      const desc = raw
+        ? ` — ${raw.slice(0, PREVIEW)}${truncated ? `… [TRUNCATED ${raw.length - PREVIEW} more chars — this preview is NOT the instruction. Read the full task before acting: cortextos bus list-tasks --format json, id ${taskId}]` : ''}`
+        : '';
       sendMessage(assigneePaths, env.agentName, opts.assignee, 'normal',
         `Task assigned: [${opts.priority}] ${title}${desc} (id: ${taskId})`);
     }
