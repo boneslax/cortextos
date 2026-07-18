@@ -525,7 +525,7 @@ if echo "$SJSON" | "$JQ" -e . >/dev/null 2>&1; then
 fi
 
 # ---- 1b impact check across both projects ----
-STALLED_NOW=(); CONTEXT_LINES=""
+STALLED_NOW=(); OK_NOW=(); CONTEXT_LINES=""
 for spec in "${PROJECTS[@]}"; do
   label="${spec%%:*}"; rest="${spec#*:}"; field="${rest##*:}"   # projref is implied by the project-scoped key
   fixvar="WATCHDOG_RUNS_FIXTURE_${label}_EXECUTING"; fixset=""   # guarded indirect, no eval
@@ -546,7 +546,14 @@ for spec in "${PROJECTS[@]}"; do
   esac
   log "[$label] $res ($STATUS_CTX)"
   CONTEXT_LINES="$CONTEXT_LINES\n$label: $res"
-  [ "${res%% *}" = "STALL" ] && STALLED_NOW+=("$label")
+  # Track STALL and OK as SEPARATE positive verdicts. A third verdict, UNKNOWN (an
+  # unparseable/failed read — the exact state an outage that also blinds the reader
+  # produces), is DELIBERATELY in neither set: it is not a stall to page on, and — the
+  # BUG-2 fix — it is not positive health to claim recovery on either.
+  case "${res%% *}" in
+    STALL) STALLED_NOW+=("$label") ;;
+    OK)    OK_NOW+=("$label") ;;
+  esac
 done
 
 # ---- watcher-unwatched: BLIND-RISK self-alert (runs EVERY tick, independent of the stall check) ----
@@ -560,6 +567,7 @@ check_key_refresh_staleness
 # Each project alerts/recovers independently — a hubapp-then-helpdesk flap across two
 # cycles must NOT page (neither stalled 2 cycles in a row).
 is_stalled() { local x; for x in "${STALLED_NOW[@]:-}"; do [ "$x" = "$1" ] && return 0; done; return 1; }
+is_ok() { local x; for x in "${OK_NOW[@]:-}"; do [ "$x" = "$1" ] && return 0; done; return 1; }
 NEWLY=(); RECOVERED=()
 for spec in "${PROJECTS[@]}"; do
   label="${spec%%:*}"; pend="$STATE_DIR/pending.$label"; mk="$STATE_DIR/incident.$label.json"
@@ -571,9 +579,17 @@ for spec in "${PROJECTS[@]}"; do
       [ "$DRY_RUN" = "1" ] || echo "$cnt" > "$pend"
       if [ "$cnt" -ge 2 ]; then NEWLY+=("$label"); else log "[$label] stall cycle $cnt/2 — debouncing"; fi
     fi
-  else
+  elif is_ok "$label"; then
+    # POSITIVE health (verdict OK, a parsed read showing his prod executing/clear). ONLY here is it
+    # safe to reset the stall debounce and — if an incident is open — claim RECOVERY.
     [ "$DRY_RUN" = "1" ] || rm -f "$pend"
     [ -f "$mk" ] && RECOVERED+=("$label")
+  else
+    # UNKNOWN (blind read: unparseable/failed fetch, or key-unavailable). BUG-2 fix (2026-07-18):
+    # a blind tick is NOT recovery. Previously "not STALL" fell here and fired a false 🟢 RECOVERED +
+    # cleared the incident during the very outage — active misinformation. Now: HOLD the incident
+    # marker AND the pending counter (don't reset), stay silent, wait for a POSITIVE OK read.
+    log "[$label] UNKNOWN (blind read) — holding state; no recovery claim, debounce preserved"
   fi
 done
 
