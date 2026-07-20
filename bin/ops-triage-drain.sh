@@ -231,31 +231,76 @@ quarantine_clear() { [ "$DRY_RUN" = "1" ] || rm -f "$QDIR/$1" 2>/dev/null; }
 # the outbox controls (the raw filename in the bad-hash path, which reaches the alert
 # BEFORE the hash contract has validated it) must be flattened first — otherwise a newline
 # or a path separator in the name steers where the marker lands.
+#
+# The flattening is LOSSY (review finding): `tr` maps every hostile byte to '_' and the
+# result was then truncated, so two DISTINCT bad filenames could land on one marker — and
+# the second signature's alert was then swallowed by the first's re-alert cadence, exactly
+# the per-signature-key bug this function exists to prevent, one layer down. A checksum of
+# the ORIGINAL string is appended so distinct inputs keep distinct keys.
 akey() {
-  local v; v="$(printf '%s' "${1:-}" | tr -c 'a-zA-Z0-9._-' '_')"
-  printf '%s' "${v:0:40}"
+  local v h
+  v="$(printf '%s' "${1:-}" | tr -c 'a-zA-Z0-9._-' '_')"
+  h="$(printf '%s' "${1:-}" | cksum 2>/dev/null)"; h="${h%% *}"
+  case "$h" in ''|*[!0-9]*) h=0 ;; esac
+  printf '%s' "${v:0:32}-$h"
 }
 
-# Content fingerprint of one outbox item. The quarantine counter bounds retries of a
-# SPECIFIC piece of evidence; when the cloud task rewrites the item the old failure streak
-# is about content that no longer exists. Without this a signature quarantined by a
-# transient host-clock skew (a documented failure mode here — a >24h-future timestamp
-# quarantines in QUARANTINE_MAX ticks) stays bricked forever even after the clock and the
-# timestamp are fixed, because the quarantine gate is checked before the timestamp parse.
+# Content fingerprint of one outbox item, used ONLY to reset the badtime streak (see the
+# two-streak note below). cksum output is digits, which is what makes an unparseable
+# fingerprint detectable rather than silently "different".
 item_fp() { cksum < "$1" 2>/dev/null | tr -d '[:space:]'; }
 
-# A HEALTHY outcome for one signature. LOAD-BEARING (review BLOCKER): the counter must
-# track CONSECUTIVE failures, not lifetime ones. It used to be cleared only on the full
+# Read a stored fingerprint. Returns "" for absent OR unparseable, and an unparseable one is
+# then treated as "no previous fingerprint" => NO reset (review minor: a corrupt .fp used to
+# read as a DIFFERENT fingerprint and hand the item one free extra retry). The explicit
+# NUL strip keeps bash from printing its "ignored null byte in input" warning to stderr,
+# which cron mails.
+read_fp() {
+  local f="$1" v=""
+  [ -f "$f" ] || { printf ''; return; }
+  v="$(head -c 64 "$f" 2>/dev/null | tr -d '\000' | tr -d '[:space:]')"
+  case "$v" in ''|*[!0-9]*) v="" ;; esac
+  printf '%s' "$v"
+}
+
+# --- the TWO failure streaks (review BLOCKER) ---------------------------------
+# There used to be ONE shared streak plus a content-fingerprint reset, and that combination
+# silently removed the bound it was added beside. The producer (`ops-triage.ts` writeOutbox)
+# OVERWRITES <hash>.json with a refreshed count / newestFailureAt / runLink on EVERY cycle a
+# signature fails again — so an actively-recurring signature's bytes change every producer
+# cycle (*/30). A shared streak that resets on any content change is therefore bounded at
+# "QUARANTINE_MAX attempts PER REWRITE, forever": measured 4 rewrites over 24 ticks = 12 real
+# dev-delegate tasks, linear in rewrites, no asymptote (~144/day).
+#
+# The reset's ONLY justification is the clock-skew recovery case — a >24h-future timestamp
+# quarantines the item in QUARANTINE_MAX ticks, and the quarantine gate is checked BEFORE the
+# timestamp parse (deliberately), which without a reset is a one-way door. That case is the
+# BADTIME path, and nothing on it ever creates a task. The create / read-back / ledger paths
+# are the ones that mint REAL tasks; they only inherited the reset by sharing the counter.
+#
+# So the streaks are split and the mechanism is scoped to its justification:
+#   $QDIR/$hash        task-creating failures (create, read-back, ledger). MONOTONIC —
+#                      only mark_healthy() on a genuine healthy outcome clears it, so a
+#                      flapping poison pill still terminates at QUARANTINE_MAX no matter how
+#                      often the producer rewrites the item.
+#   $QDIR/$hash.time   unusable-newestFailureAt failures. A content change RESETS this one,
+#                      so a fixed host clock still recovers.
+# A hash is ^[0-9a-z]{1,16}$ and contains no dot, so neither suffix can collide with a counter.
+
+# A HEALTHY outcome for one signature. LOAD-BEARING (review BLOCKER): the counters must
+# track CONSECUTIVE failures, not lifetime ones. They used to be cleared only on the full
 # create + read-back + ledger success path, so every legitimate skip (active carrier,
 # carrier closed at/after the failure, already drained) left a stale count behind and one
 # transient read-back miss a month eventually bricked the signature. Clearing here is also
-# the ONLY thing that ever resolves the quarantine alert.
+# the ONLY thing that ever resolves the quarantine alert, and — since the split above — the
+# only thing that ever clears the task-creating streak.
 mark_healthy() {
   local h="$1"
-  if [ "$(quarantine_count "$h")" -gt 0 ]; then
-    log "[$h] healthy outcome — clearing the consecutive-failure counter"
+  if [ "$(quarantine_count "$h")" -gt 0 ] || [ "$(quarantine_count "$h.time")" -gt 0 ]; then
+    log "[$h] healthy outcome — clearing the consecutive-failure counters"
   fi
   quarantine_clear "$h"
+  quarantine_clear "$h.time"
   clear_cond "quarantine.$h" "🟢 ops-triage drainer: signature $h recovered — quarantine cleared, draining resumed."
   clear_cond "badtime.$h"    "🟢 ops-triage drainer: signature $h has a usable newestFailureAt again."
   clear_cond "readback.$h"   "🟢 ops-triage drainer: signature $h reconciled — read-back healthy again."
@@ -369,7 +414,10 @@ clear_cond sync "🟢 ops-triage drainer: vault clone sync recovered."
 [ "$DRY_RUN" = "1" ] && echo "OUTBOX=$OUTBOX_DIR"
 
 # --- 3. Drain each outbox item ------------------------------------------------
-[ -f "$LEDGER" ] || { [ "$DRY_RUN" = "1" ] || echo '{}' > "$LEDGER" 2>/dev/null; }
+# stderr is silenced BEFORE the output redirection — bash reports a failed `>` through the
+# redirections established SO FAR, so a trailing 2>/dev/null does not catch it and an
+# unwritable/occupied ledger path leaked "Is a directory" into cron mail.
+[ -f "$LEDGER" ] || { [ "$DRY_RUN" = "1" ] || echo '{}' 2>/dev/null > "$LEDGER" 2>/dev/null; }
 
 ledger_get() { [ -f "$LEDGER" ] && "$JQ" -r --arg h "$1" '.[$h] // ""' "$LEDGER" 2>/dev/null || echo ""; }
 ledger_put() {
@@ -402,11 +450,13 @@ for file in "$OUTBOX_DIR"/*.json; do
     *[!0-9a-z]* | "")
       log "invalid hash '$hash' (not ^[0-9a-z]{1,16}\$) — quarantined, not drained"
       alert_cond "badhash.$(akey "$hash")" "⚠️ ops-triage drainer: outbox file '$base' has an invalid signature hash. Quarantined, not drained."
+      QSKIPS=$((QSKIPS + 1))
       continue ;;
   esac
   if [ "${#hash}" -gt 16 ]; then
     log "invalid hash '$hash' (too long) — quarantined, not drained"
     alert_cond "badhash.$(akey "$hash")" "⚠️ ops-triage drainer: outbox file '$base' has an over-long signature hash. Quarantined, not drained."
+    QSKIPS=$((QSKIPS + 1))
     continue
   fi
 
@@ -414,33 +464,44 @@ for file in "$OUTBOX_DIR"/*.json; do
   # evidence fields are treated as hostile regardless (fenced + sanitized below).
   if ! "$JQ" -e '.marker=="NOT_A_SPEC" and .assignee=="dev-delegate"' "$file" >/dev/null 2>&1; then
     log "[$hash] shape check failed (marker/assignee) — skipped, not drained"
+    QSKIPS=$((QSKIPS + 1))
     continue
   fi
 
-  # 3b-bis. NEW EVIDENCE RESETS THE FAILURE STREAK. The quarantine counter bounds retries
-  # of one specific item; when the content changes the streak is about evidence that no
-  # longer exists. Without this the quarantine gate below (which runs BEFORE the timestamp
-  # parse, deliberately) is a one-way door: a signature quarantined by a host-clock skew
-  # could never recover even once the clock and the timestamp were fixed.
+  # 3b-bis. NEW EVIDENCE RESETS THE **BADTIME** STREAK ONLY (review BLOCKER — see the
+  # two-streak note above). This is the clock-skew recovery mechanism and nothing else: the
+  # badtime gate runs BEFORE the timestamp parse, deliberately, which without a reset is a
+  # one-way door. It deliberately does NOT touch $QDIR/$hash, because the producer rewrites
+  # an actively-recurring item every cycle and a reset there is an unbounded licence to keep
+  # minting real dev-delegate tasks.
   fp="$(item_fp "$file")"
-  fpf="$QDIR/$hash.fp"          # cannot collide with the counter file: a hash has no dot
-  prev_fp=""
-  [ -f "$fpf" ] && prev_fp="$(head -c 64 "$fpf" 2>/dev/null | tr -d '[:space:]')"
-  if [ "$fp" != "$prev_fp" ]; then
-    if [ -n "$prev_fp" ] && [ "$(quarantine_count "$hash")" -gt 0 ]; then
-      log "[$hash] outbox item content changed — resetting the consecutive-failure counter"
-      quarantine_clear "$hash"
-      clear_cond "quarantine.$hash" "🟢 ops-triage drainer: signature $hash has fresh evidence — quarantine reset, retrying."
+  fpf="$QDIR/$hash.fp"          # cannot collide with a counter file: a hash has no dot
+  prev_fp="$(read_fp "$fpf")"   # "" for absent OR corrupt => "no change" => no reset
+  if [ -n "$fp" ] && [ "$fp" != "$prev_fp" ]; then
+    if [ -n "$prev_fp" ] && [ "$(quarantine_count "$hash.time")" -gt 0 ]; then
+      log "[$hash] outbox item content changed — resetting the unusable-timestamp counter"
+      quarantine_clear "$hash.time"
+      clear_cond "quarantine.$hash" "🟢 ops-triage drainer: signature $hash has fresh evidence — timestamp quarantine reset, retrying."
     fi
-    [ "$DRY_RUN" = "1" ] || printf '%s' "$fp" > "$fpf" 2>/dev/null
+    # stderr is silenced BEFORE the output redirection so an unwritable $QDIR cannot leak a
+    # "Permission denied" line into cron mail (the behaviour is already correct: no reset).
+    [ "$DRY_RUN" = "1" ] || printf '%s' "$fp" 2>/dev/null > "$fpf" 2>/dev/null
   fi
 
   # 3c. QUARANTINE gate — a poison pill must not retry forever. Checked BEFORE the
-  # timestamp parse so that a permanently-unparseable item is bounded too.
+  # timestamp parse so that a permanently-unparseable item is bounded too. BOTH streaks gate
+  # here; only the badtime one is ever reset by a content change.
   qn="$(quarantine_count "$hash")"
   if [ "$qn" -ge "$QUARANTINE_MAX" ]; then
-    log "[$hash] quarantined ($qn failed attempts >= $QUARANTINE_MAX) — skipping, no further retries"
-    alert_cond "quarantine.$hash" "🔴 ops-triage drainer: signature $hash QUARANTINED after $qn failed attempts. It will not be retried until the quarantine counter is cleared ($QDIR/$hash)."
+    log "[$hash] quarantined ($qn failed create/read-back/ledger attempts >= $QUARANTINE_MAX) — skipping, no further retries"
+    alert_cond "quarantine.$hash" "🔴 ops-triage drainer: signature $hash QUARANTINED after $qn failed attempts. It will not be retried until the quarantine counter is cleared ($QDIR/$hash). Fresh evidence does NOT clear this streak — only a healthy outcome does."
+    QSKIPS=$((QSKIPS + 1))
+    continue
+  fi
+  qnt="$(quarantine_count "$hash.time")"
+  if [ "$qnt" -ge "$QUARANTINE_MAX" ]; then
+    log "[$hash] quarantined ($qnt unusable-timestamp attempts >= $QUARANTINE_MAX) — skipping, no further retries"
+    alert_cond "quarantine.$hash" "🔴 ops-triage drainer: signature $hash QUARANTINED after $qnt attempts with an unusable newestFailureAt. It retries once the outbox item is rewritten, or clear $QDIR/$hash.time."
     QSKIPS=$((QSKIPS + 1))
     continue
   fi
@@ -453,9 +514,12 @@ for file in "$OUTBOX_DIR"/*.json; do
   newest="$("$JQ" -r '.newestFailureAt // ""' "$file" 2>/dev/null)"
   newest_e="$(epoch "$newest")"
   if [ -z "$newest_e" ]; then
-    quarantine_bump "$hash"
-    log "[$hash] REJECTED newestFailureAt ('$newest') — not a strict ISO-8601 instant (or too far future); skipped, attempt $(quarantine_count "$hash")/$QUARANTINE_MAX"
-    alert_cond "badtime.$hash" "⚠️ ops-triage drainer: signature $hash has an invalid newestFailureAt ('$newest'). Not drained. Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
+    # The BADTIME streak — the one a content change is allowed to reset, because this is the
+    # documented host-clock-skew recovery case and this path never creates a task.
+    quarantine_bump "$hash.time"
+    log "[$hash] REJECTED newestFailureAt ('$newest') — not a strict ISO-8601 instant (or too far future); skipped, attempt $(quarantine_count "$hash.time")/$QUARANTINE_MAX"
+    alert_cond "badtime.$hash" "⚠️ ops-triage drainer: signature $hash has an invalid newestFailureAt ('$newest'). Not drained. Attempt $(quarantine_count "$hash.time")/$QUARANTINE_MAX."
+    QSKIPS=$((QSKIPS + 1))
     continue
   fi
 
@@ -466,6 +530,7 @@ for file in "$OUTBOX_DIR"/*.json; do
     # creating anyway is exactly the flood this dedup exists to prevent.
     log "[$hash] list-tasks unreadable (not a JSON array) — failing closed, no create this tick"
     alert_cond scan "⚠️ ops-triage drainer: could not read the task queue (list-tasks did not return a JSON array). Draining is paused this tick."
+    QSKIPS=$((QSKIPS + 1))
     continue
   fi
   clear_cond scan "🟢 ops-triage drainer: task queue readable again."
@@ -598,12 +663,14 @@ for file in "$OUTBOX_DIR"/*.json; do
       quarantine_bump "$hash"
       log "[$hash] create returned no/invalid task id ('${id:-<empty>}') — quarantine counter now $(quarantine_count "$hash"), will retry"
       alert_cond "createfail.$hash" "⚠️ ops-triage drainer: create-task for signature $hash returned no valid id. Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
+      QSKIPS=$((QSKIPS + 1))
       continue ;;
   esac
   if ! printf '%s' "$id" | grep -Eq '^task_[0-9]+_[0-9]+$'; then
     quarantine_bump "$hash"
     log "[$hash] create returned an invalid task id ('$id') — quarantine counter now $(quarantine_count "$hash")"
     alert_cond "createfail.$hash" "⚠️ ops-triage drainer: create-task for signature $hash returned an invalid id. Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
+    QSKIPS=$((QSKIPS + 1))
     continue
   fi
 
@@ -619,6 +686,7 @@ for file in "$OUTBOX_DIR"/*.json; do
       quarantine_bump "$hash"
       log "[$hash] LEDGER WRITE FAILED after a confirmed create ($id) — NOT counted as drained, attempt $(quarantine_count "$hash")/$QUARANTINE_MAX"
       alert_cond "ledger.$hash" "🔴 ops-triage drainer: created $id for signature $hash but the drained-ledger write FAILED ($LEDGER). Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
+      QSKIPS=$((QSKIPS + 1))
       continue
     fi
     [ "$DRY_RUN" = "1" ] || printf '%s' "$id" > "$IDCACHE/$hash" 2>/dev/null
@@ -637,6 +705,7 @@ for file in "$OUTBOX_DIR"/*.json; do
     # ever stops it. The counter is the only bound on that loop.
     quarantine_bump "$hash"
     qn="$(quarantine_count "$hash")"
+    QSKIPS=$((QSKIPS + 1))
     log "[$hash] read-back miss for $id — NOT re-creating; attempt $qn/$QUARANTINE_MAX"
     if [ "$qn" -ge "$QUARANTINE_MAX" ]; then
       log "[$hash] read-back miss escalated — QUARANTINED at $qn/$QUARANTINE_MAX, no further creates for this signature"
@@ -651,14 +720,21 @@ done
 # Only on a tick that actually completed the flow. A refused/failed tick returns early
 # above, so a stale heartbeat is a real signal that the drainer is stuck.
 #
-# AND NOT on a tick where every outbox item was skipped by quarantine (review finding).
+# AND NOT on a tick where every outbox item was skipped by a FAULT (review finding).
 # Touching it unconditionally meant the external staleness watcher could not tell a working
 # drainer from a fully-bricked one: 100% of the outbox quarantined, zero creates, heartbeat
-# perfectly fresh. The rule is deliberately narrow — an empty outbox and a tick of
-# legitimate healthy skips are both a working drainer and DO still beat.
+# perfectly fresh.
+#
+# QSKIPS counts EVERY non-drain, non-healthy skip, not just the quarantine gate (review
+# IMPORTANT). ITEMS_SEEN increments before the invalid-hash and shape-check skips, and
+# neither of those used to count, so a fully-bricked outbox plus ONE junk file made
+# QSKIPS < ITEMS_SEEN and reported a perfectly fresh heartbeat — one malformed file defeated
+# the whole suppression rule. The rule stays deliberately narrow: an empty outbox and a tick
+# of legitimate HEALTHY skips (active carrier, respected close, already drained) are both a
+# working drainer and DO still beat.
 if [ "$DRY_RUN" != "1" ]; then
-  if [ "$ITEMS_SEEN" -gt 0 ] && [ "$QSKIPS" -ge "$ITEMS_SEEN" ]; then
-    log "HEARTBEAT SUPPRESSED — all $ITEMS_SEEN outbox item(s) skipped by quarantine; nothing is draining"
+  if [ "$DRAINED" -eq 0 ] && [ "$ITEMS_SEEN" -gt 0 ] && [ "$QSKIPS" -ge "$ITEMS_SEEN" ]; then
+    log "HEARTBEAT SUPPRESSED — all $ITEMS_SEEN outbox item(s) skipped by a fault; nothing is draining"
   else
     touch "$STATE/heartbeat" 2>/dev/null
   fi

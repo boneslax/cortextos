@@ -305,8 +305,25 @@ function alertEnv(rec: string): Record<string, string> {
   return { CTX_FRAMEWORK_ROOT: tokenFwRoot, CURL_BIN: okCurl, CURL_RECORD_DIR: rec };
 }
 
+/**
+ * The TASK-CREATING failure streak ($QDIR/<hash>) — create / read-back / ledger failures.
+ * MONOTONIC: only a healthy outcome clears it, never a content change.
+ */
 const qcount = (c: Ctx, h: string) =>
   (existsSync(join(c.state, 'quarantine', h)) ? readFileSync(join(c.state, 'quarantine', h), 'utf-8') : '0');
+
+/**
+ * The BADTIME streak ($QDIR/<hash>.time) — unusable-newestFailureAt failures. This is the
+ * one a content change resets, because it is the documented host-clock-skew recovery case
+ * and nothing on that path ever creates a task.
+ */
+const qtcount = (c: Ctx, h: string) => qcount(c, `${h}.time`);
+
+/** Alert marker files present, by name. akey() now appends a checksum, so match by prefix. */
+const alertFiles = (c: Ctx) =>
+  readdirSync(c.state).filter(f => f.startsWith('alert.') && f.endsWith('.json'));
+const hasAlert = (c: Ctx, prefix: string) =>
+  alertFiles(c).some(f => f === `${prefix}.json` || f.startsWith(`${prefix}-`));
 
 /**
  * Clear the stub's "a create already happened" flag so the NEXT tick starts with an empty
@@ -355,7 +372,7 @@ describe('ops-triage-drain: hash contract', () => {
     tick(c);
     expect(creates(c)).toHaveLength(0);
     expect(log(c)).toMatch(/invalid hash/i);
-    expect(existsSync(join(c.state, 'alert.badhash.BAD-Hash.json'))).toBe(true); // per-signature key
+    expect(hasAlert(c, 'alert.badhash.BAD-Hash')).toBe(true); // per-signature key
   });
 });
 
@@ -703,7 +720,7 @@ describe('ops-triage-drain: quarantine is per-signature, consecutive, and recove
     writeItem(c, HASH, outboxItem({ newestFailureAt: futureISO(48) }));
     for (let i = 0; i < 4; i++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
     expect(creates(c)).toHaveLength(0);
-    expect(qcount(c, HASH)).toBe('3');
+    expect(qtcount(c, HASH)).toBe('3');        // the BADTIME streak
     expect(log(c)).toMatch(/QUARANTINED|quarantined \(3/);
 
     // clock fixed => the cloud task rewrites the item with a sane timestamp
@@ -712,9 +729,9 @@ describe('ops-triage-drain: quarantine is per-signature, consecutive, and recove
       OPS_DRAIN_QUARANTINE_MAX: '3',
       STUB_TASKS_POST: tasksFixture(c, 'post', [carrier({ id: VALID_ID })]),
     });
-    expect(log(c)).toMatch(/content changed — resetting the consecutive-failure counter/);
+    expect(log(c)).toMatch(/content changed — resetting the unusable-timestamp counter/);
     expect(creates(c)).toHaveLength(1);        // it drains: not bricked forever
-    expect(qcount(c, HASH)).toBe('0');
+    expect(qtcount(c, HASH)).toBe('0');
   });
 
   it('UNCHANGED evidence does NOT reset the streak (the bound still bounds a real poison pill)', () => {
@@ -727,7 +744,52 @@ describe('ops-triage-drain: quarantine is per-signature, consecutive, and recove
       tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
     }
     expect(creates(c)).toHaveLength(0);
-    expect(qcount(c, HASH)).toBe('3');         // capped, never climbing past the max
+    expect(qtcount(c, HASH)).toBe('3');        // capped, never climbing past the max
+  });
+
+  it('a CORRUPT .fp is treated as "no change" — it does not hand out a free extra retry', () => {
+    // Round-4 minor: the stored fingerprint was read raw, so a corrupt .fp parsed as a
+    // DIFFERENT fingerprint, which counted as a content change and reset the streak — one
+    // free retry per corruption. It also made bash print an "ignored null byte in input"
+    // warning to stderr, which cron mails.
+    const c = ctx();
+    writeItem(c, HASH, outboxItem({ newestFailureAt: 'now' }));
+    tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });          // establishes the .fp, streak = 1
+    expect(qtcount(c, HASH)).toBe('1');
+
+    writeFileSync(join(c.state, 'quarantine', `${HASH}.fp`), Buffer.from([0x41, 0x00, 0x42, 0x0a]));
+    for (let i = 0; i < 5; i++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
+
+    expect(qtcount(c, HASH)).toBe('3');                  // still capped, no free retry
+    expect(log(c)).not.toMatch(/content changed/);
+    expect(creates(c)).toHaveLength(0);
+  });
+
+  it('an UNWRITABLE quarantine dir leaks no "Permission denied" to stderr', () => {
+    const c = ctx();
+    writeItem(c, HASH, outboxItem());
+    tick(c);                                             // creates $QDIR
+    const qdir = join(c.state, 'quarantine');
+    chmodSync(qdir, 0o500);
+    try {
+      // execFileSync would surface a noisy stderr; assert the tick stays quiet and exits 0
+      const out = execFileSync('bash', ['-c', `bash ${SCRIPT} 2>&1 1>/dev/null`], {
+        cwd: c.cwd,
+        env: {
+          ...process.env,
+          OPS_DRAIN_STATE_DIR: c.state, OPS_DRAIN_OUTBOX_DIR: c.outbox, OPS_DRAIN_GATE_DIR: c.gate,
+          OPS_DRAIN_NO_SYNC: '1', CORTEXTOS_BIN: stubBin, STUB_DIR: c.stubDir,
+          CTX_ROOT: join(c.state, 'ctxroot'), CTX_FRAMEWORK_ROOT: isoFwRoot,
+          OP_SA_TOKEN_FILE: '/nonexistent', TELEGRAM_API_BASE: 'http://127.0.0.1:9',
+          OPS_DRAIN_CHAT_ID: '000',
+        },
+        encoding: 'utf-8',
+      });
+      expect(out).not.toMatch(/Permission denied/);
+      expect(out).not.toMatch(/null byte/);
+    } finally {
+      chmodSync(qdir, 0o700);
+    }
   });
 
   it('alert keys do not cross-talk: a healthy tick for one signature leaves the other alerted', () => {
@@ -758,8 +820,38 @@ describe('ops-triage-drain: quarantine is per-signature, consecutive, and recove
     writeItem(c, 'BAD-Two', outboxItem());
     tick(c);
     expect(creates(c)).toHaveLength(0);
-    expect(existsSync(join(c.state, 'alert.badhash.BAD-One.json'))).toBe(true);
-    expect(existsSync(join(c.state, 'alert.badhash.BAD-Two.json'))).toBe(true);
+    expect(hasAlert(c, 'alert.badhash.BAD-One')).toBe(true);
+    expect(hasAlert(c, 'alert.badhash.BAD-Two')).toBe(true);
+  });
+
+  it('akey() keeps two hostile filenames DISTINCT that flatten+truncate onto one key', () => {
+    // Round-4 minor: akey() mapped every non-[A-Za-z0-9._-] byte to '_' and truncated to 40
+    // chars, so these two distinct names collided on ONE marker — and the second one's alert
+    // was then swallowed by the first's re-alert cadence. That is exactly the bug the
+    // per-signature alert keys exist to prevent, reintroduced one layer down.
+    const c = ctx();
+    const pad = 'x'.repeat(40);
+    writeFileSync(`${c.outbox}/BAD ${pad} ONE.json`, JSON.stringify(outboxItem()));
+    writeFileSync(`${c.outbox}/BAD ${pad} TWO.json`, JSON.stringify(outboxItem()));
+    tick(c);
+
+    expect(creates(c)).toHaveLength(0);
+    const badhash = alertFiles(c).filter(f => f.startsWith('alert.badhash.'));
+    expect(badhash).toHaveLength(2);                 // one marker each, not one shared
+    expect(new Set(badhash).size).toBe(2);
+  });
+
+  it('BOTH hostile filenames get a DELIVERED alert (a collided key suppresses the second)', () => {
+    const c = ctx();
+    const rec = join(c.state, 'curlrec');
+    const pad = 'y'.repeat(40);
+    writeFileSync(`${c.outbox}/BAD ${pad} ONE.json`, JSON.stringify(outboxItem()));
+    writeFileSync(`${c.outbox}/BAD ${pad} TWO.json`, JSON.stringify(outboxItem()));
+    tick(c, alertEnv(rec));
+
+    const texts = alertTexts(rec);
+    expect(texts.filter(t => t.includes('ONE.json')).length).toBeGreaterThan(0);
+    expect(texts.filter(t => t.includes('TWO.json')).length).toBeGreaterThan(0);
   });
 });
 
@@ -783,6 +875,38 @@ describe('ops-triage-drain: heartbeat must not lie about a bricked outbox', () =
     expect(creates(c)).toHaveLength(0);
     expect(existsSync(join(c.state, 'heartbeat'))).toBe(false);
     expect(log(c)).toMatch(/HEARTBEAT SUPPRESSED/);
+  });
+
+  it('ONE invalid-hash file does NOT rescue the heartbeat of an otherwise bricked outbox', () => {
+    // Round-4 IMPORTANT: ITEMS_SEEN increments BEFORE the invalid-hash and shape-check skips,
+    // but neither of those counted toward QSKIPS. So a fully-bricked outbox plus ONE junk
+    // file made QSKIPS < ITEMS_SEEN and the drainer reported a perfectly fresh heartbeat —
+    // a single malformed file defeated the whole suppression rule.
+    const c = ctx();
+    brick(c, HASH);
+    writeItem(c, 'BAD-Hash', outboxItem());
+    tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
+    expect(creates(c)).toHaveLength(0);
+    expect(existsSync(join(c.state, 'heartbeat'))).toBe(false);
+    expect(log(c)).toMatch(/HEARTBEAT SUPPRESSED/);
+  });
+
+  it('ONE shape-failing file does NOT rescue the heartbeat either', () => {
+    const c = ctx();
+    brick(c, HASH);
+    writeItem(c, 'j7p', outboxItem({ marker: 'SOMETHING_ELSE' }));
+    tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
+    expect(creates(c)).toHaveLength(0);
+    expect(existsSync(join(c.state, 'heartbeat'))).toBe(false);
+  });
+
+  it('an outbox where EVERY item is junk (nothing drained, nothing healthy) does not beat', () => {
+    const c = ctx();
+    writeItem(c, 'BAD-One', outboxItem());
+    writeItem(c, 'j7p', outboxItem({ assignee: 'someone-else' }));
+    tick(c);
+    expect(creates(c)).toHaveLength(0);
+    expect(existsSync(join(c.state, 'heartbeat'))).toBe(false);
   });
 
   it('an EMPTY outbox still refreshes the heartbeat (nothing to drain is not a fault)', () => {
@@ -1062,7 +1186,7 @@ describe('ops-triage-drain: timestamp contract (free-form date input is refused)
     writeItem(c, HASH, outboxItem({ newestFailureAt: 'now' }));
     for (let i = 0; i < 5; i++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
     expect(creates(c)).toHaveLength(0);
-    expect(readFileSync(join(c.state, 'quarantine', HASH), 'utf-8')).toBe('3');
+    expect(qtcount(c, HASH)).toBe('3');        // the badtime streak, not the create streak
     expect(existsSync(join(c.state, `alert.quarantine.${HASH}.json`))).toBe(true);
   });
 
@@ -1085,6 +1209,114 @@ describe('ops-triage-drain: timestamp contract (free-form date input is refused)
     tick(c, { STUB_TASKS: t });
     expect(creates(c)).toHaveLength(0);
     expect(log(c)).toMatch(/no parseable close time/);
+  });
+});
+
+describe('ops-triage-drain: the task-creating streak is MONOTONIC under a rewriting producer', () => {
+  // THE COVERAGE GAP that let the round-3 regression through. Every existing fingerprint
+  // test drove EITHER changed-bytes-then-healthy (clock-skew recovery) OR
+  // unchanged-bytes-still-failing (the poison pill). Nothing drove CHANGED BYTES **AND**
+  // STILL FAILING — which is the actual production shape.
+  //
+  // MEASURED: the producer (`ops-triage.ts` writeOutbox) OVERWRITES <hash>.json with a
+  // refreshed count / newestFailureAt / runLink on EVERY cycle a signature fails again, so
+  // an actively-recurring signature's bytes change every producer cycle (*/30). With ONE
+  // shared streak plus a content-change reset, the bound became "QUARANTINE_MAX attempts per
+  // rewrite, forever" — linear in rewrites, no asymptote:
+  //
+  //     rewrites | ticks | REAL create-task calls   (shared streak)   (split streak)
+  //            0 |    24 |                                       3               3
+  //            1 |     6 |                                       3               3
+  //            2 |    12 |                                       6               3
+  //            4 |    24 |                                      12               3
+  //
+  // ~144 real dev-delegate tasks/day. The fix splits the streak: $QDIR/<hash> (create /
+  // read-back / ledger) is MONOTONIC, and only $QDIR/<hash>.time keeps the content reset.
+
+  /** A rewritten outbox item whose BYTES differ every time, exactly as the producer writes. */
+  const rewritten = (n: number) =>
+    outboxItem({
+      count: 4 + n,
+      newestFailureAt: new Date(Date.UTC(2026, 6, 18, 10, 0, n)).toISOString(),
+      runLink: `https://cloud.trigger.dev/runs/run_${n}`,
+    });
+
+  it('CREATE keeps failing + bytes change every tick → total creates STOP at QUARANTINE_MAX', () => {
+    const c = ctx();
+    let n = 0;
+    for (let rewrite = 0; rewrite < 6; rewrite++) {
+      writeItem(c, HASH, rewritten(n++));         // producer cycle: new bytes
+      for (let t = 0; t < 4; t++) tick(c, { STUB_CREATE_FAIL: '1', OPS_DRAIN_QUARANTINE_MAX: '3' });
+    }
+    // 6 rewrites x 4 ticks = 24 ticks. Shared-streak bound => 18 creates. Split => 3.
+    expect(creates(c)).toHaveLength(3);
+    expect(qcount(c, HASH)).toBe('3');
+    expect(log(c)).toMatch(/failed create\/read-back\/ledger attempts/);
+  });
+
+  it('READ-BACK always misses + bytes change every tick → total creates STOP at QUARANTINE_MAX', () => {
+    // The nastier variant: create-task SUCCEEDS every time, so every un-bounded retry mints
+    // a REAL dev-delegate task. list-tasks always returns [] so the read-back never confirms.
+    const c = ctx();
+    let n = 0;
+    for (let rewrite = 0; rewrite < 6; rewrite++) {
+      writeItem(c, HASH, rewritten(n++));
+      for (let t = 0; t < 4; t++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
+    }
+    expect(creates(c)).toHaveLength(3);
+    expect(qcount(c, HASH)).toBe('3');
+  });
+
+  it('the create bound does NOT grow linearly with the number of producer rewrites', () => {
+    // The asymptote assertion. Under the shared streak these three runs produced 3 / 6 / 12
+    // real tasks; a correct bound is flat at QUARANTINE_MAX regardless of rewrite count.
+    const run = (rewrites: number, ticksPerRewrite: number) => {
+      const c = ctx();
+      let n = 0;
+      for (let r = 0; r < rewrites; r++) {
+        writeItem(c, HASH, rewritten(n++));
+        for (let t = 0; t < ticksPerRewrite; t++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
+      }
+      return creates(c).length;
+    };
+    const oneRewrite  = run(1, 6);
+    const twoRewrites = run(2, 6);
+    const fourRewrites = run(4, 6);
+
+    expect(oneRewrite).toBe(3);
+    expect(twoRewrites).toBe(3);      // shared streak: 6
+    expect(fourRewrites).toBe(3);     // shared streak: 12
+    expect(fourRewrites).toBe(oneRewrite);   // flat, not linear
+  });
+
+  it('a genuine HEALTHY outcome is still the way out of the create streak', () => {
+    // Monotonic must not mean permanent: mark_healthy() clears it, so a signature that
+    // recovers on its own resumes draining.
+    const c = ctx();
+    writeItem(c, HASH, outboxItem());
+    tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });      // read-back miss => streak 1
+    tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });      // => streak 2
+    expect(qcount(c, HASH)).toBe('2');
+
+    // an active carrier turns up => healthy skip => streak cleared
+    tick(c, {
+      OPS_DRAIN_QUARANTINE_MAX: '3',
+      STUB_TASKS: tasksFixture(c, 't', [carrier({ status: 'in_progress' })]),
+    });
+    expect(qcount(c, HASH)).toBe('0');
+  });
+
+  it('a badtime quarantine still recovers on rewritten bytes WITHOUT unblocking the create streak', () => {
+    // The two streaks are genuinely independent: the create streak is already at the cap, so
+    // even a fresh, perfectly valid rewrite must not mint another task.
+    const c = ctx();
+    writeItem(c, HASH, outboxItem());
+    for (let i = 0; i < 4; i++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });  // create streak -> 3
+    expect(creates(c)).toHaveLength(3);
+
+    writeItem(c, HASH, rewritten(99));                                       // fresh evidence
+    for (let i = 0; i < 4; i++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
+    expect(creates(c)).toHaveLength(3);                                      // still bounded
   });
 });
 
