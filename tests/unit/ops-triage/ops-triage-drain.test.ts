@@ -664,9 +664,12 @@ describe('ops-triage-drain: quarantine is per-signature, consecutive, and recove
     const texts = alertTexts(rec);
     expect(texts.filter(t => t.includes(`signature ${A} QUARANTINED`)).length).toBeGreaterThan(0);
     expect(texts.filter(t => t.includes(`signature ${B} QUARANTINED`)).length).toBeGreaterThan(0);
-    expect(existsSync(join(c.state, `alert.quarantine.${A}.json`))).toBe(true);
-    expect(existsSync(join(c.state, `alert.quarantine.${B}.json`))).toBe(true);
-    expect(existsSync(join(c.state, 'alert.quarantine.json'))).toBe(false); // no shared key
+    // the BADTIME cap's own key (split from the one-way-door `quarantine.$hash`), still
+    // per-signature — which is what this test is actually about
+    expect(existsSync(join(c.state, `alert.quarantine.time.${A}.json`))).toBe(true);
+    expect(existsSync(join(c.state, `alert.quarantine.time.${B}.json`))).toBe(true);
+    expect(existsSync(join(c.state, 'alert.quarantine.time.json'))).toBe(false); // no shared key
+    expect(existsSync(join(c.state, 'alert.quarantine.json'))).toBe(false);      // nor the old one
   });
 
   it('the counter tracks CONSECUTIVE failures — one transient miss then a healthy skip clears it', () => {
@@ -1187,7 +1190,9 @@ describe('ops-triage-drain: timestamp contract (free-form date input is refused)
     for (let i = 0; i < 5; i++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
     expect(creates(c)).toHaveLength(0);
     expect(qtcount(c, HASH)).toBe('3');        // the badtime streak, not the create streak
-    expect(existsSync(join(c.state, `alert.quarantine.${HASH}.json`))).toBe(true);
+    // and the badtime streak's OWN alert key, not the one-way-door create/read-back one
+    expect(existsSync(join(c.state, `alert.quarantine.time.${HASH}.json`))).toBe(true);
+    expect(existsSync(join(c.state, `alert.quarantine.${HASH}.json`))).toBe(false);
   });
 
   it('still drains a VALID ISO timestamp (the guard rejects free-form, not everything)', () => {
@@ -1555,6 +1560,118 @@ describe('ops-triage-drain: env hygiene + resilience', () => {
     expect(log(c)).toMatch(/LEDGER WRITE FAILED/);
     expect(log(c)).not.toMatch(/drained \+ read-back confirmed/);
     expect(existsSync(join(c.state, 'quarantine', HASH))).toBe(true);
+  });
+});
+
+describe('ops-triage-drain: an alert key is shared only when the REMEDY is identical', () => {
+  // (signature x recovery action), not signature alone. Round-2 fixed global key ->
+  // per-signature key; that stopped one level short. THREE capped-quarantine alerts shared
+  // `quarantine.$hash` while having THREE different remedies:
+  //
+  //   :497 create-streak capped -> ONE-WAY DOOR, manual `rm $QDIR/$hash`
+  //   :504 badtime capped       -> AUTO-RECOVERS on an outbox rewrite, or clear $QDIR/$hash.time
+  //   :712 read-back capped     -> ONE-WAY DOOR, manual `rm $QDIR/$hash`
+  //
+  // One suppression marker across three remedies means the human's LAST instruction can be a
+  // stale, wrong one. :497/:712 keep sharing (identical remedy); the badtime one is split out.
+
+  /** The exact remedy sentence each alert must be able to deliver, independent of the other. */
+  const BADTIME_REMEDY = /outbox item is rewritten|\.time/;
+  const ONE_WAY_REMEDY = /quarantine counter is cleared|until \S+ is cleared/;
+
+  it('a badtime cap then a create-streak cap for the SAME signature inside the window delivers BOTH alerts', () => {
+    // THE TRACED FAILURE. A signature badtime-caps and is told "it retries once the outbox
+    // item is rewritten, or clear $QDIR/$hash.time". The human takes the documented remedy,
+    // the item clears the badtime gate, reaches create — and the create path caps. Under one
+    // shared key that second alert is cadence-suppressed inside the hour, so the last thing
+    // the human was told is to wait for an auto-retry that can never come.
+    const c = ctx();
+    const rec = join(c.state, 'curlrec');
+    const env = { OPS_DRAIN_QUARANTINE_MAX: '3', OPS_DRAIN_REALERT_SEC: '3600', ...alertEnv(rec) };
+
+    // --- phase 1: drive the BADTIME streak to the cap -> the :504 alert -------------------
+    writeItem(c, HASH, outboxItem({ newestFailureAt: 'now' }));   // never a valid instant
+    for (let i = 0; i < 4; i++) tick(c, env);                     // 3 bumps, then the gate fires
+    expect(qtcount(c, HASH)).toBe('3');
+    expect(creates(c)).toHaveLength(0);
+
+    const afterBadtime = alertTexts(rec);
+    const badtimeCap = afterBadtime.filter(t => /QUARANTINED/.test(t) && BADTIME_REMEDY.test(t));
+    expect(badtimeCap.length).toBeGreaterThan(0);                 // the human was told: it auto-retries
+
+    // --- the human takes the documented remedy, and the producer rewrites the item --------
+    // Clearing the counter is exactly what the :504 alert instructs. Both happen before the
+    // next tick, so the badtime streak reads 0 at the fingerprint check and the content-change
+    // reset at :481 does NOT fire (it is gated on the streak being > 0) — nothing clears the
+    // marker. This is the state in which the two alerts must not share a suppression window.
+    rmSync(join(c.state, 'quarantine', `${HASH}.time`), { force: true });
+    writeItem(c, HASH, outboxItem());                             // valid newestFailureAt now
+    expect(log(c)).not.toMatch(/content changed — resetting the unusable-timestamp counter/);
+
+    // --- phase 2: the item now reaches CREATE, which caps -> the :497 alert ---------------
+    for (let i = 0; i < 4; i++) tick(c, { ...env, STUB_CREATE_FAIL: '1' });
+    expect(creates(c)).toHaveLength(3);                           // bounded at the cap
+    expect(qcount(c, HASH)).toBe('3');
+
+    const texts = alertTexts(rec);
+    const oneWayCap = texts.filter(t => /QUARANTINED/.test(t) && ONE_WAY_REMEDY.test(t));
+
+    // BOTH remedies reached the human, within one REALERT_SEC window.
+    expect(badtimeCap.length).toBeGreaterThan(0);
+    expect(oneWayCap.length).toBeGreaterThan(0);
+
+    // and they are genuinely DIFFERENT instructions, not the same text twice
+    expect(oneWayCap[0]).not.toBe(badtimeCap[0]);
+    expect(oneWayCap[0]).toContain(join(c.state, 'quarantine', HASH));  // the manual file to clear
+    expect(badtimeCap[0]).toContain(`${join(c.state, 'quarantine', HASH)}.time`);
+
+    // the two conditions carry SEPARATE suppression markers on disk
+    expect(existsSync(join(c.state, `alert.quarantine.${HASH}.json`))).toBe(true);
+    expect(existsSync(join(c.state, `alert.quarantine.time.${HASH}.json`))).toBe(true);
+  });
+
+  it('the CORRECT sharing is preserved: two successive create-streak-capped ticks do not double-alert', () => {
+    // The counterexample that keeps the fix from over-applying. Re-alerting the identical
+    // remedy every tick is the alert spam the cadence exists to prevent.
+    const c = ctx();
+    const rec = join(c.state, 'curlrec');
+    const env = { OPS_DRAIN_QUARANTINE_MAX: '3', OPS_DRAIN_REALERT_SEC: '3600', ...alertEnv(rec) };
+
+    writeItem(c, HASH, outboxItem());
+    for (let i = 0; i < 3; i++) tick(c, { ...env, STUB_CREATE_FAIL: '1' });  // streak -> 3
+    expect(qcount(c, HASH)).toBe('3');
+
+    tick(c, { ...env, STUB_CREATE_FAIL: '1' });   // gate fires, alert delivered
+    const afterFirst = alertTexts(rec).filter(t => /QUARANTINED/.test(t)).length;
+    expect(afterFirst).toBe(1);
+
+    tick(c, { ...env, STUB_CREATE_FAIL: '1' });   // same condition, same remedy => suppressed
+    tick(c, { ...env, STUB_CREATE_FAIL: '1' });
+    expect(alertTexts(rec).filter(t => /QUARANTINED/.test(t)).length).toBe(1);
+    expect(log(c)).toMatch(/condition ongoing — alert suppressed by cadence/);
+  });
+
+  it('the create-streak quarantine alert names the file to clear and promises no automatic recovery', () => {
+    // The trailing clause used to read "Fresh evidence does NOT clear this streak — only a
+    // healthy outcome does." That is FALSE in exactly the state it fires in: the gate at :494
+    // `continue`s before every mark_healthy() callsite, so once capped a healthy outcome is
+    // unreachable. It told the human to wait for something impossible. The half that names
+    // $QDIR/$hash is the correct, actionable half and must stay.
+    const c = ctx();
+    const rec = join(c.state, 'curlrec');
+    const env = { OPS_DRAIN_QUARANTINE_MAX: '3', OPS_DRAIN_REALERT_SEC: '3600', ...alertEnv(rec) };
+
+    writeItem(c, HASH, outboxItem());
+    for (let i = 0; i < 4; i++) tick(c, { ...env, STUB_CREATE_FAIL: '1' });
+
+    const capped = alertTexts(rec).filter(t => /QUARANTINED after 3 failed attempts/.test(t));
+    expect(capped).toHaveLength(1);
+    const text = capped[0];
+
+    expect(text).toContain(join(c.state, 'quarantine', HASH));   // the actionable bit survives
+    expect(text).toMatch(/manual/i);                             // and says it is a manual clear
+    expect(text).not.toMatch(/healthy outcome/i);                // unreachable once capped
+    expect(text).not.toMatch(/fresh evidence/i);                 // ditto — no auto-recovery
   });
 });
 
