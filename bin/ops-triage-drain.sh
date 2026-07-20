@@ -485,7 +485,7 @@ for file in "$OUTBOX_DIR"/*.json; do
     if [ -n "$prev_fp" ] && [ "$(quarantine_count "$hash.time")" -gt 0 ]; then
       log "[$hash] outbox item content changed — resetting the unusable-timestamp counter"
       quarantine_clear "$hash.time"
-      # Same key as the capped-badtime alert it recovers (:504). It must NOT clear
+      # Same key as the capped-badtime alert it recovers (:522). It must NOT clear
       # `quarantine.$hash`: that marker belongs to the one-way-door create/read-back caps,
       # whose condition a content change does not resolve.
       clear_cond "quarantine.time.$hash" "🟢 ops-triage drainer: signature $hash has fresh evidence — timestamp quarantine reset, retrying."
@@ -514,11 +514,15 @@ for file in "$OUTBOX_DIR"/*.json; do
     log "[$hash] quarantined ($qnt unusable-timestamp attempts >= $QUARANTINE_MAX) — skipping, no further retries"
     # SEPARATE KEY from the two one-way-door alerts (review finding). An alert key dedupes a
     # SITUATION, so it may be shared only when the REMEDY is identical — the granularity is
-    # (signature x recovery action), not signature alone. This one AUTO-RECOVERS; :497 and
-    # :712 are one-way doors needing a manual `rm $QDIR/$hash`. Under the old shared
-    # `quarantine.$hash` a badtime cap followed by a create cap on the same signature (~30-60
-    # min apart in the common case, inside REALERT_SEC) suppressed the second alert, so the
-    # human's last instruction was to wait for an auto-retry that could never come.
+    # (signature x recovery action), not signature alone. This one AUTO-RECOVERS; :508 and
+    # :730 are one-way doors needing a manual `rm $QDIR/$hash`. Under the old shared
+    # `quarantine.$hash`, the reachable suppression was: the human takes the badtime alert's
+    # OTHER documented remedy and manually clears $QDIR/$hash.time, so the counter reads 0,
+    # the content-change reset block above (gated on count > 0) never runs, nothing clears
+    # the shared marker, and a later create-streak cap is silently swallowed inside
+    # REALERT_SEC — leaving the human holding a stale, wrong recovery instruction. (A second
+    # route: clear_cond keeps the marker on a FAILED send, so the producer-rewrite path
+    # reopens the same suppression whenever the recovery alert itself fails to deliver.)
     alert_cond "quarantine.time.$hash" "🔴 ops-triage drainer: signature $hash QUARANTINED after $qnt attempts with an unusable newestFailureAt. It retries once the outbox item is rewritten, or clear $QDIR/$hash.time."
     QSKIPS=$((QSKIPS + 1))
     continue

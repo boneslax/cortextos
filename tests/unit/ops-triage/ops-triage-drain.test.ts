@@ -1568,12 +1568,12 @@ describe('ops-triage-drain: an alert key is shared only when the REMEDY is ident
   // per-signature key; that stopped one level short. THREE capped-quarantine alerts shared
   // `quarantine.$hash` while having THREE different remedies:
   //
-  //   :497 create-streak capped -> ONE-WAY DOOR, manual `rm $QDIR/$hash`
-  //   :504 badtime capped       -> AUTO-RECOVERS on an outbox rewrite, or clear $QDIR/$hash.time
-  //   :712 read-back capped     -> ONE-WAY DOOR, manual `rm $QDIR/$hash`
+  //   :508 create-streak capped -> ONE-WAY DOOR, manual `rm $QDIR/$hash`
+  //   :522 badtime capped       -> AUTO-RECOVERS on an outbox rewrite, or clear $QDIR/$hash.time
+  //   :730 read-back capped     -> ONE-WAY DOOR, manual `rm $QDIR/$hash`
   //
   // One suppression marker across three remedies means the human's LAST instruction can be a
-  // stale, wrong one. :497/:712 keep sharing (identical remedy); the badtime one is split out.
+  // stale, wrong one. :508/:730 keep sharing (identical remedy); the badtime one is split out.
 
   /** The exact remedy sentence each alert must be able to deliver, independent of the other. */
   const BADTIME_REMEDY = /outbox item is rewritten|\.time/;
@@ -1589,7 +1589,7 @@ describe('ops-triage-drain: an alert key is shared only when the REMEDY is ident
     const rec = join(c.state, 'curlrec');
     const env = { OPS_DRAIN_QUARANTINE_MAX: '3', OPS_DRAIN_REALERT_SEC: '3600', ...alertEnv(rec) };
 
-    // --- phase 1: drive the BADTIME streak to the cap -> the :504 alert -------------------
+    // --- phase 1: drive the BADTIME streak to the cap -> the :522 alert -------------------
     writeItem(c, HASH, outboxItem({ newestFailureAt: 'now' }));   // never a valid instant
     for (let i = 0; i < 4; i++) tick(c, env);                     // 3 bumps, then the gate fires
     expect(qtcount(c, HASH)).toBe('3');
@@ -1600,15 +1600,15 @@ describe('ops-triage-drain: an alert key is shared only when the REMEDY is ident
     expect(badtimeCap.length).toBeGreaterThan(0);                 // the human was told: it auto-retries
 
     // --- the human takes the documented remedy, and the producer rewrites the item --------
-    // Clearing the counter is exactly what the :504 alert instructs. Both happen before the
+    // Clearing the counter is exactly what the :522 alert instructs. Both happen before the
     // next tick, so the badtime streak reads 0 at the fingerprint check and the content-change
-    // reset at :481 does NOT fire (it is gated on the streak being > 0) — nothing clears the
+    // reset at :485 does NOT fire (it is gated on the streak being > 0) — nothing clears the
     // marker. This is the state in which the two alerts must not share a suppression window.
     rmSync(join(c.state, 'quarantine', `${HASH}.time`), { force: true });
     writeItem(c, HASH, outboxItem());                             // valid newestFailureAt now
     expect(log(c)).not.toMatch(/content changed — resetting the unusable-timestamp counter/);
 
-    // --- phase 2: the item now reaches CREATE, which caps -> the :497 alert ---------------
+    // --- phase 2: the item now reaches CREATE, which caps -> the :508 alert ---------------
     for (let i = 0; i < 4; i++) tick(c, { ...env, STUB_CREATE_FAIL: '1' });
     expect(creates(c)).toHaveLength(3);                           // bounded at the cap
     expect(qcount(c, HASH)).toBe('3');
@@ -1653,7 +1653,7 @@ describe('ops-triage-drain: an alert key is shared only when the REMEDY is ident
 
   it('the create-streak quarantine alert names the file to clear and promises no automatic recovery', () => {
     // The trailing clause used to read "Fresh evidence does NOT clear this streak — only a
-    // healthy outcome does." That is FALSE in exactly the state it fires in: the gate at :494
+    // healthy outcome does." That is FALSE in exactly the state it fires in: the gate at :502
     // `continue`s before every mark_healthy() callsite, so once capped a healthy outcome is
     // unreachable. It told the human to wait for something impossible. The half that names
     // $QDIR/$hash is the correct, actionable half and must stay.
