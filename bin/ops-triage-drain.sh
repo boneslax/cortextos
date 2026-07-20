@@ -16,7 +16,10 @@
 # 3 adversarial rounds). Every non-obvious rule below is a bug that pass caught.
 #
 # Tunables (env):
-#   OPS_DRAIN_DRY_RUN=1        decide + print DECISION lines; no create, no send, no state writes
+#   OPS_DRAIN_DRY_RUN=1        decide + print DECISION lines; no create, no send, and no
+#                              DURABLE state writes (ledger / quarantine / idcache /
+#                              heartbeat / alert markers). It DOES still append to drain.log
+#                              — a dry run you cannot read afterwards is useless.
 #   OPS_DRAIN_STATE_DIR        durable state root (default $CTX_ROOT/state/ops-triage-drain)
 #   OPS_DRAIN_OUTBOX_DIR       override the outbox dir (default: the drainer's OWN clone)
 #   OPS_DRAIN_NO_SYNC=1        skip the git clone/fetch entirely (tests)
@@ -25,6 +28,7 @@
 #   OPS_DRAIN_QUARANTINE_MAX   failed creates for one hash before quarantine (default 3)
 #   OPS_DRAIN_REALERT_SEC      re-alert cadence for a sustained condition (default 3600)
 #   OPS_DRAIN_MAX_FIELD        per-field char cap on user-controlled text (default 1800)
+#   OPS_DRAIN_MAX_FUTURE_SKEW  reject a timestamp this far in the future (default 86400)
 #   OPS_DRAIN_VAULT_REMOTE     clone URL for the drainer's own vault clone
 #   CORTEXTOS_BIN              cortextOS CLI (tests point it at a fake stub)
 #   TELEGRAM_API_BASE          Telegram base (tests point it at a dead endpoint)
@@ -40,6 +44,14 @@ DRY_RUN="${OPS_DRAIN_DRY_RUN:-0}"
 QUARANTINE_MAX="${OPS_DRAIN_QUARANTINE_MAX:-3}"
 REALERT_SEC="${OPS_DRAIN_REALERT_SEC:-3600}"
 MAX_FIELD="${OPS_DRAIN_MAX_FIELD:-1800}"
+MAX_FUTURE_SKEW="${OPS_DRAIN_MAX_FUTURE_SKEW:-86400}"
+
+# Every numeric tunable is arithmetic-compared later. A non-numeric value from the
+# environment must not make `[ x -ge y ]` error the whole tick — fall back to the default.
+case "$QUARANTINE_MAX"  in ''|*[!0-9]*) QUARANTINE_MAX=3     ;; esac
+case "$REALERT_SEC"     in ''|*[!0-9]*) REALERT_SEC=3600     ;; esac
+case "$MAX_FIELD"       in ''|*[!0-9]*) MAX_FIELD=1800       ;; esac
+case "$MAX_FUTURE_SKEW" in ''|*[!0-9]*) MAX_FUTURE_SKEW=86400;; esac
 
 # --- pinned cortextOS context -------------------------------------------------
 # LOAD-BEARING (BLOCKER in review): create, the dedup scan, AND the read-back must all
@@ -91,7 +103,13 @@ THREAD_ID="${OPS_DRAIN_THREAD_ID:-$(env_get TOPIC_ID)}"
 BOT_TOKEN_FALLBACK="$(env_get BOT_TOKEN)"
 
 send_alert() {
-  local msg="$1"
+  # SECURITY (review finding): $msg embeds user-controlled text (an outbox FILENAME reaches
+  # here BEFORE the hash contract has validated it). It is later written into a curl
+  # --config file, where every LINE is an option — so a newline in $msg would open a new
+  # directive (`output = /path` = arbitrary local write, a second `url =` = a second
+  # request) and a double quote would terminate the quoted value early. Sanitize once, at
+  # the single choke point, before either transport sees it.
+  local msg; msg="$(san "${1:-}" | tr -d '"')"
   if [ "$DRY_RUN" = "1" ]; then log "DRY_RUN alert: $msg"; return 0; fi
   local args=("$CHAT_ID" "$msg" --plain-text)
   [ -n "$THREAD_ID" ] && args+=(--thread "$THREAD_ID")
@@ -155,10 +173,24 @@ clear_cond() {
 # (src/bus/task.ts writes toISOString().replace(/\.\d{3}Z$/,'Z')) while the outbox keeps
 # them, and timezone forms can differ — so every comparison converts to epoch seconds
 # first. A raw lexicographic compare on mixed forms inverts.
+#
+# SECURITY (review BLOCKER): `date -d` is a FREE-FORM parser. It happily accepts "now",
+# "tomorrow", "+1 day" — relative expressions that are re-evaluated on every tick and are
+# therefore ALWAYS newer than any fixed close time. Feeding it the untrusted
+# `.newestFailureAt` inverted the whole settled timestamp gate: an item saying "now"
+# re-drained forever and walked straight through a human's cancellation. So: assert a
+# strict ISO-8601 instant FIRST, and reject anything implausibly far in the future (a
+# year-3000 timestamp is the same forever-newer attack with an absolute form).
+ISO_INSTANT_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
 epoch() {
-  local t="${1:-}"
+  local t="${1:-}" e now
   if [ -z "$t" ] || [ "$t" = "null" ]; then echo ""; return; fi
-  date -u -d "$t" +%s 2>/dev/null || echo ""
+  if ! [[ "$t" =~ $ISO_INSTANT_RE ]]; then echo ""; return; fi
+  e="$(date -u -d "$t" +%s 2>/dev/null)" || { echo ""; return; }
+  case "$e" in ''|*[!0-9]*) echo ""; return ;; esac
+  now="$(date -u +%s)"
+  if [ "$e" -gt $(( now + MAX_FUTURE_SKEW )) ]; then echo ""; return; fi
+  printf '%s\n' "$e"
 }
 
 # Sanitize one user-controlled field: strip ALL control characters (newlines included —
@@ -170,13 +202,25 @@ san() {
 
 # Every CLI call goes through here so the pinned CTX env can never drift between the scan,
 # the create, and the read-back.
+# The -u list is LOAD-BEARING (review finding): pinning five vars is not enough. A hand-run
+# from a live agent shell also exports CTX_AGENT_DIR / CTX_PROJECT_ROOT, and the real CLI
+# THROWS on a "sandbox/live environment leak" when those disagree with the pinned framework
+# root — fail-closing every single call. Scrub them rather than inherit them.
 ctx_cli() {
-  env CTX_ROOT="$PIN_ROOT" CTX_FRAMEWORK_ROOT="$PIN_FWROOT" CTX_ORG="$PIN_ORG" \
+  env -u CTX_AGENT_DIR -u CTX_PROJECT_ROOT -u CTX_TIMEZONE -u CTX_ORCHESTRATOR \
+      CTX_ROOT="$PIN_ROOT" CTX_FRAMEWORK_ROOT="$PIN_FWROOT" CTX_ORG="$PIN_ORG" \
       CTX_INSTANCE_ID="$PIN_INSTANCE" CTX_AGENT_NAME="$PIN_AGENT" \
       "$CORTEXTOS" "$@"
 }
 
-quarantine_count() { local f="$QDIR/$1"; [ -f "$f" ] && cat "$f" 2>/dev/null || echo 0; }
+# Always returns a plain non-negative integer. A corrupt/garbage counter file must read as
+# 0, never as a string that errors the `[ "$qn" -ge ... ]` comparison and kills the tick.
+quarantine_count() {
+  local f="$QDIR/$1" n=""
+  [ -f "$f" ] && n="$(head -c 32 "$f" 2>/dev/null | tr -d '[:space:]')"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
 quarantine_bump() {
   [ "$DRY_RUN" = "1" ] && return 0
   local h="$1" n; n=$(( $(quarantine_count "$h") + 1 )); printf '%s' "$n" > "$QDIR/$h"
@@ -186,8 +230,14 @@ quarantine_clear() { [ "$DRY_RUN" = "1" ] || rm -f "$QDIR/$1" 2>/dev/null; }
 # --- 1. PREFLIGHT: dev-delegate gate drift tripwire ---------------------------
 # HONEST SCOPE: this proves the gate PROSE is intact. It is NOT enforcement — the real
 # gate is dev-delegate's own behavioral self-gate (`--needs-approval` is written but never
-# read, verified in D1). Matching is case-insensitive on TOKENS, not exact phrases, so a
-# cosmetic reword ("must never merge into main") does not trip while a real removal does.
+# read, verified in D1).
+#
+# Matching is on the WHOLE PHRASE, case-insensitively, with runs of whitespace (newlines
+# included) collapsed to one space. It used to word-split the phrase into independent
+# substring checks — which meant "merge main" passed on any file that happened to contain
+# the words "merge" and "main" anywhere, even with the invariant deleted (review finding).
+# Tolerance is deliberately whitespace/case only: a line-wrap or a capitalization change
+# does not trip, but rewriting the invariant away does.
 preflight_ok() {
   local text="" f
   for f in "$GATE_DIR/config.json" "$GATE_DIR/IDENTITY.md"; do
@@ -195,23 +245,21 @@ preflight_ok() {
 $(cat "$f" 2>/dev/null)"
   done
   [ -z "${text//[[:space:]]/}" ] && { MISSING_INVARIANT="gate files absent ($GATE_DIR)"; return 1; }
-  local lower; lower="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')"
-  # invariant name -> all of these tokens must be present
+  local lower; lower="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ')"
+  # invariant name -> the whole phrase that must be present
   local -a inv=(
     "graphify-gate:graphify"
     "human-approval:approval"
-    "never-merge-main:merge main"
+    "never-merge-main:merge to main"
     "no-external-writes:external writes"
   )
-  local spec name toks tok
+  local spec name phrase
   for spec in "${inv[@]}"; do
-    name="${spec%%:*}"; toks="${spec#*:}"
-    for tok in $toks; do
-      case "$lower" in
-        *"$tok"*) ;;
-        *) MISSING_INVARIANT="$name (token '$tok')"; return 1 ;;
-      esac
-    done
+    name="${spec%%:*}"; phrase="${spec#*:}"
+    case "$lower" in
+      *"$phrase"*) ;;
+      *) MISSING_INVARIANT="$name (phrase '$phrase')"; return 1 ;;
+    esac
   done
   return 0
 }
@@ -227,23 +275,42 @@ clear_cond preflight "🟢 ops-triage drainer: dev-delegate gate invariants rest
 # --- 2. SYNC the drainer's OWN clone ------------------------------------------
 # A fetch failure ALERTS and skips the tick. It must never fall through to draining a
 # stale working tree — that would silently re-drain yesterday's evidence as if fresh.
+SYNC_REFUSE=""
 sync_clone() {
   [ "${OPS_DRAIN_NO_SYNC:-0}" = "1" ] && return 0
+
+  # OWNERSHIP PROOF, before ANY destructive git verb. `reset --hard` discards tracked
+  # modifications, so it must be proven to land in the drainer's own throwaway clone.
+  # `[ -d "$CLONE/.git" ]` alone does not prove that: a symlinked $CLONE resolves into a
+  # shared checkout and the reset blows away someone's uncommitted work (review finding).
+  # Two independent checks — the path is not a symlink, and origin is the expected vault
+  # remote. On either failure: alert and skip the tick. Never reset.
+  if [ -L "$CLONE" ]; then
+    SYNC_REFUSE="clone path is a SYMLINK ($CLONE) — refusing to fetch/reset a tree we do not own"
+    return 1
+  fi
   if [ ! -d "$CLONE/.git" ]; then
     rm -rf "$CLONE" 2>/dev/null
-    "$GIT" clone --depth 1 --filter=blob:none --sparse "$VAULT_REMOTE" "$CLONE" >/dev/null 2>&1 || return 1
-    "$GIT" -C "$CLONE" sparse-checkout set knowledge/ops-triage >/dev/null 2>&1 || return 1
+    "$GIT" clone --depth 1 --filter=blob:none --sparse "$VAULT_REMOTE" "$CLONE" >/dev/null 2>&1 \
+      || { SYNC_REFUSE="clone failed"; return 1; }
+    "$GIT" -C "$CLONE" sparse-checkout set knowledge/ops-triage >/dev/null 2>&1 \
+      || { SYNC_REFUSE="sparse-checkout failed"; return 1; }
   fi
-  "$GIT" -C "$CLONE" fetch origin >/dev/null 2>&1 || return 1
-  # reset --hard on OUR OWN clone only. Never a push, never a force-push, never the
-  # shared checkout.
-  "$GIT" -C "$CLONE" reset --hard origin/main >/dev/null 2>&1 || return 1
+  local origin; origin="$("$GIT" -C "$CLONE" remote get-url origin 2>/dev/null)"
+  if [ "$origin" != "$VAULT_REMOTE" ]; then
+    SYNC_REFUSE="origin mismatch at $CLONE (got '${origin:-<none>}', expected '$VAULT_REMOTE') — refusing to fetch/reset"
+    return 1
+  fi
+  "$GIT" -C "$CLONE" fetch origin >/dev/null 2>&1 || { SYNC_REFUSE="fetch failed"; return 1; }
+  # reset --hard on OUR OWN clone only, now proven. Never a push, never a force-push,
+  # never the shared checkout.
+  "$GIT" -C "$CLONE" reset --hard origin/main >/dev/null 2>&1 || { SYNC_REFUSE="reset failed"; return 1; }
   return 0
 }
 
 if ! sync_clone; then
-  log "SYNC FAILED — could not fetch/reset the drainer's own vault clone; skipping tick (NOT draining stale)"
-  alert_cond sync "🔴 ops-triage drainer: vault clone sync (fetch/reset) FAILED. Skipping the tick rather than draining a stale outbox. Check $CLONE on Solo."
+  log "SYNC FAILED — $SYNC_REFUSE; skipping tick (NOT draining stale)"
+  alert_cond sync "🔴 ops-triage drainer: vault clone sync FAILED ($SYNC_REFUSE). Skipping the tick rather than draining a stale outbox. Check $CLONE on Solo."
   exit 0
 fi
 clear_cond sync "🟢 ops-triage drainer: vault clone sync recovered."
@@ -251,7 +318,7 @@ clear_cond sync "🟢 ops-triage drainer: vault clone sync recovered."
 [ "$DRY_RUN" = "1" ] && echo "OUTBOX=$OUTBOX_DIR"
 
 # --- 3. Drain each outbox item ------------------------------------------------
-[ -f "$LEDGER" ] || { [ "$DRY_RUN" = "1" ] || echo '{}' > "$LEDGER"; }
+[ -f "$LEDGER" ] || { [ "$DRY_RUN" = "1" ] || echo '{}' > "$LEDGER" 2>/dev/null; }
 
 ledger_get() { [ -f "$LEDGER" ] && "$JQ" -r --arg h "$1" '.[$h] // ""' "$LEDGER" 2>/dev/null || echo ""; }
 ledger_put() {
@@ -290,18 +357,26 @@ for file in "$OUTBOX_DIR"/*.json; do
     continue
   fi
 
-  newest="$("$JQ" -r '.newestFailureAt // ""' "$file" 2>/dev/null)"
-  newest_e="$(epoch "$newest")"
-  if [ -z "$newest_e" ]; then
-    log "[$hash] unparseable newestFailureAt ('$newest') — skipped"
+  # 3c. QUARANTINE gate — a poison pill must not retry forever. Checked BEFORE the
+  # timestamp parse so that a permanently-unparseable item is bounded too.
+  qn="$(quarantine_count "$hash")"
+  if [ "$qn" -ge "$QUARANTINE_MAX" ]; then
+    log "[$hash] quarantined ($qn failed attempts >= $QUARANTINE_MAX) — skipping, no further retries"
+    alert_cond quarantine "🔴 ops-triage drainer: signature $hash QUARANTINED after $qn failed attempts. It will not be retried until the quarantine counter is cleared ($QDIR/$hash)."
     continue
   fi
 
-  # 3c. QUARANTINE gate — a poison pill must not retry forever.
-  qn="$(quarantine_count "$hash")"
-  if [ "$qn" -ge "$QUARANTINE_MAX" ]; then
-    log "[$hash] quarantined ($qn failed creates >= $QUARANTINE_MAX) — skipping, no further retries"
-    alert_cond quarantine "🔴 ops-triage drainer: signature $hash QUARANTINED after $qn failed create attempts. It will not be retried until the quarantine counter is cleared ($QDIR/$hash)."
+  # 3c-bis. TIMESTAMP CONTRACT. epoch() rejects anything that is not a strict ISO-8601
+  # instant (so `date -d`'s relative forms — "now", "tomorrow", "+1 day" — never reach it)
+  # and anything implausibly future-dated. An invalid timestamp SKIPS, never drains: the
+  # whole terminal-carrier gate is a comparison against this value, so a value we cannot
+  # trust cannot be allowed to win that comparison.
+  newest="$("$JQ" -r '.newestFailureAt // ""' "$file" 2>/dev/null)"
+  newest_e="$(epoch "$newest")"
+  if [ -z "$newest_e" ]; then
+    quarantine_bump "$hash"
+    log "[$hash] REJECTED newestFailureAt ('$newest') — not a strict ISO-8601 instant (or too far future); skipped, attempt $(quarantine_count "$hash")/$QUARANTINE_MAX"
+    alert_cond badtime "⚠️ ops-triage drainer: signature $hash has an invalid newestFailureAt ('$newest'). Not drained. Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
     continue
   fi
 
@@ -323,7 +398,7 @@ for file in "$OUTBOX_DIR"/*.json; do
       | select(.assigned_to == "dev-delegate")
       | select((.title // "") | endswith("sig " + $h))
       | select((.archived // false) | not)
-      | select(.status != "completed" and .status != "cancelled")
+      | select(.status != "completed" and .status != "cancelled" and .status != "done")
     ] | length' 2>/dev/null)"
   [ -z "$active_n" ] && active_n=0
 
@@ -332,6 +407,11 @@ for file in "$OUTBOX_DIR"/*.json; do
     continue
   fi
 
+  # `done` is a LEGACY terminal status (older bus records use it where current ones write
+  # `completed`). Treating it as active would deadlock the signature forever behind a
+  # carrier that will never move; treating it as terminal routes it through the close-time
+  # comparison like any other finished task.
+  #
   # closed-at = completed_at // updated_at. LOAD-BEARING: completed_at is null for a
   # CANCELLED task (only completeTask sets it), so comparing against completed_at alone
   # would evaluate "newestFailureAt > null" = always true and re-drain a human rejection
@@ -340,7 +420,7 @@ for file in "$OUTBOX_DIR"/*.json; do
     .[]
     | select(.assigned_to == "dev-delegate")
     | select((.title // "") | endswith("sig " + $h))
-    | select(.status == "completed" or .status == "cancelled")
+    | select(.status == "completed" or .status == "cancelled" or .status == "done")
     | (.completed_at // .updated_at // "")' 2>/dev/null)"
 
   decision=""
@@ -449,17 +529,37 @@ for file in "$OUTBOX_DIR"/*.json; do
   rb="$(ctx_cli bus list-tasks --format json 2>/dev/null)"
   if printf '%s' "$rb" | "$JQ" -e --arg id "$id" \
        'if type=="array" then any(.[]; .id == $id) else false end' >/dev/null 2>&1; then
-    ledger_put "$hash" "$newest"
+    # The LEDGER is what makes a drain durable. If its write fails, the next tick will
+    # decide "absent from the ledger => NEW" and create a duplicate — so a failed ledger
+    # write is a FAILED drain, not a successful one, and it counts toward quarantine.
+    if ! ledger_put "$hash" "$newest"; then
+      quarantine_bump "$hash"
+      log "[$hash] LEDGER WRITE FAILED after a confirmed create ($id) — NOT counted as drained, attempt $(quarantine_count "$hash")/$QUARANTINE_MAX"
+      alert_cond ledger "🔴 ops-triage drainer: created $id for signature $hash but the drained-ledger write FAILED ($LEDGER). Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
+      continue
+    fi
     quarantine_clear "$hash"
     [ "$DRY_RUN" = "1" ] || printf '%s' "$id" > "$IDCACHE/$hash" 2>/dev/null
     log "[$hash] drained + read-back confirmed: $id"
     DRAINED=$((DRAINED + 1))
     clear_cond createfail "🟢 ops-triage drainer: create-task succeeded again (signature $hash)."
   else
-    # DO NOT re-create. The task may well exist; next tick's dedup scan will find the
-    # active carrier and ADOPT it. Re-creating here is how you get duplicates.
-    log "[$hash] read-back miss for $id — NOT re-creating; will reconcile via the queue next tick"
-    alert_cond readback "⚠️ ops-triage drainer: created $id for signature $hash but could not read it back. Not re-creating; reconciling via the queue next tick."
+    # DO NOT re-create in THIS tick. The task may well exist; next tick's dedup scan will
+    # find the active carrier and ADOPT it. Re-creating here is how you get duplicates.
+    #
+    # But this path MUST also bump the quarantine counter (review BLOCKER). Against a bus
+    # whose list-tasks keeps returning [] while create-task keeps succeeding, an unbumped
+    # read-back miss retries forever: every tick creates one more REAL task and nothing
+    # ever stops it. The counter is the only bound on that loop.
+    quarantine_bump "$hash"
+    qn="$(quarantine_count "$hash")"
+    log "[$hash] read-back miss for $id — NOT re-creating; attempt $qn/$QUARANTINE_MAX"
+    if [ "$qn" -ge "$QUARANTINE_MAX" ]; then
+      log "[$hash] read-back miss escalated — QUARANTINED at $qn/$QUARANTINE_MAX, no further creates for this signature"
+      alert_cond quarantine "🔴 ops-triage drainer: signature $hash QUARANTINED after $qn create attempts whose read-back never confirmed. No further creates until $QDIR/$hash is cleared."
+    else
+      alert_cond readback "⚠️ ops-triage drainer: created $id for signature $hash but could not read it back. Not re-creating; reconciling via the queue next tick. Attempt $qn/$QUARANTINE_MAX."
+    fi
   fi
 done
 

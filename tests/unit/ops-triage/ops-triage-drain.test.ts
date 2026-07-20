@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync, rmSync, symlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -29,7 +29,10 @@ const VALID_ID = 'task_1784413707062_31877972';
 
 let stubBin: string;      // fake cortextos CLI
 let failGit: string;      // git stub that always fails
+let recGit: string;       // git stub that records argv (proves a verb was never reached)
+let recCurl: string;      // curl stub that records the --config file it was handed
 let isoFwRoot: string;    // empty framework root => no agent .env => no BOT_TOKEN
+let tokenFwRoot: string;  // framework root WITH a fake BOT_TOKEN (curl-fallback tests only)
 
 beforeAll(() => {
   const d = mkdtempSync(join(tmpdir(), 'opsdrain-bin-'));
@@ -50,7 +53,11 @@ beforeAll(() => {
     'n=$(( $(cat "$sd/n" 2>/dev/null || echo 0) + 1 )); printf "%s" "$n" > "$sd/n"\n' +
     'printf "%s\\0" "$@" > "$sd/calls/call-$n.argv"\n' +
     '{ printf "CTX_ORG=%s\\n" "${CTX_ORG:-}"; printf "CTX_INSTANCE_ID=%s\\n" "${CTX_INSTANCE_ID:-}";\n' +
-    '  printf "CTX_AGENT_NAME=%s\\n" "${CTX_AGENT_NAME:-}"; } > "$sd/calls/call-$n.env"\n' +
+    '  printf "CTX_AGENT_NAME=%s\\n" "${CTX_AGENT_NAME:-}";\n' +
+    '  printf "CTX_AGENT_DIR=%s\\n" "${CTX_AGENT_DIR:-}";\n' +
+    '  printf "CTX_PROJECT_ROOT=%s\\n" "${CTX_PROJECT_ROOT:-}";\n' +
+    '  printf "CTX_TIMEZONE=%s\\n" "${CTX_TIMEZONE:-}";\n' +
+    '  printf "CTX_ORCHESTRATOR=%s\\n" "${CTX_ORCHESTRATOR:-}"; } > "$sd/calls/call-$n.env"\n' +
     'case "$2" in\n' +
     '  create-task)\n' +
     '    if [ "${STUB_CREATE_FAIL:-0}" = "1" ]; then exit 1; fi\n' +
@@ -67,6 +74,38 @@ beforeAll(() => {
   failGit = join(d, 'git-fail');
   writeFileSync(failGit, '#!/bin/bash\nexit 1\n');
   chmodSync(failGit, 0o755);
+
+  // A git stub that RECORDS its argv instead of running git. Used to prove that the
+  // symlink/origin ownership guard refuses BEFORE any destructive verb is reached.
+  recGit = join(d, 'git-record');
+  writeFileSync(recGit,
+    '#!/bin/bash\n' +
+    'rd="$GIT_RECORD_DIR"; mkdir -p "$rd"\n' +
+    'n=$(( $(cat "$rd/n" 2>/dev/null || echo 0) + 1 )); printf "%s" "$n" > "$rd/n"\n' +
+    'printf "%s\\0" "$@" > "$rd/argv-$n"\n' +
+    'exit 1\n');
+  chmodSync(recGit, 0o755);
+
+  // A curl stub that COPIES the --config file it was handed and exits non-zero. It never
+  // opens a socket, so the alert path can be inspected byte-for-byte with zero network
+  // reachability (belt and braces on top of TELEGRAM_API_BASE pointing at a dead port).
+  recCurl = join(d, 'curl-record');
+  writeFileSync(recCurl,
+    '#!/bin/bash\n' +
+    'rd="$CURL_RECORD_DIR"; mkdir -p "$rd"\n' +
+    'n=$(( $(cat "$rd/n" 2>/dev/null || echo 0) + 1 )); printf "%s" "$n" > "$rd/n"\n' +
+    'printf "%s\\0" "$@" > "$rd/argv-$n"\n' +
+    'prev=""\n' +
+    'for a in "$@"; do if [ "$prev" = "--config" ]; then cp "$a" "$rd/cfg-$n"; fi; prev="$a"; done\n' +
+    'exit 1\n');
+  chmodSync(recCurl, 0o755);
+
+  // A framework root that DOES resolve a BOT_TOKEN, so the raw-curl fallback branch is
+  // actually entered. Paired with the recording curl stub above, never with a real curl.
+  tokenFwRoot = mkdtempSync(join(tmpdir(), 'opsdrain-fwtok-'));
+  mkdirSync(join(tokenFwRoot, 'orgs', 'vault', 'agents', 'solo'), { recursive: true });
+  writeFileSync(join(tokenFwRoot, 'orgs', 'vault', 'agents', 'solo', '.env'),
+    'BOT_TOKEN="fake-token-not-a-real-bot"\nCHAT_ID="000"\n');
 });
 
 // ---------------------------------------------------------------- fixtures
@@ -101,25 +140,37 @@ function carrier(over: Record<string, unknown> = {}) {
   };
 }
 
-/** A gate dir whose config.json + IDENTITY.md carry all four preflight invariants. */
-function gateDir(opts: { drop?: string; reword?: boolean } = {}) {
+/**
+ * A gate dir whose IDENTITY.md carries all four preflight invariants — deliberately ONE
+ * INVARIANT PER LINE, so `drop` can remove exactly one and the per-invariant tests are
+ * genuinely independent (the old fixture put graphify and approval on the same line, so
+ * dropping one silently dropped two).
+ *
+ * `reword` is the tolerance fixture: same wording, different CASE and WHITESPACE only
+ * (including a line wrap mid-phrase). That is the exact and only drift the tripwire is
+ * meant to forgive.
+ */
+const GATE_LINES: Record<string, string> = {
+  graphify: 'Heartbeat gate: graphify runs first, before anything else.',
+  approval: 'Nothing ships without Bones approval.',
+  merge:    'I never merge to main. I hand Bones the PR.',
+  external: 'I never fire external writes (Hudu pushes, sends, deploys).',
+};
+
+function gateDir(opts: { drop?: keyof typeof GATE_LINES; reword?: boolean } = {}) {
   const g = mkdtempSync(join(tmpdir(), 'opsdrain-gate-'));
   mkdirSync(g, { recursive: true });
-  let identity = opts.reword
-    ? [
-        'The heartbeat runs GRAPHIFY first, then a plan, then Bones approval.',
-        'You must never merge anything into main.',
-        'You must never fire any external writes without approval.',
-      ].join('\n')
-    : [
-        'Heartbeat gate: graphify -> plan -> BONES APPROVAL -> build.',
-        'never merge to main',
-        'never fire external writes',
-      ].join('\n');
-  if (opts.drop) {
-    identity = identity.split('\n').filter(l => !l.toLowerCase().includes(opts.drop!)).join('\n');
-  }
-  writeFileSync(join(g, 'IDENTITY.md'), identity + '\n');
+  const lines = opts.reword
+    ? {
+        graphify: 'The heartbeat runs   GRAPHIFY   first.',
+        approval: 'Then a plan, then Bones\n   APPROVAL, then build.',
+        // phrase preserved, wrapped across a newline + padded with extra spaces
+        merge:    'You must never\n\tmerge   to\n  main under any circumstances.',
+        external: 'You must never fire any External\n   Writes without a human go.',
+      }
+    : { ...GATE_LINES };
+  if (opts.drop) delete (lines as Record<string, string>)[opts.drop];
+  writeFileSync(join(g, 'IDENTITY.md'), Object.values(lines).join('\n') + '\n');
   writeFileSync(join(g, 'config.json'), JSON.stringify({ name: 'dev-delegate' }));
   return g;
 }
@@ -547,13 +598,37 @@ describe('ops-triage-drain: outbox source isolation', () => {
 });
 
 describe('ops-triage-drain: preflight drift tripwire', () => {
-  it('a MISSING gate invariant → refuse, alert, zero creates', () => {
-    const c = ctx({ gate: gateDir({ drop: 'external' }) });
+  // ONE TEST PER INVARIANT. Previously only the `external` token had coverage, so deleting
+  // "never-merge-main" from the invariant list still passed the whole suite — an untested
+  // tripwire is not a tripwire. Each case removes exactly one invariant line.
+  for (const inv of ['graphify', 'approval', 'merge', 'external'] as const) {
+    it(`a MISSING gate invariant (${inv}) → refuse, alert, zero creates`, () => {
+      const c = ctx({ gate: gateDir({ drop: inv }) });
+      writeItem(c, HASH, outboxItem());
+      tick(c);
+      expect(creates(c)).toHaveLength(0);
+      expect(existsSync(join(c.state, 'alert.preflight.json'))).toBe(true);
+      expect(log(c)).toMatch(/preflight/i);
+    });
+  }
+
+  it('the merge invariant is matched as a PHRASE — "merge" and "main" scattered elsewhere do not satisfy it', () => {
+    // The word-splitting implementation checked "merge" and "main" independently, so this
+    // gate (invariant deleted, both words present in unrelated prose) passed the tripwire.
+    const g = mkdtempSync(join(tmpdir(), 'opsdrain-gate-split-'));
+    writeFileSync(join(g, 'IDENTITY.md'), [
+      'Heartbeat gate: graphify runs first.',
+      'Nothing ships without Bones approval.',
+      'I never fire external writes.',
+      // every word of the phrase appears — "merge", "to", "main" — but not the invariant
+      'I merge my feature branches often, I push to origin, and main is the trunk.',
+    ].join('\n'));
+    writeFileSync(join(g, 'config.json'), JSON.stringify({ name: 'dev-delegate' }));
+    const c = ctx({ gate: g });
     writeItem(c, HASH, outboxItem());
     tick(c);
     expect(creates(c)).toHaveLength(0);
-    expect(existsSync(join(c.state, 'alert.preflight.json'))).toBe(true);
-    expect(log(c)).toMatch(/preflight/i);
+    expect(log(c)).toMatch(/never-merge-main/);
   });
 
   it('a cosmetically REWORDED but intact gate → does not trip, drains normally', () => {
@@ -626,6 +701,288 @@ describe('ops-triage-drain: ISOLATION GUARD', () => {
     expect(l).not.toMatch(/alert sent/);
     // every CLI invocation went to the stub (it recorded them); none escaped to the real binary
     for (const call of calls(c)) expect(call.argv[0]).toBe('bus');
+  });
+});
+
+describe('ops-triage-drain: timestamp contract (free-form date input is refused)', () => {
+  // `date -d` parses relative expressions. Fed the untrusted .newestFailureAt, "now" is
+  // re-evaluated every tick and is therefore ALWAYS newer than any fixed close time — the
+  // settled "respect the human no" gate inverts and the item re-drains forever.
+  for (const bad of ['now', 'tomorrow', '+1 day', 'next friday']) {
+    it(`refuses the free-form timestamp "${bad}" — zero creates across 3 ticks even with a terminal carrier`, () => {
+      const c = ctx();
+      writeItem(c, HASH, outboxItem({ newestFailureAt: bad }));
+      const t = tasksFixture(c, 't', [carrier({
+        status: 'cancelled', updated_at: '2026-07-18T12:00:00Z', completed_at: null,
+      })]);
+      for (let i = 0; i < 3; i++) tick(c, { STUB_TASKS: t });
+      expect(creates(c)).toHaveLength(0);
+      expect(log(c)).toMatch(/REJECTED newestFailureAt/);
+    });
+  }
+
+  it('refuses a far-FUTURE timestamp (the absolute form of the same forever-newer attack)', () => {
+    const c = ctx();
+    writeItem(c, HASH, outboxItem({ newestFailureAt: '3000-01-01T00:00:00.000Z' }));
+    const t = tasksFixture(c, 't', [carrier({
+      status: 'completed', updated_at: '2026-07-18T12:00:00Z', completed_at: '2026-07-18T12:00:00Z',
+    })]);
+    tick(c, { STUB_TASKS: t });
+    expect(creates(c)).toHaveLength(0);
+    expect(log(c)).toMatch(/REJECTED newestFailureAt/);
+  });
+
+  it('refuses other non-ISO shapes (epoch seconds, date-only, "yesterday 5pm")', () => {
+    for (const bad of ['1784413707', '2026-07-18', 'yesterday 5pm', '18 Jul 2026']) {
+      const c = ctx();
+      writeItem(c, HASH, outboxItem({ newestFailureAt: bad }));
+      tick(c);
+      expect(creates(c)).toHaveLength(0);
+    }
+  });
+
+  it('a rejected timestamp counts toward quarantine instead of retrying forever', () => {
+    const c = ctx();
+    writeItem(c, HASH, outboxItem({ newestFailureAt: 'now' }));
+    for (let i = 0; i < 5; i++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
+    expect(creates(c)).toHaveLength(0);
+    expect(readFileSync(join(c.state, 'quarantine', HASH), 'utf-8')).toBe('3');
+    expect(existsSync(join(c.state, 'alert.quarantine.json'))).toBe(true);
+  });
+
+  it('still drains a VALID ISO timestamp (the guard rejects free-form, not everything)', () => {
+    for (const good of ['2026-07-18T10:00:56.789Z', '2026-07-18T10:00:56Z', '2026-07-18T03:00:56-07:00', '2026-07-18T03:00:56-0700']) {
+      const c = ctx();
+      writeItem(c, HASH, outboxItem({ newestFailureAt: good }));
+      tick(c, { STUB_TASKS_POST: tasksFixture(c, 'post', [carrier({ id: VALID_ID })]) });
+      expect(creates(c)).toHaveLength(1);
+    }
+  });
+
+  it('applies the same contract to timestamps read from the CLI — a carrier closed "now" is treated as closed, never re-drained', () => {
+    const c = ctx();
+    writeItem(c, HASH, outboxItem({ newestFailureAt: '2026-07-18T10:00:00.000Z' }));
+    const t = tasksFixture(c, 't', [carrier({
+      status: 'completed', completed_at: 'now', updated_at: 'tomorrow',
+    })]);
+    tick(c, { STUB_TASKS: t });
+    tick(c, { STUB_TASKS: t });
+    expect(creates(c)).toHaveLength(0);
+    expect(log(c)).toMatch(/no parseable close time/);
+  });
+});
+
+describe('ops-triage-drain: read-back miss is BOUNDED', () => {
+  it('a bus that always returns [] but always accepts create-task stops at QUARANTINE_MAX', () => {
+    // Without a quarantine bump on this branch, every tick created one more REAL task and
+    // nothing ever stopped it: 10 ticks = 10 tasks, 0 quarantine entries.
+    const c = ctx();
+    writeItem(c, HASH, outboxItem());
+    for (let i = 0; i < 10; i++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
+    expect(creates(c)).toHaveLength(3);
+    expect(readFileSync(join(c.state, 'quarantine', HASH), 'utf-8')).toBe('3');
+    expect(log(c)).toMatch(/read-back miss escalated/);
+    expect(existsSync(join(c.state, 'alert.quarantine.json'))).toBe(true);
+  });
+
+  it('a NON-EMPTY queue that lacks the created id is a read-back MISS, not a pass', () => {
+    // The discriminator for `any(.[]; .id == $id)` vs a vacuous `length > 0`: the queue is
+    // non-empty, but the id we just created is not in it.
+    const c = ctx();
+    writeItem(c, HASH, outboxItem());
+    const post = tasksFixture(c, 'post', [
+      carrier({ id: 'task_1700000000000_99999999', title: 'Some entirely unrelated task' }),
+    ]);
+    tick(c, { STUB_TASKS_POST: post });
+    expect(creates(c)).toHaveLength(1);
+    expect(log(c)).toMatch(/read-back miss/);
+    const ledger = existsSync(join(c.state, 'drained.json'))
+      ? JSON.parse(readFileSync(join(c.state, 'drained.json'), 'utf-8')) : {};
+    expect(ledger[HASH]).toBeUndefined();
+    expect(existsSync(join(c.state, 'quarantine', HASH))).toBe(true);
+  });
+});
+
+describe('ops-triage-drain: dedup discriminators', () => {
+  it('closed-at precedence is completed_at FIRST — a stale updated_at must not reopen a completed carrier', () => {
+    // completed_at 12:00, updated_at 09:00, failure 10:00. Correct order → closed at 12:00
+    // → not newer → no create. Reversed (`updated_at // completed_at`) → 10:00 > 09:00 → create.
+    const c = ctx();
+    writeItem(c, HASH, outboxItem({ newestFailureAt: '2026-07-18T10:00:00.000Z' }));
+    const t = tasksFixture(c, 't', [carrier({
+      status: 'completed', completed_at: '2026-07-18T12:00:00Z', updated_at: '2026-07-18T09:00:00Z',
+    })]);
+    tick(c, { STUB_TASKS: t, STUB_TASKS_POST: tasksFixture(c, 'post', [carrier({ id: VALID_ID })]) });
+    expect(creates(c)).toHaveLength(0);
+  });
+
+  it('an ARCHIVED carrier is not an active carrier — the ledger decides, so a fresh signature drains', () => {
+    // Discriminator for the `select((.archived // false) | not)` filter: pending status but
+    // archived out of the queue. With the filter deleted this is read as an active carrier
+    // and the item is skipped forever.
+    const c = ctx();
+    writeItem(c, HASH, outboxItem());
+    const t = tasksFixture(c, 't', [carrier({ status: 'pending', archived: true })]);
+    tick(c, { STUB_TASKS: t, STUB_TASKS_POST: tasksFixture(c, 'post', [carrier({ id: VALID_ID })]) });
+    expect(creates(c)).toHaveLength(1);
+  });
+
+  it('a legacy "done" status is TERMINAL, not active — a genuinely newer failure re-flares', () => {
+    const c = ctx();
+    writeItem(c, HASH, outboxItem({ newestFailureAt: '2026-07-18T13:00:00.000Z' }));
+    const t = tasksFixture(c, 't', [carrier({
+      status: 'done', completed_at: '2026-07-18T12:00:00Z', updated_at: '2026-07-18T12:00:00Z',
+    })]);
+    tick(c, { STUB_TASKS: t, STUB_TASKS_POST: tasksFixture(c, 'post', [carrier({ id: VALID_ID })]) });
+    expect(creates(c)).toHaveLength(1); // treated as active => 0
+  });
+
+  it('a legacy "done" carrier closed after the newest failure still suppresses the drain', () => {
+    const c = ctx();
+    writeItem(c, HASH, outboxItem({ newestFailureAt: '2026-07-18T10:00:00.000Z' }));
+    const t = tasksFixture(c, 't', [carrier({
+      status: 'done', completed_at: '2026-07-18T12:00:00Z', updated_at: '2026-07-18T12:00:00Z',
+    })]);
+    tick(c, { STUB_TASKS: t });
+    expect(creates(c)).toHaveLength(0);
+  });
+});
+
+describe('ops-triage-drain: clone confinement (reset --hard must land in OUR clone)', () => {
+  it('a SYMLINKED clone path → refuse, alert, no git verb reached, target untouched', () => {
+    const c = ctx();
+    const target = mkdtempSync(join(tmpdir(), 'opsdrain-shared-checkout-'));
+    mkdirSync(join(target, '.git'), { recursive: true });
+    writeFileSync(join(target, 'tracked.txt'), 'precious uncommitted work');
+    symlinkSync(target, join(c.state, 'vault-clone'));
+
+    const rec = join(c.state, 'gitrec');
+    writeItem(c, HASH, outboxItem());
+    tick(c, { OPS_DRAIN_NO_SYNC: '0', OPS_DRAIN_GIT_BIN: recGit, GIT_RECORD_DIR: rec });
+
+    expect(creates(c)).toHaveLength(0);
+    expect(log(c)).toMatch(/symlink/i);
+    expect(existsSync(join(c.state, 'alert.sync.json'))).toBe(true);
+    // git was never invoked at all, so no fetch and above all no `reset --hard`
+    expect(existsSync(rec)).toBe(false);
+    expect(readFileSync(join(target, 'tracked.txt'), 'utf-8')).toBe('precious uncommitted work');
+    expect(existsSync(join(target, '.git'))).toBe(true);
+  });
+
+  it('an origin that is NOT the expected vault remote → refuse before fetch/reset', () => {
+    const c = ctx();
+    mkdirSync(join(c.state, 'vault-clone', '.git'), { recursive: true });
+    const rec = join(c.state, 'gitrec2');
+    const wrongOrigin = join(c.state, 'git-wrong-origin');
+    writeFileSync(wrongOrigin,
+      '#!/bin/bash\n' +
+      'rd="$GIT_RECORD_DIR"; mkdir -p "$rd"\n' +
+      'n=$(( $(cat "$rd/n" 2>/dev/null || echo 0) + 1 )); printf "%s" "$n" > "$rd/n"\n' +
+      'printf "%s\\0" "$@" > "$rd/argv-$n"\n' +
+      'if [ "$3" = "remote" ]; then echo "git@github.com:attacker/not-the-vault.git"; exit 0; fi\n' +
+      'exit 0\n');
+    chmodSync(wrongOrigin, 0o755);
+
+    writeItem(c, HASH, outboxItem());
+    tick(c, { OPS_DRAIN_NO_SYNC: '0', OPS_DRAIN_GIT_BIN: wrongOrigin, GIT_RECORD_DIR: rec });
+
+    expect(creates(c)).toHaveLength(0);
+    expect(log(c)).toMatch(/origin mismatch/i);
+    const verbs = readdirSync(rec)
+      .filter(f => f.startsWith('argv-'))
+      .map(f => readFileSync(join(rec, f), 'utf-8').split('\0').slice(0, -1));
+    expect(verbs.every(v => !v.includes('reset'))).toBe(true);
+    expect(verbs.every(v => !v.includes('fetch'))).toBe(true);
+  });
+});
+
+describe('ops-triage-drain: alert text can never forge a curl config directive', () => {
+  it('a newline + "output =" in an outbox FILENAME does not become a config line and writes no file', () => {
+    // $base reaches the alert BEFORE the hash contract validates it. curl --config parses
+    // every LINE as an option, so an unsanitized newline would inject `output = <path>`
+    // (arbitrary local write) or a second `url =` (a second request).
+    const c = ctx();
+    const rec = join(c.state, 'curlrec');
+    const marker = 'PWNED_BY_CONFIG';
+    // NB: built by concatenation, not join() — join() would normalize the embedded slashes
+    // into path separators. The injected directives are slash-free for the same reason;
+    // a relative `output =` still lands a real file (in cwd), which is the whole point.
+    writeFileSync(`${c.outbox}/BAD\noutput = ${marker}\nurl = injected.invalid\n.json`,
+      JSON.stringify(outboxItem()));
+
+    tick(c, {
+      CTX_FRAMEWORK_ROOT: tokenFwRoot,   // resolves a FAKE BOT_TOKEN so the fallback runs
+      CURL_BIN: recCurl,                 // records the config; never opens a socket
+      CURL_RECORD_DIR: rec,
+    });
+
+    expect(creates(c)).toHaveLength(0);
+    const cfgs = readdirSync(rec).filter(f => f.startsWith('cfg-'));
+    expect(cfgs.length).toBeGreaterThan(0);
+
+    for (const f of cfgs) {
+      const lines = readFileSync(join(rec, f), 'utf-8').split('\n');
+      expect(lines.filter(l => /^\s*output\s*=/.test(l))).toEqual([]);
+      expect(lines.filter(l => /^\s*(url|upload-file|write-out|trace|dump-header)\s*=/.test(l)))
+        .toHaveLength(1); // exactly the one url line we wrote ourselves
+      // the hostile text survives only INSIDE the single text= value, flattened
+      expect(lines.filter(l => /^\s*data-urlencode\s*=\s*"text=/.test(l))).toHaveLength(1);
+    }
+
+    for (const root of [c.cwd, c.state, c.outbox, c.stubDir]) {
+      expect(walk(root).filter(p => p.split('/').pop() === marker)).toEqual([]);
+    }
+  });
+});
+
+describe('ops-triage-drain: env hygiene + resilience', () => {
+  it('scrubs inherited CTX_AGENT_DIR / CTX_PROJECT_ROOT (the real CLI throws on a mismatch)', () => {
+    const c = ctx();
+    writeItem(c, HASH, outboxItem());
+    tick(c, {
+      CTX_AGENT_DIR: '/home/bones/cortextos/orgs/vault/agents/some-live-agent',
+      CTX_PROJECT_ROOT: '/home/bones/some-live-project',
+      CTX_TIMEZONE: 'Antarctica/Troll',
+      CTX_ORCHESTRATOR: 'solo',
+      STUB_TASKS_POST: tasksFixture(c, 'post', [carrier({ id: VALID_ID })]),
+    });
+    expect(calls(c).length).toBeGreaterThan(0);
+    for (const call of calls(c)) {
+      expect(call.env.CTX_AGENT_DIR).toBe('');
+      expect(call.env.CTX_PROJECT_ROOT).toBe('');
+      expect(call.env.CTX_TIMEZONE).toBe('');
+      expect(call.env.CTX_ORCHESTRATOR).toBe('');
+    }
+  });
+
+  it('a corrupt quarantine counter reads as 0 instead of erroring the tick', () => {
+    const c = ctx();
+    mkdirSync(join(c.state, 'quarantine'), { recursive: true });
+    writeFileSync(join(c.state, 'quarantine', HASH), 'not-a-number\n');
+    writeItem(c, HASH, outboxItem());
+    expect(() => tick(c, { STUB_TASKS_POST: tasksFixture(c, 'post', [carrier({ id: VALID_ID })]) })).not.toThrow();
+    expect(creates(c)).toHaveLength(1);
+  });
+
+  it('a non-numeric QUARANTINE_MAX falls back to the default instead of erroring the tick', () => {
+    const c = ctx();
+    writeItem(c, HASH, outboxItem());
+    expect(() => tick(c, {
+      OPS_DRAIN_QUARANTINE_MAX: 'lots',
+      STUB_TASKS_POST: tasksFixture(c, 'post', [carrier({ id: VALID_ID })]),
+    })).not.toThrow();
+    expect(creates(c)).toHaveLength(1);
+  });
+
+  it('a FAILED ledger write is not a successful drain — logged, alerted, counted', () => {
+    const c = ctx();
+    mkdirSync(join(c.state, 'drained.json'));   // a directory: every jq write against it fails
+    writeItem(c, HASH, outboxItem());
+    tick(c, { STUB_TASKS_POST: tasksFixture(c, 'post', [carrier({ id: VALID_ID })]) });
+    expect(creates(c)).toHaveLength(1);
+    expect(log(c)).toMatch(/LEDGER WRITE FAILED/);
+    expect(log(c)).not.toMatch(/drained \+ read-back confirmed/);
+    expect(existsSync(join(c.state, 'quarantine', HASH))).toBe(true);
   });
 });
 
