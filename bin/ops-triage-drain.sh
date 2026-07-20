@@ -227,6 +227,40 @@ quarantine_bump() {
 }
 quarantine_clear() { [ "$DRY_RUN" = "1" ] || rm -f "$QDIR/$1" 2>/dev/null; }
 
+# Alert marker keys become FILENAMES ($STATE/alert.$key.json). A key derived from a value
+# the outbox controls (the raw filename in the bad-hash path, which reaches the alert
+# BEFORE the hash contract has validated it) must be flattened first — otherwise a newline
+# or a path separator in the name steers where the marker lands.
+akey() {
+  local v; v="$(printf '%s' "${1:-}" | tr -c 'a-zA-Z0-9._-' '_')"
+  printf '%s' "${v:0:40}"
+}
+
+# Content fingerprint of one outbox item. The quarantine counter bounds retries of a
+# SPECIFIC piece of evidence; when the cloud task rewrites the item the old failure streak
+# is about content that no longer exists. Without this a signature quarantined by a
+# transient host-clock skew (a documented failure mode here — a >24h-future timestamp
+# quarantines in QUARANTINE_MAX ticks) stays bricked forever even after the clock and the
+# timestamp are fixed, because the quarantine gate is checked before the timestamp parse.
+item_fp() { cksum < "$1" 2>/dev/null | tr -d '[:space:]'; }
+
+# A HEALTHY outcome for one signature. LOAD-BEARING (review BLOCKER): the counter must
+# track CONSECUTIVE failures, not lifetime ones. It used to be cleared only on the full
+# create + read-back + ledger success path, so every legitimate skip (active carrier,
+# carrier closed at/after the failure, already drained) left a stale count behind and one
+# transient read-back miss a month eventually bricked the signature. Clearing here is also
+# the ONLY thing that ever resolves the quarantine alert.
+mark_healthy() {
+  local h="$1"
+  if [ "$(quarantine_count "$h")" -gt 0 ]; then
+    log "[$h] healthy outcome — clearing the consecutive-failure counter"
+  fi
+  quarantine_clear "$h"
+  clear_cond "quarantine.$h" "🟢 ops-triage drainer: signature $h recovered — quarantine cleared, draining resumed."
+  clear_cond "badtime.$h"    "🟢 ops-triage drainer: signature $h has a usable newestFailureAt again."
+  clear_cond "readback.$h"   "🟢 ops-triage drainer: signature $h reconciled — read-back healthy again."
+}
+
 # --- 1. PREFLIGHT: dev-delegate gate drift tripwire ---------------------------
 # HONEST SCOPE: this proves the gate PROSE is intact. It is NOT enforcement — the real
 # gate is dev-delegate's own behavioral self-gate (`--needs-approval` is written but never
@@ -238,18 +272,28 @@ quarantine_clear() { [ "$DRY_RUN" = "1" ] || rm -f "$QDIR/$1" 2>/dev/null; }
 # the words "merge" and "main" anywhere, even with the invariant deleted (review finding).
 # Tolerance is deliberately whitespace/case only: a line-wrap or a capitalization change
 # does not trip, but rewriting the invariant away does.
+#
+# THE INVARIANTS ARE ASSERTED AGAINST IDENTITY.md ALONE (review finding). This used to
+# concatenate config.json with IDENTITY.md and match the phrases across the union — but the
+# live config.json's heartbeat `prompt` string already paraphrases the hard lines ("Never
+# merge to main, never fire external writes.") and names graphify and approval_rules. That
+# made the tripwire INERT against the one file whose prose is the gate: emptying or
+# inverting IDENTITY.md entirely produced zero refusals. config.json is now checked for
+# presence only; it can never satisfy an IDENTITY invariant.
+#
+# The phrases are also specific gate prose, not bare tokens. "approval" alone was satisfied
+# by the machine key `"approval_rules":`, and "graphify" by any passing mention.
 preflight_ok() {
-  local text="" f
-  for f in "$GATE_DIR/config.json" "$GATE_DIR/IDENTITY.md"; do
-    [ -f "$f" ] && text="$text
-$(cat "$f" 2>/dev/null)"
-  done
-  [ -z "${text//[[:space:]]/}" ] && { MISSING_INVARIANT="gate files absent ($GATE_DIR)"; return 1; }
+  local cfg="$GATE_DIR/config.json" idf="$GATE_DIR/IDENTITY.md"
+  if [ ! -f "$cfg" ]; then MISSING_INVARIANT="config.json absent ($GATE_DIR)"; return 1; fi
+  if [ ! -f "$idf" ]; then MISSING_INVARIANT="IDENTITY.md absent ($GATE_DIR)"; return 1; fi
+  local text; text="$(cat "$idf" 2>/dev/null)"
+  [ -z "${text//[[:space:]]/}" ] && { MISSING_INVARIANT="IDENTITY.md is empty ($idf)"; return 1; }
   local lower; lower="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ')"
-  # invariant name -> the whole phrase that must be present
+  # invariant name -> the whole phrase that must be present IN IDENTITY.md
   local -a inv=(
-    "graphify-gate:graphify"
-    "human-approval:approval"
+    "graphify-gate:graphify the target repo"
+    "human-approval:no build before approval"
     "never-merge-main:merge to main"
     "no-external-writes:external writes"
   )
@@ -287,6 +331,13 @@ sync_clone() {
   # remote. On either failure: alert and skip the tick. Never reset.
   if [ -L "$CLONE" ]; then
     SYNC_REFUSE="clone path is a SYMLINK ($CLONE) — refusing to fetch/reset a tree we do not own"
+    return 1
+  fi
+  # A real dir whose .git is a symlink into a shared repo is the same hazard wearing a
+  # different hat: `[ -d "$CLONE/.git" ]` FOLLOWS the link and reads true, so the ownership
+  # proof passed and `reset --hard` landed in someone else's object store (review finding).
+  if [ -L "$CLONE/.git" ]; then
+    SYNC_REFUSE="clone .git is a SYMLINK ($CLONE/.git) — refusing to fetch/reset a repo we do not own"
     return 1
   fi
   if [ ! -d "$CLONE/.git" ]; then
@@ -332,21 +383,30 @@ ledger_put() {
 shopt -s nullglob
 
 DRAINED=0
+ITEMS_SEEN=0
+QSKIPS=0
 for file in "$OUTBOX_DIR"/*.json; do
   base="$(basename "$file")"
   hash="${base%.json}"
+  ITEMS_SEEN=$((ITEMS_SEEN + 1))
 
   # 3a. HASH CONTRACT. D1's signatureHash is djb2 -> base36 = [0-9a-z], ~4-7 chars. It is
   # NOT hex — a `^[a-f0-9]{6,64}$` assert would quarantine every real item.
+  #
+  # ALERT KEYS ARE PER-SIGNATURE (review BLOCKER). They used to be fixed strings, so with
+  # two bad signatures in the outbox only the FIRST ever produced a delivered alert — the
+  # second was suppressed by the first's cadence marker and was bricked with zero
+  # human-visible signal. Only genuinely global conditions (preflight, scan, clone/fetch)
+  # keep a global key.
   case "$hash" in
     *[!0-9a-z]* | "")
       log "invalid hash '$hash' (not ^[0-9a-z]{1,16}\$) — quarantined, not drained"
-      alert_cond badhash "⚠️ ops-triage drainer: outbox file '$base' has an invalid signature hash. Quarantined, not drained."
+      alert_cond "badhash.$(akey "$hash")" "⚠️ ops-triage drainer: outbox file '$base' has an invalid signature hash. Quarantined, not drained."
       continue ;;
   esac
   if [ "${#hash}" -gt 16 ]; then
     log "invalid hash '$hash' (too long) — quarantined, not drained"
-    alert_cond badhash "⚠️ ops-triage drainer: outbox file '$base' has an over-long signature hash. Quarantined, not drained."
+    alert_cond "badhash.$(akey "$hash")" "⚠️ ops-triage drainer: outbox file '$base' has an over-long signature hash. Quarantined, not drained."
     continue
   fi
 
@@ -357,12 +417,31 @@ for file in "$OUTBOX_DIR"/*.json; do
     continue
   fi
 
+  # 3b-bis. NEW EVIDENCE RESETS THE FAILURE STREAK. The quarantine counter bounds retries
+  # of one specific item; when the content changes the streak is about evidence that no
+  # longer exists. Without this the quarantine gate below (which runs BEFORE the timestamp
+  # parse, deliberately) is a one-way door: a signature quarantined by a host-clock skew
+  # could never recover even once the clock and the timestamp were fixed.
+  fp="$(item_fp "$file")"
+  fpf="$QDIR/$hash.fp"          # cannot collide with the counter file: a hash has no dot
+  prev_fp=""
+  [ -f "$fpf" ] && prev_fp="$(head -c 64 "$fpf" 2>/dev/null | tr -d '[:space:]')"
+  if [ "$fp" != "$prev_fp" ]; then
+    if [ -n "$prev_fp" ] && [ "$(quarantine_count "$hash")" -gt 0 ]; then
+      log "[$hash] outbox item content changed — resetting the consecutive-failure counter"
+      quarantine_clear "$hash"
+      clear_cond "quarantine.$hash" "🟢 ops-triage drainer: signature $hash has fresh evidence — quarantine reset, retrying."
+    fi
+    [ "$DRY_RUN" = "1" ] || printf '%s' "$fp" > "$fpf" 2>/dev/null
+  fi
+
   # 3c. QUARANTINE gate — a poison pill must not retry forever. Checked BEFORE the
   # timestamp parse so that a permanently-unparseable item is bounded too.
   qn="$(quarantine_count "$hash")"
   if [ "$qn" -ge "$QUARANTINE_MAX" ]; then
     log "[$hash] quarantined ($qn failed attempts >= $QUARANTINE_MAX) — skipping, no further retries"
-    alert_cond quarantine "🔴 ops-triage drainer: signature $hash QUARANTINED after $qn failed attempts. It will not be retried until the quarantine counter is cleared ($QDIR/$hash)."
+    alert_cond "quarantine.$hash" "🔴 ops-triage drainer: signature $hash QUARANTINED after $qn failed attempts. It will not be retried until the quarantine counter is cleared ($QDIR/$hash)."
+    QSKIPS=$((QSKIPS + 1))
     continue
   fi
 
@@ -376,7 +455,7 @@ for file in "$OUTBOX_DIR"/*.json; do
   if [ -z "$newest_e" ]; then
     quarantine_bump "$hash"
     log "[$hash] REJECTED newestFailureAt ('$newest') — not a strict ISO-8601 instant (or too far future); skipped, attempt $(quarantine_count "$hash")/$QUARANTINE_MAX"
-    alert_cond badtime "⚠️ ops-triage drainer: signature $hash has an invalid newestFailureAt ('$newest'). Not drained. Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
+    alert_cond "badtime.$hash" "⚠️ ops-triage drainer: signature $hash has an invalid newestFailureAt ('$newest'). Not drained. Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
     continue
   fi
 
@@ -404,6 +483,7 @@ for file in "$OUTBOX_DIR"/*.json; do
 
   if [ "$active_n" -gt 0 ]; then
     log "[$hash] active carrier already queued — skip"
+    mark_healthy "$hash"
     continue
   fi
 
@@ -433,12 +513,14 @@ for file in "$OUTBOX_DIR"/*.json; do
     done <<< "$closed_list"
     if [ -z "$closed_e" ]; then
       log "[$hash] terminal carrier with no parseable close time — treating as closed, skip"
+      mark_healthy "$hash"
       continue
     fi
     if [ "$newest_e" -gt "$closed_e" ]; then
       decision="RE-FLARE (newestFailureAt $newest is after the carrier closed)"
     else
       log "[$hash] terminal carrier closed at/after the newest failure — skip (respecting the close)"
+      mark_healthy "$hash"
       continue
     fi
   else
@@ -454,6 +536,7 @@ for file in "$OUTBOX_DIR"/*.json; do
       prev_e="$(epoch "$prev")"
       if [ -n "$prev_e" ] && [ "$newest_e" -le "$prev_e" ]; then
         log "[$hash] already drained at $prev and no newer failure — skip"
+        mark_healthy "$hash"
         continue
       fi
       decision="RE-FLARE (newestFailureAt $newest is after the ledger's $prev)"
@@ -514,13 +597,13 @@ for file in "$OUTBOX_DIR"/*.json; do
     *)
       quarantine_bump "$hash"
       log "[$hash] create returned no/invalid task id ('${id:-<empty>}') — quarantine counter now $(quarantine_count "$hash"), will retry"
-      alert_cond createfail "⚠️ ops-triage drainer: create-task for signature $hash returned no valid id. Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
+      alert_cond "createfail.$hash" "⚠️ ops-triage drainer: create-task for signature $hash returned no valid id. Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
       continue ;;
   esac
   if ! printf '%s' "$id" | grep -Eq '^task_[0-9]+_[0-9]+$'; then
     quarantine_bump "$hash"
     log "[$hash] create returned an invalid task id ('$id') — quarantine counter now $(quarantine_count "$hash")"
-    alert_cond createfail "⚠️ ops-triage drainer: create-task for signature $hash returned an invalid id. Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
+    alert_cond "createfail.$hash" "⚠️ ops-triage drainer: create-task for signature $hash returned an invalid id. Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
     continue
   fi
 
@@ -535,14 +618,15 @@ for file in "$OUTBOX_DIR"/*.json; do
     if ! ledger_put "$hash" "$newest"; then
       quarantine_bump "$hash"
       log "[$hash] LEDGER WRITE FAILED after a confirmed create ($id) — NOT counted as drained, attempt $(quarantine_count "$hash")/$QUARANTINE_MAX"
-      alert_cond ledger "🔴 ops-triage drainer: created $id for signature $hash but the drained-ledger write FAILED ($LEDGER). Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
+      alert_cond "ledger.$hash" "🔴 ops-triage drainer: created $id for signature $hash but the drained-ledger write FAILED ($LEDGER). Attempt $(quarantine_count "$hash")/$QUARANTINE_MAX."
       continue
     fi
-    quarantine_clear "$hash"
     [ "$DRY_RUN" = "1" ] || printf '%s' "$id" > "$IDCACHE/$hash" 2>/dev/null
     log "[$hash] drained + read-back confirmed: $id"
     DRAINED=$((DRAINED + 1))
-    clear_cond createfail "🟢 ops-triage drainer: create-task succeeded again (signature $hash)."
+    mark_healthy "$hash"
+    clear_cond "createfail.$hash" "🟢 ops-triage drainer: create-task succeeded again (signature $hash)."
+    clear_cond "ledger.$hash" "🟢 ops-triage drainer: the drained-ledger write succeeded again (signature $hash)."
   else
     # DO NOT re-create in THIS tick. The task may well exist; next tick's dedup scan will
     # find the active carrier and ADOPT it. Re-creating here is how you get duplicates.
@@ -556,9 +640,9 @@ for file in "$OUTBOX_DIR"/*.json; do
     log "[$hash] read-back miss for $id — NOT re-creating; attempt $qn/$QUARANTINE_MAX"
     if [ "$qn" -ge "$QUARANTINE_MAX" ]; then
       log "[$hash] read-back miss escalated — QUARANTINED at $qn/$QUARANTINE_MAX, no further creates for this signature"
-      alert_cond quarantine "🔴 ops-triage drainer: signature $hash QUARANTINED after $qn create attempts whose read-back never confirmed. No further creates until $QDIR/$hash is cleared."
+      alert_cond "quarantine.$hash" "🔴 ops-triage drainer: signature $hash QUARANTINED after $qn create attempts whose read-back never confirmed. No further creates until $QDIR/$hash is cleared."
     else
-      alert_cond readback "⚠️ ops-triage drainer: created $id for signature $hash but could not read it back. Not re-creating; reconciling via the queue next tick. Attempt $qn/$QUARANTINE_MAX."
+      alert_cond "readback.$hash" "⚠️ ops-triage drainer: created $id for signature $hash but could not read it back. Not re-creating; reconciling via the queue next tick. Attempt $qn/$QUARANTINE_MAX."
     fi
   fi
 done
@@ -566,8 +650,18 @@ done
 # --- 4. Heartbeat (watch-the-watcher) ------------------------------------------
 # Only on a tick that actually completed the flow. A refused/failed tick returns early
 # above, so a stale heartbeat is a real signal that the drainer is stuck.
+#
+# AND NOT on a tick where every outbox item was skipped by quarantine (review finding).
+# Touching it unconditionally meant the external staleness watcher could not tell a working
+# drainer from a fully-bricked one: 100% of the outbox quarantined, zero creates, heartbeat
+# perfectly fresh. The rule is deliberately narrow — an empty outbox and a tick of
+# legitimate healthy skips are both a working drainer and DO still beat.
 if [ "$DRY_RUN" != "1" ]; then
-  touch "$STATE/heartbeat" 2>/dev/null
+  if [ "$ITEMS_SEEN" -gt 0 ] && [ "$QSKIPS" -ge "$ITEMS_SEEN" ]; then
+    log "HEARTBEAT SUPPRESSED — all $ITEMS_SEEN outbox item(s) skipped by quarantine; nothing is draining"
+  else
+    touch "$STATE/heartbeat" 2>/dev/null
+  fi
 fi
-log "tick complete — drained=$DRAINED"
+log "tick complete — drained=$DRAINED items=$ITEMS_SEEN quarantine_skips=$QSKIPS"
 exit 0

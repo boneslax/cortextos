@@ -31,6 +31,7 @@ let stubBin: string;      // fake cortextos CLI
 let failGit: string;      // git stub that always fails
 let recGit: string;       // git stub that records argv (proves a verb was never reached)
 let recCurl: string;      // curl stub that records the --config file it was handed
+let okCurl: string;       // ditto, but reports SUCCESS so the re-alert cadence engages
 let isoFwRoot: string;    // empty framework root => no agent .env => no BOT_TOKEN
 let tokenFwRoot: string;  // framework root WITH a fake BOT_TOKEN (curl-fallback tests only)
 
@@ -100,6 +101,20 @@ beforeAll(() => {
     'exit 1\n');
   chmodSync(recCurl, 0o755);
 
+  // Same recorder, but exits 0. STILL SOCKET-LESS — it never runs curl, it only copies the
+  // config file. Needed because a FAILED delivery persists last=0, which disables the
+  // re-alert cadence entirely; the alert-key cross-talk bug is only observable when
+  // deliveries succeed and the cadence can suppress a second signature's alert.
+  okCurl = join(d, 'curl-ok');
+  writeFileSync(okCurl,
+    '#!/bin/bash\n' +
+    'rd="$CURL_RECORD_DIR"; mkdir -p "$rd"\n' +
+    'n=$(( $(cat "$rd/n" 2>/dev/null || echo 0) + 1 )); printf "%s" "$n" > "$rd/n"\n' +
+    'prev=""\n' +
+    'for a in "$@"; do if [ "$prev" = "--config" ]; then cp "$a" "$rd/cfg-$n"; fi; prev="$a"; done\n' +
+    'exit 0\n');
+  chmodSync(okCurl, 0o755);
+
   // A framework root that DOES resolve a BOT_TOKEN, so the raw-curl fallback branch is
   // actually entered. Paired with the recording curl stub above, never with a real curl.
   tokenFwRoot = mkdtempSync(join(tmpdir(), 'opsdrain-fwtok-'));
@@ -146,34 +161,59 @@ function carrier(over: Record<string, unknown> = {}) {
  * genuinely independent (the old fixture put graphify and approval on the same line, so
  * dropping one silently dropped two).
  *
+ * The wording tracks the REAL dev-delegate IDENTITY.md, because the invariant phrases are
+ * now specific gate prose rather than bare tokens ("graphify" alone was satisfied by any
+ * passing mention; "approval" by the machine key `"approval_rules":`).
+ *
  * `reword` is the tolerance fixture: same wording, different CASE and WHITESPACE only
  * (including a line wrap mid-phrase). That is the exact and only drift the tripwire is
  * meant to forgive.
+ *
+ * config.json is deliberately a STUB here. The live one paraphrases every hard line in its
+ * heartbeat prompt, and the round-2 finding was that concatenating it with IDENTITY.md made
+ * the tripwire inert — see the `config.json cannot satisfy an IDENTITY invariant` tests.
  */
 const GATE_LINES: Record<string, string> = {
-  graphify: 'Heartbeat gate: graphify runs first, before anything else.',
-  approval: 'Nothing ships without Bones approval.',
+  graphify: 'Heartbeat gate: I graphify the target repo first (map-before-plan).',
+  approval: 'Bones reviews the hardened plan and approves. NO build before approval.',
   merge:    'I never merge to main. I hand Bones the PR.',
   external: 'I never fire external writes (Hudu pushes, sends, deploys).',
 };
 
-function gateDir(opts: { drop?: keyof typeof GATE_LINES; reword?: boolean } = {}) {
+function gateDir(opts: { drop?: keyof typeof GATE_LINES; reword?: boolean; config?: unknown } = {}) {
   const g = mkdtempSync(join(tmpdir(), 'opsdrain-gate-'));
   mkdirSync(g, { recursive: true });
   const lines = opts.reword
     ? {
-        graphify: 'The heartbeat runs   GRAPHIFY   first.',
-        approval: 'Then a plan, then Bones\n   APPROVAL, then build.',
-        // phrase preserved, wrapped across a newline + padded with extra spaces
+        // every phrase preserved verbatim — only CASE and WHITESPACE differ, including
+        // wraps placed mid-phrase, which is the whole tolerance contract
+        graphify: 'Heartbeat gate: I   GRAPHIFY\n   THE TARGET\tREPO first (map-before-plan).',
+        approval: 'Bones reviews the hardened plan and approves.\n   No   BUILD\n\tBEFORE\n APPROVAL.',
         merge:    'You must never\n\tmerge   to\n  main under any circumstances.',
         external: 'You must never fire any External\n   Writes without a human go.',
       }
     : { ...GATE_LINES };
   if (opts.drop) delete (lines as Record<string, string>)[opts.drop];
   writeFileSync(join(g, 'IDENTITY.md'), Object.values(lines).join('\n') + '\n');
-  writeFileSync(join(g, 'config.json'), JSON.stringify({ name: 'dev-delegate' }));
+  writeFileSync(join(g, 'config.json'), JSON.stringify(opts.config ?? { name: 'dev-delegate' }));
   return g;
 }
+
+/**
+ * A config.json shaped like the LIVE one: its heartbeat prompt paraphrases every hard line
+ * and it carries the `approval_rules` key. Under the old union-of-both-files matching this
+ * single file satisfied all four invariants on its own.
+ */
+const LIVE_SHAPED_CONFIG = {
+  name: 'dev-delegate',
+  approval_rules: { require: ['external-comms'] },
+  heartbeat: {
+    prompt:
+      'Read HEARTBEAT.md + IDENTITY.md. Work the gated flow (graphify the target repo -> ' +
+      'plan -> dual-adversarial plan gate -> Bones approval -> build). NO build before ' +
+      'approval. Never merge to main, never fire external writes.',
+  },
+};
 
 // ---------------------------------------------------------------- harness
 
@@ -247,6 +287,28 @@ const scans = (c: Ctx) => calls(c).filter(x => x.argv[1] === 'list-tasks');
 const log = (c: Ctx) => (existsSync(join(c.state, 'drain.log')) ? readFileSync(join(c.state, 'drain.log'), 'utf-8') : '');
 
 /**
+ * Every alert body actually handed to the transport, in order. This is the "was it
+ * DELIVERED" oracle: an alert suppressed by the re-alert cadence never reaches here, which
+ * is exactly how a shared alert key silently swallows a second signature's alert.
+ */
+function alertTexts(recDir: string): string[] {
+  if (!existsSync(recDir)) return [];
+  return readdirSync(recDir)
+    .filter(f => f.startsWith('cfg-'))
+    .sort((a, b) => Number(a.match(/\d+/)![0]) - Number(b.match(/\d+/)![0]))
+    .map(f => readFileSync(join(recDir, f), 'utf-8'))
+    .map(t => (t.match(/^data-urlencode = "text=(.*)"$/m) ?? ['', ''])[1]);
+}
+
+/** Env that routes alerts through the socket-less RECORDING curl stub that reports success. */
+function alertEnv(rec: string): Record<string, string> {
+  return { CTX_FRAMEWORK_ROOT: tokenFwRoot, CURL_BIN: okCurl, CURL_RECORD_DIR: rec };
+}
+
+const qcount = (c: Ctx, h: string) =>
+  (existsSync(join(c.state, 'quarantine', h)) ? readFileSync(join(c.state, 'quarantine', h), 'utf-8') : '0');
+
+/**
  * Clear the stub's "a create already happened" flag so the NEXT tick starts with an empty
  * dedup scan again (STUB_TASKS) and only flips to STUB_TASKS_POST for its own read-back.
  * Without this, tick 2's scan would still see tick 1's carrier and the test would exercise
@@ -293,7 +355,7 @@ describe('ops-triage-drain: hash contract', () => {
     tick(c);
     expect(creates(c)).toHaveLength(0);
     expect(log(c)).toMatch(/invalid hash/i);
-    expect(existsSync(join(c.state, 'alert.badhash.json'))).toBe(true);
+    expect(existsSync(join(c.state, 'alert.badhash.BAD-Hash.json'))).toBe(true); // per-signature key
   });
 });
 
@@ -561,8 +623,196 @@ describe('ops-triage-drain: poison-pill quarantine', () => {
     writeItem(c, HASH, outboxItem());
     for (let i = 0; i < 6; i++) tick(c, { STUB_CREATE_FAIL: '1', OPS_DRAIN_QUARANTINE_MAX: '3' });
     expect(creates(c)).toHaveLength(3);                      // stopped trying at the cap
-    expect(existsSync(join(c.state, 'alert.quarantine.json'))).toBe(true);
+    expect(existsSync(join(c.state, `alert.quarantine.${HASH}.json`))).toBe(true);
     expect(log(c)).toMatch(/quarantin/i);
+  });
+});
+
+describe('ops-triage-drain: quarantine is per-signature, consecutive, and recoverable', () => {
+  const A = 'aaa1';
+  const B = 'bbb2';
+  const futureISO = (hours: number) => new Date(Date.now() + hours * 3600_000).toISOString();
+
+  it('TWO quarantined signatures each produce their OWN delivered alert', () => {
+    // Round-2 BLOCKER: the alert key was the fixed string "quarantine", so the first
+    // signature's cadence marker suppressed the second one's alert forever. Two bad
+    // signatures produced two alerts — BOTH naming the first hash. The second was bricked
+    // with zero human-visible signal.
+    const c = ctx();
+    const rec = join(c.state, 'curlrec');
+    writeItem(c, A, outboxItem({ newestFailureAt: 'now' }));   // unparseable => bumps
+    writeItem(c, B, outboxItem({ newestFailureAt: 'now' }));
+    for (let i = 0; i < 4; i++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3', ...alertEnv(rec) });
+
+    const texts = alertTexts(rec);
+    expect(texts.filter(t => t.includes(`signature ${A} QUARANTINED`)).length).toBeGreaterThan(0);
+    expect(texts.filter(t => t.includes(`signature ${B} QUARANTINED`)).length).toBeGreaterThan(0);
+    expect(existsSync(join(c.state, `alert.quarantine.${A}.json`))).toBe(true);
+    expect(existsSync(join(c.state, `alert.quarantine.${B}.json`))).toBe(true);
+    expect(existsSync(join(c.state, 'alert.quarantine.json'))).toBe(false); // no shared key
+  });
+
+  it('the counter tracks CONSECUTIVE failures — one transient miss then a healthy skip clears it', () => {
+    // Round-2 BLOCKER: quarantine_clear ran only on the full create+read-back+ledger
+    // success path, so a single transient read-back miss stuck at 1 forever and three
+    // unrelated blips months apart eventually bricked the signature.
+    const c = ctx();
+    writeItem(c, HASH, outboxItem());
+    tick(c);                                   // list-tasks [] => create, read-back MISS
+    expect(qcount(c, HASH)).toBe('1');
+
+    // a healthy SKIP (an active carrier is already queued) — not a drain
+    tick(c, { STUB_TASKS: tasksFixture(c, 't', [carrier({ status: 'in_progress' })]) });
+    expect(qcount(c, HASH)).toBe('0');
+    expect(existsSync(join(c.state, 'quarantine', HASH))).toBe(false);
+    expect(log(c)).toMatch(/healthy outcome — clearing the consecutive-failure counter/);
+  });
+
+  it('a healthy skip on the ALREADY-DRAINED path also clears the counter', () => {
+    const c = ctx();
+    writeItem(c, HASH, outboxItem());
+    const post = tasksFixture(c, 'post', [carrier({ id: VALID_ID })]);
+    tick(c, { STUB_TASKS_POST: post });        // real drain => ledger upserted
+    resetPost(c);                              // carrier archived out of the queue
+    mkdirSync(join(c.state, 'quarantine'), { recursive: true });
+    writeFileSync(join(c.state, 'quarantine', HASH), '2');  // a stale streak from earlier
+    tick(c, { STUB_TASKS_POST: post });        // ledger says already drained => healthy skip
+    expect(log(c)).toMatch(/already drained/);
+    expect(qcount(c, HASH)).toBe('0');
+  });
+
+  it('a terminal carrier closed at/after the failure clears the counter too', () => {
+    const c = ctx();
+    writeItem(c, HASH, outboxItem({ newestFailureAt: '2026-07-18T10:00:00.000Z' }));
+    mkdirSync(join(c.state, 'quarantine'), { recursive: true });
+    writeFileSync(join(c.state, 'quarantine', HASH), '2');
+    tick(c, { STUB_TASKS: tasksFixture(c, 't', [carrier({
+      status: 'completed', updated_at: '2026-07-18T12:00:00Z', completed_at: '2026-07-18T12:00:00Z',
+    })]) });
+    expect(creates(c)).toHaveLength(0);
+    expect(qcount(c, HASH)).toBe('0');
+  });
+
+  it('HOST CLOCK SKEW: quarantined by a 48h-future timestamp, then RECOVERS once it is valid', () => {
+    // The documented failure mode: a host clock running days ahead makes every timestamp
+    // look implausibly future-dated, so the item quarantines in QUARANTINE_MAX ticks. The
+    // quarantine gate is checked BEFORE the timestamp parse (deliberately — a permanently
+    // unparseable item must be bounded), which made that a ONE-WAY DOOR: after the clock
+    // was fixed the signature stayed bricked forever.
+    const c = ctx();
+    writeItem(c, HASH, outboxItem({ newestFailureAt: futureISO(48) }));
+    for (let i = 0; i < 4; i++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
+    expect(creates(c)).toHaveLength(0);
+    expect(qcount(c, HASH)).toBe('3');
+    expect(log(c)).toMatch(/QUARANTINED|quarantined \(3/);
+
+    // clock fixed => the cloud task rewrites the item with a sane timestamp
+    writeItem(c, HASH, outboxItem({ newestFailureAt: '2026-07-18T10:00:56.789Z' }));
+    tick(c, {
+      OPS_DRAIN_QUARANTINE_MAX: '3',
+      STUB_TASKS_POST: tasksFixture(c, 'post', [carrier({ id: VALID_ID })]),
+    });
+    expect(log(c)).toMatch(/content changed — resetting the consecutive-failure counter/);
+    expect(creates(c)).toHaveLength(1);        // it drains: not bricked forever
+    expect(qcount(c, HASH)).toBe('0');
+  });
+
+  it('UNCHANGED evidence does NOT reset the streak (the bound still bounds a real poison pill)', () => {
+    // The discriminator for the content-fingerprint reset: rewriting the SAME bytes must
+    // not hand a genuine poison pill an unlimited retry budget.
+    const c = ctx();
+    writeItem(c, HASH, outboxItem({ newestFailureAt: 'now' }));
+    for (let i = 0; i < 8; i++) {
+      writeItem(c, HASH, outboxItem({ newestFailureAt: 'now' })); // identical bytes each tick
+      tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
+    }
+    expect(creates(c)).toHaveLength(0);
+    expect(qcount(c, HASH)).toBe('3');         // capped, never climbing past the max
+  });
+
+  it('alert keys do not cross-talk: a healthy tick for one signature leaves the other alerted', () => {
+    const c = ctx();
+    const rec = join(c.state, 'curlrec');
+    writeItem(c, A, outboxItem());
+    writeItem(c, B, outboxItem());
+    tick(c, alertEnv(rec));                    // both create, both read-back MISS
+    expect(existsSync(join(c.state, `alert.readback.${A}.json`))).toBe(true);
+    expect(existsSync(join(c.state, `alert.readback.${B}.json`))).toBe(true);
+    expect(existsSync(join(c.state, 'alert.readback.json'))).toBe(false);
+
+    // an active carrier appears for A only => A recovers, B is still broken
+    tick(c, {
+      // a DIFFERENT id from the one create-task hands back, so B's read-back still misses
+      STUB_TASKS: tasksFixture(c, 't', [carrier({
+        id: 'task_1700000000000_00000042', title: `Ops-triage evidence: sig ${A}`, status: 'pending',
+      })]),
+      ...alertEnv(rec),
+    });
+    expect(existsSync(join(c.state, `alert.readback.${A}.json`))).toBe(false); // cleared
+    expect(existsSync(join(c.state, `alert.readback.${B}.json`))).toBe(true);  // untouched
+  });
+
+  it('two invalid-hash files each get their own badhash alert key', () => {
+    const c = ctx();
+    writeItem(c, 'BAD-One', outboxItem());
+    writeItem(c, 'BAD-Two', outboxItem());
+    tick(c);
+    expect(creates(c)).toHaveLength(0);
+    expect(existsSync(join(c.state, 'alert.badhash.BAD-One.json'))).toBe(true);
+    expect(existsSync(join(c.state, 'alert.badhash.BAD-Two.json'))).toBe(true);
+  });
+});
+
+describe('ops-triage-drain: heartbeat must not lie about a bricked outbox', () => {
+  const futureISO = (h: number) => new Date(Date.now() + h * 3600_000).toISOString();
+
+  /** Drive one signature to the quarantine cap, then remove the heartbeat file. */
+  function brick(c: Ctx, hash: string) {
+    writeItem(c, hash, outboxItem({ newestFailureAt: futureISO(48) }));
+    for (let i = 0; i < 3; i++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
+    rmSync(join(c.state, 'heartbeat'), { force: true });
+  }
+
+  it('a tick where EVERY outbox item is quarantined does NOT refresh the heartbeat', () => {
+    // Round-2 finding: the heartbeat was touched unconditionally on any completed tick, so
+    // the external staleness watcher could not tell a working drainer from a fully bricked
+    // one — 100% of the outbox quarantined, zero creates, heartbeat perfectly fresh.
+    const c = ctx();
+    brick(c, HASH);
+    tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
+    expect(creates(c)).toHaveLength(0);
+    expect(existsSync(join(c.state, 'heartbeat'))).toBe(false);
+    expect(log(c)).toMatch(/HEARTBEAT SUPPRESSED/);
+  });
+
+  it('an EMPTY outbox still refreshes the heartbeat (nothing to drain is not a fault)', () => {
+    const c = ctx();
+    tick(c);
+    rmSync(join(c.state, 'heartbeat'), { force: true });
+    tick(c);
+    expect(existsSync(join(c.state, 'heartbeat'))).toBe(true);
+  });
+
+  it('a tick of legitimate HEALTHY SKIPS still refreshes the heartbeat', () => {
+    const c = ctx();
+    writeItem(c, HASH, outboxItem());
+    tick(c, { STUB_TASKS: tasksFixture(c, 't', [carrier({ status: 'in_progress' })]) });
+    rmSync(join(c.state, 'heartbeat'), { force: true });
+    tick(c, { STUB_TASKS: tasksFixture(c, 't', [carrier({ status: 'in_progress' })]) });
+    expect(existsSync(join(c.state, 'heartbeat'))).toBe(true);
+  });
+
+  it('a MIXED tick (one quarantined, one healthy) still refreshes the heartbeat', () => {
+    const c = ctx();
+    brick(c, 'aaa1');
+    writeItem(c, 'bbb2', outboxItem());
+    tick(c, {
+      OPS_DRAIN_QUARANTINE_MAX: '3',
+      STUB_TASKS_POST: tasksFixture(c, 'post', [carrier({
+        id: VALID_ID, title: 'Ops-triage evidence: sig bbb2',
+      })]),
+    });
+    expect(existsSync(join(c.state, 'heartbeat'))).toBe(true);
   });
 });
 
@@ -617,8 +867,8 @@ describe('ops-triage-drain: preflight drift tripwire', () => {
     // gate (invariant deleted, both words present in unrelated prose) passed the tripwire.
     const g = mkdtempSync(join(tmpdir(), 'opsdrain-gate-split-'));
     writeFileSync(join(g, 'IDENTITY.md'), [
-      'Heartbeat gate: graphify runs first.',
-      'Nothing ships without Bones approval.',
+      'Heartbeat gate: I graphify the target repo first (map-before-plan).',
+      'Bones reviews the hardened plan and approves. NO build before approval.',
       'I never fire external writes.',
       // every word of the phrase appears — "merge", "to", "main" — but not the invariant
       'I merge my feature branches often, I push to origin, and main is the trunk.',
@@ -630,6 +880,72 @@ describe('ops-triage-drain: preflight drift tripwire', () => {
     expect(creates(c)).toHaveLength(0);
     expect(log(c)).toMatch(/never-merge-main/);
   });
+
+  // ---- the tripwire must watch IDENTITY.md SPECIFICALLY -------------------------------
+  // Round-2 finding: preflight concatenated config.json + IDENTITY.md and matched the
+  // phrases across the union. The LIVE config.json's heartbeat prompt already paraphrases
+  // every hard line, so against the real gate dir the tripwire was completely inert —
+  // emptying IDENTITY.md produced ZERO refusals. The four drop-one tests only passed
+  // because the fixture's config.json was a stub.
+  it('config.json carries every phrase but IDENTITY.md is EMPTY → REFUSE', () => {
+    const g = mkdtempSync(join(tmpdir(), 'opsdrain-gate-inert-'));
+    writeFileSync(join(g, 'config.json'), JSON.stringify(LIVE_SHAPED_CONFIG));
+    writeFileSync(join(g, 'IDENTITY.md'), '');   // the gate prose is gone entirely
+    const c = ctx({ gate: g });
+    writeItem(c, HASH, outboxItem());
+    tick(c);
+    expect(creates(c)).toHaveLength(0);
+    expect(existsSync(join(c.state, 'alert.preflight.json'))).toBe(true);
+    expect(log(c)).toMatch(/PREFLIGHT REFUSE/);
+    expect(log(c)).toMatch(/IDENTITY\.md is empty/);
+  });
+
+  it('config.json carries every phrase but IDENTITY.md is INVERTED → REFUSE', () => {
+    // A phrase tripwire detects REMOVAL, not negation — but inverting the gate necessarily
+    // rewrites the surrounding prose away, and that is what trips it here.
+    const g = mkdtempSync(join(tmpdir(), 'opsdrain-gate-inverted-'));
+    writeFileSync(join(g, 'config.json'), JSON.stringify(LIVE_SHAPED_CONFIG));
+    writeFileSync(join(g, 'IDENTITY.md'),
+      '# Agent Identity\n\nI now merge to main freely whenever the tests are green.\n' +
+      'I fire external writes on my own initiative. There are no gates.\n');
+    const c = ctx({ gate: g });
+    writeItem(c, HASH, outboxItem());
+    tick(c);
+    expect(creates(c)).toHaveLength(0);
+    expect(existsSync(join(c.state, 'alert.preflight.json'))).toBe(true);
+    expect(log(c)).toMatch(/PREFLIGHT REFUSE/);
+  });
+
+  for (const inv of ['graphify', 'approval', 'merge', 'external'] as const) {
+    it(`config.json cannot satisfy the ${inv} invariant on IDENTITY.md's behalf`, () => {
+      // IDENTITY.md is missing exactly one invariant; config.json contains all four.
+      const c = ctx({ gate: gateDir({ drop: inv, config: LIVE_SHAPED_CONFIG }) });
+      writeItem(c, HASH, outboxItem());
+      tick(c);
+      expect(creates(c)).toHaveLength(0);
+      expect(log(c)).toMatch(/PREFLIGHT REFUSE/);
+    });
+  }
+
+  it('a gate dir with IDENTITY.md but NO config.json → refuse (both files must be present)', () => {
+    const g = mkdtempSync(join(tmpdir(), 'opsdrain-gate-nocfg-'));
+    writeFileSync(join(g, 'IDENTITY.md'), Object.values(GATE_LINES).join('\n'));
+    const c = ctx({ gate: g });
+    writeItem(c, HASH, outboxItem());
+    tick(c);
+    expect(creates(c)).toHaveLength(0);
+    expect(log(c)).toMatch(/config\.json absent/);
+  });
+
+  // Guards the phrase CHOICE against production: if the invariant phrases drift from the
+  // real dev-delegate IDENTITY.md, the drainer refuses to drain anything on Solo.
+  const REAL_GATE = '/home/bones/cortextos/orgs/vault/agents/dev-delegate';
+  it.skipIf(!existsSync(join(REAL_GATE, 'IDENTITY.md')))(
+    'the invariant phrases are present in the REAL dev-delegate IDENTITY.md (read-only)', () => {
+      const c = ctx({ gate: REAL_GATE });   // reads the live gate; writes only to temp dirs
+      tick(c);                              // empty outbox => zero creates regardless
+      expect(log(c)).not.toMatch(/PREFLIGHT REFUSE/);
+    });
 
   it('a cosmetically REWORDED but intact gate → does not trip, drains normally', () => {
     const c = ctx({ gate: gateDir({ reword: true }) });
@@ -747,7 +1063,7 @@ describe('ops-triage-drain: timestamp contract (free-form date input is refused)
     for (let i = 0; i < 5; i++) tick(c, { OPS_DRAIN_QUARANTINE_MAX: '3' });
     expect(creates(c)).toHaveLength(0);
     expect(readFileSync(join(c.state, 'quarantine', HASH), 'utf-8')).toBe('3');
-    expect(existsSync(join(c.state, 'alert.quarantine.json'))).toBe(true);
+    expect(existsSync(join(c.state, `alert.quarantine.${HASH}.json`))).toBe(true);
   });
 
   it('still drains a VALID ISO timestamp (the guard rejects free-form, not everything)', () => {
@@ -782,7 +1098,7 @@ describe('ops-triage-drain: read-back miss is BOUNDED', () => {
     expect(creates(c)).toHaveLength(3);
     expect(readFileSync(join(c.state, 'quarantine', HASH), 'utf-8')).toBe('3');
     expect(log(c)).toMatch(/read-back miss escalated/);
-    expect(existsSync(join(c.state, 'alert.quarantine.json'))).toBe(true);
+    expect(existsSync(join(c.state, `alert.quarantine.${HASH}.json`))).toBe(true);
   });
 
   it('a NON-EMPTY queue that lacks the created id is a read-back MISS, not a pass', () => {
@@ -867,6 +1183,30 @@ describe('ops-triage-drain: clone confinement (reset --hard must land in OUR clo
     expect(existsSync(rec)).toBe(false);
     expect(readFileSync(join(target, 'tracked.txt'), 'utf-8')).toBe('precious uncommitted work');
     expect(existsSync(join(target, '.git'))).toBe(true);
+  });
+
+  it('a real clone dir whose .git is a SYMLINK → refuse, no git verb reached, target untouched', () => {
+    // The -L guard only covered the clone PATH. A real directory whose .git is a symlink
+    // into a shared repo passes `[ -d "$CLONE/.git" ]` (test -d follows the link), so the
+    // ownership proof was satisfied and `reset --hard` landed in someone else's objects.
+    const c = ctx();
+    const target = mkdtempSync(join(tmpdir(), 'opsdrain-shared-git-'));
+    mkdirSync(join(target, '.git'), { recursive: true });
+    writeFileSync(join(target, '.git', 'HEAD'), 'ref: refs/heads/precious\n');
+
+    const clone = join(c.state, 'vault-clone');
+    mkdirSync(clone, { recursive: true });
+    symlinkSync(join(target, '.git'), join(clone, '.git'));
+
+    const rec = join(c.state, 'gitrec-dotgit');
+    writeItem(c, HASH, outboxItem());
+    tick(c, { OPS_DRAIN_NO_SYNC: '0', OPS_DRAIN_GIT_BIN: recGit, GIT_RECORD_DIR: rec });
+
+    expect(creates(c)).toHaveLength(0);
+    expect(log(c)).toMatch(/\.git is a SYMLINK/i);
+    expect(existsSync(join(c.state, 'alert.sync.json'))).toBe(true);
+    expect(existsSync(rec)).toBe(false);                      // git never invoked at all
+    expect(readFileSync(join(target, '.git', 'HEAD'), 'utf-8')).toBe('ref: refs/heads/precious\n');
   });
 
   it('an origin that is NOT the expected vault remote → refuse before fetch/reset', () => {
