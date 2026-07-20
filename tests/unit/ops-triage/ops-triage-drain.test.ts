@@ -1675,6 +1675,135 @@ describe('ops-triage-drain: an alert key is shared only when the REMEDY is ident
   });
 });
 
+describe('ops-triage-drain: a recovery may only all-clear the condition it actually resolves', () => {
+  // Both tests below cover the SAME invariant from its two sides: the split alert keys
+  // (`quarantine.$hash` = one-way door, `quarantine.time.$hash` = auto-recovering badtime)
+  // are only worth having if every clear_cond() targets the key whose condition it truly
+  // resolved. Two separate clears carry that, and neither was covered:
+  //
+  //   :485  content-change reset  -> resolves the BADTIME state only, so it must clear
+  //                                  `quarantine.time.$hash` and leave the one-way-door
+  //                                  marker alone (it resolves nothing about it).
+  //   :302  mark_healthy()        -> resolves EVERYTHING, so it must clear BOTH markers;
+  //                                  keeping the badtime one swallows the next real cap.
+  //
+  // A marker is not cosmetic: while it is on disk it SUPPRESSES its condition's next alert
+  // for a whole REALERT_SEC window. Clearing the wrong one, or failing to clear one, is a
+  // silently swallowed or a spuriously repeated page — so both are asserted on DELIVERED
+  // alert texts, through the socket-less success-reporting curl stub (a failed delivery
+  // persists last=0 and disables the cadence, which would make either check vacuous).
+
+  /** The one-way-door cap (:508 create-streak / :730 read-back). Manual `rm $QDIR/$hash`. */
+  const ONE_WAY_CAP = /QUARANTINED after \d+ failed attempts/;
+  /** The badtime cap (:522). Auto-recovers on an outbox rewrite. */
+  const BADTIME_CAP = /QUARANTINED after \d+ attempts with an unusable newestFailureAt/;
+
+  it('a content-change reset must NOT all-clear the one-way-door marker — the next create cap stays suppressed', () => {
+    // THE STATE THIS FIRES IN. The create streak caps, so the human is paged with the
+    // one-way-door remedy and told to `rm $QDIR/$hash` MANUALLY. They do exactly that. The
+    // counter is now 0 but the suppression marker is still on disk — nothing but a genuine
+    // healthy outcome ever removes it, and the cap gate `continue`s before every
+    // mark_healthy() callsite, so that is by design.
+    //
+    // The item then flows again, hits a bad host clock, and the producer rewrites it. That
+    // rewrite legitimately resets the BADTIME streak — and nothing else. If the reset clears
+    // `quarantine.$hash` instead of `quarantine.time.$hash`, a content change the create path
+    // knows nothing about silently all-clears the one-way-door alert.
+    const c = ctx();
+    const rec = join(c.state, 'curlrec');
+    const env = { OPS_DRAIN_QUARANTINE_MAX: '3', OPS_DRAIN_REALERT_SEC: '3600', ...alertEnv(rec) };
+    const oneWayMarker = join(c.state, `alert.quarantine.${HASH}.json`);
+
+    // --- phase 1: the create streak caps -> the one-way-door alert + its marker ----------
+    writeItem(c, HASH, outboxItem());
+    for (let i = 0; i < 4; i++) tick(c, { ...env, STUB_CREATE_FAIL: '1' });
+    expect(creates(c)).toHaveLength(3);
+    expect(qcount(c, HASH)).toBe('3');
+    expect(alertTexts(rec).filter(t => ONE_WAY_CAP.test(t))).toHaveLength(1);
+    expect(existsSync(oneWayMarker)).toBe(true);
+
+    // --- the human takes the documented remedy: the COUNTER goes, the MARKER stays -------
+    rmSync(join(c.state, 'quarantine', HASH), { force: true });
+    expect(existsSync(oneWayMarker)).toBe(true);
+
+    // --- phase 2: a bad host clock -> the badtime streak starts climbing -----------------
+    // Content changes here too, but the badtime counter still reads 0, so the reset block
+    // (gated on count > 0) does NOT run this tick. It only arms it.
+    writeItem(c, HASH, outboxItem({ newestFailureAt: 'now' }));
+    tick(c, env);
+    expect(qtcount(c, HASH)).toBe('1');
+    expect(log(c)).not.toMatch(/content changed — resetting the unusable-timestamp counter/);
+
+    // --- phase 3: the producer rewrites -> THE RESET FIRES (the mutation point) ----------
+    writeItem(c, HASH, outboxItem({ newestFailureAt: 'tomorrow' }));   // different bytes, still unusable
+    tick(c, env);
+    expect(log(c)).toMatch(/content changed — resetting the unusable-timestamp counter/);
+    expect(qtcount(c, HASH)).toBe('1');            // reset to 0, then re-bumped by this same tick
+
+    // The badtime state is what recovered. The one-way door resolved NOTHING, so its marker
+    // must still be standing.
+    expect(existsSync(oneWayMarker)).toBe(true);
+
+    // --- phase 4: the clock is fixed, the item reaches create, and create caps AGAIN ------
+    writeItem(c, HASH, outboxItem({ count: 9, runLink: 'https://cloud.trigger.dev/runs/run_z' }));
+    for (let i = 0; i < 4; i++) tick(c, { ...env, STUB_CREATE_FAIL: '1' });
+    expect(qcount(c, HASH)).toBe('3');             // the same one-way-door condition, capped again
+
+    // THE OBSERVABLE. Same condition, same remedy, inside one REALERT_SEC window: the
+    // surviving marker suppresses it. If the reset had deleted that marker, the human gets a
+    // second page for a condition they were never told had recovered — and the log says the
+    // cadence never engaged at all.
+    expect(alertTexts(rec).filter(t => ONE_WAY_CAP.test(t))).toHaveLength(1);
+    expect(existsSync(oneWayMarker)).toBe(true);
+  });
+
+  it('mark_healthy clears the badtime marker too — a LATER real badtime cap is still delivered', () => {
+    // The mirror image. A signature badtime-caps and the human takes the OTHER documented
+    // remedy from that alert: clear $QDIR/$hash.time. The counter reads 0, so the
+    // content-change reset (gated on count > 0) never runs and never clears the marker —
+    // mark_healthy() is then the ONLY thing left that can. If it clears just
+    // `quarantine.$hash`, the stale badtime marker suppresses the next genuine badtime cap
+    // for a whole REALERT_SEC window: a real, recurring, unusable-timestamp condition that
+    // nobody is paged for.
+    const c = ctx();
+    const rec = join(c.state, 'curlrec');
+    const env = { OPS_DRAIN_QUARANTINE_MAX: '3', OPS_DRAIN_REALERT_SEC: '3600', ...alertEnv(rec) };
+    const badtimeMarker = join(c.state, `alert.quarantine.time.${HASH}.json`);
+
+    // --- phase 1: the badtime streak caps -> its own alert + marker ----------------------
+    writeItem(c, HASH, outboxItem({ newestFailureAt: 'now' }));
+    for (let i = 0; i < 4; i++) tick(c, env);
+    expect(creates(c)).toHaveLength(0);
+    expect(qtcount(c, HASH)).toBe('3');
+    expect(alertTexts(rec).filter(t => BADTIME_CAP.test(t))).toHaveLength(1);
+    expect(existsSync(badtimeMarker)).toBe(true);
+
+    // --- the human takes the documented remedy: counter cleared, marker still standing ---
+    rmSync(join(c.state, 'quarantine', `${HASH}.time`), { force: true });
+    expect(existsSync(badtimeMarker)).toBe(true);
+
+    // --- phase 2: a GENUINE healthy outcome — an active carrier is already queued ---------
+    // The counter is 0 at the fingerprint check, so the content-change reset does not fire
+    // and cannot be the thing that clears the marker. mark_healthy() is.
+    writeItem(c, HASH, outboxItem());                       // valid timestamp again
+    tick(c, { ...env, STUB_TASKS: tasksFixture(c, 'active', [carrier({ status: 'in_progress' })]) });
+    expect(log(c)).toMatch(/active carrier already queued — skip/);
+    expect(log(c)).not.toMatch(/content changed — resetting the unusable-timestamp counter/);
+    expect(existsSync(badtimeMarker)).toBe(false);          // the healthy outcome all-cleared it
+
+    // --- phase 3: the bad clock comes back and the badtime streak caps AGAIN --------------
+    writeItem(c, HASH, outboxItem({ newestFailureAt: 'next friday' }));
+    for (let i = 0; i < 4; i++) tick(c, env);
+    expect(qtcount(c, HASH)).toBe('3');
+
+    // THE OBSERVABLE. Well inside REALERT_SEC of the first one, but the condition genuinely
+    // recovered and re-broke, so the human MUST be paged again. A marker left behind by the
+    // recovery swallows this second page entirely.
+    expect(alertTexts(rec).filter(t => BADTIME_CAP.test(t))).toHaveLength(2);
+    expect(creates(c)).toHaveLength(0);                     // still never mints a task on this path
+  });
+});
+
 describe('ops-triage-drain: static checks', () => {
   it('bash -n parses cleanly', () => {
     expect(() => execFileSync('bash', ['-n', SCRIPT], { encoding: 'utf-8' })).not.toThrow();
