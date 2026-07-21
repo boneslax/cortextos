@@ -80,7 +80,13 @@ BOT_TOKEN_FALLBACK="$(env_get BOT_TOKEN)"
 # user- or file-controlled text ever reaches here — the whole point of the mtime-only read
 # is that nothing from the heartbeat's bytes can influence what is sent or where.
 send_alert() {
-  local msg="$1"
+  # Defense-in-depth (mirrors ops-triage-drain.sh's san() + tr -d '"' choke point): strip
+  # control chars + double quotes before $msg can ever reach a curl --config line, where a
+  # newline opens a new directive and a quote terminates the quoted value early. Today $msg
+  # is built only from a fixed string plus $STALE_MIN/$STATE (both env-derived, not file-
+  # derived) so this is not exploitable yet — the point is that a future edit letting a
+  # file-derived value into the message can't become a curl-config injection by surprise.
+  local msg; msg="$(printf '%s' "${1:-}" | tr -d '[:cntrl:]"')"
   if [ "$DRY_RUN" = "1" ]; then log "DRY_RUN alert: $msg"; return 0; fi
   local args=("$CHAT_ID" "$msg" --plain-text)
   [ -n "$THREAD_ID" ] && args+=(--thread "$THREAD_ID")
@@ -90,7 +96,7 @@ send_alert() {
   log "bus CLI send failed — raw-curl Telegram fallback"
   if [ -n "$BOT_TOKEN_FALLBACK" ]; then
     local cfg; cfg="$(mktemp "${TMPDIR:-/tmp}/ods-XXXXXX")" || return 1
-    chmod 600 "$cfg"; trap 'rm -f "$cfg"' RETURN
+    chmod 600 "$cfg"
     {
       # TELEGRAM_API_BASE override (default real) lets tests point the raw-curl fallback at
       # a dead endpoint so a send is structurally impossible.
