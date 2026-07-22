@@ -1257,7 +1257,7 @@ describe('ops-triage-drain: the task-creating streak is MONOTONIC under a rewrit
     expect(creates(c)).toHaveLength(3);
     expect(qcount(c, HASH)).toBe('3');
     expect(log(c)).toMatch(/failed create\/read-back\/ledger attempts/);
-  });
+  }, 30_000); // wall-clock headroom: ~24 bash-spawn ticks; a load spike must not testTimeout-false-RED the retry bound
 
   it('READ-BACK always misses + bytes change every tick → total creates STOP at QUARANTINE_MAX', () => {
     // The nastier variant: create-task SUCCEEDS every time, so every un-bounded retry mints
@@ -1270,7 +1270,7 @@ describe('ops-triage-drain: the task-creating streak is MONOTONIC under a rewrit
     }
     expect(creates(c)).toHaveLength(3);
     expect(qcount(c, HASH)).toBe('3');
-  });
+  }, 30_000); // wall-clock headroom: ~24 bash-spawn ticks; a load spike must not testTimeout-false-RED the retry bound
 
   it('the create bound does NOT grow linearly with the number of producer rewrites', () => {
     // The asymptote assertion. Under the shared streak these three runs produced 3 / 6 / 12
@@ -1292,7 +1292,7 @@ describe('ops-triage-drain: the task-creating streak is MONOTONIC under a rewrit
     expect(twoRewrites).toBe(3);      // shared streak: 6
     expect(fourRewrites).toBe(3);     // shared streak: 12
     expect(fourRewrites).toBe(oneRewrite);   // flat, not linear
-  });
+  }, 30_000); // wall-clock headroom: ~42 bash-spawn ticks (the heaviest test, ~4s nominal / ~6s under load); a load spike must not testTimeout-false-RED the retry bound
 
   it('a genuine HEALTHY outcome is still the way out of the create streak', () => {
     // Monotonic must not mean permanent: mark_healthy() clears it, so a signature that
