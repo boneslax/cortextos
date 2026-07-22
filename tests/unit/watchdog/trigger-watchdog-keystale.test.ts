@@ -89,6 +89,26 @@ function runCheck(opts: {
   return { out: out.trim(), log, state, marker, missMarker };
 }
 
+// WALL-CLOCK TOLERANCE for the two ageSec assertions that are computed from a live clock.
+// The fixture seeds the keycache mtime at build time T0 (Date.now(), line 48); the script
+// computes ageSec = now(T1) - mtime at exec time T1 >= T0 (bin/trigger-watchdog.sh:436,
+// integer `date -u +%s` minus integer `stat -c %Y`). When the subprocess spawn crosses a
+// one-second boundary the reported age is expected+1 — the 198001-vs-198000 RUN-B flake.
+// The true drift is 0..1s; a ±TOL window absorbs a loaded box while still rejecting any real
+// staleness miscalculation, which is off by whole minutes/hours (>> TOL), never a few seconds.
+// This tolerance applies ONLY to wall-clock-derived ages. The missing-cache sentinel
+// (ageSec=999999999) and the static thresholdSec values are deterministic and stay exact.
+const AGE_TOLERANCE_SEC = 5;
+function expectAgeSecNear(out: string, expected: number) {
+  const m = out.match(/ageSec=(\d+)/);
+  expect(m, `expected an ageSec=<n> token in output:\n${out}`).not.toBeNull();
+  const actual = Number(m![1]);
+  expect(
+    Math.abs(actual - expected),
+    `ageSec=${actual} is outside ±${AGE_TOLERANCE_SEC}s of the expected ${expected}`,
+  ).toBeLessThanOrEqual(AGE_TOLERANCE_SEC);
+}
+
 describe('trigger-watchdog BLIND-RISK key-refresh-staleness self-alert', () => {
   // ---- present-but-stale (the original op-failing-for-days scenario) — UNCHANGED by the grace fix ----
   it('fresh cache (both keys just refreshed) → OK, no alert decision', () => {
@@ -107,13 +127,13 @@ describe('trigger-watchdog BLIND-RISK key-refresh-staleness self-alert', () => {
   it('present-but-stale (oldest 4h > 3h floor) → ALERT immediately (no grace on a present cache)', () => {
     const r = runCheck({ ages: { hubapp_prod_read_key: 4 * 3600, helpdesk_prod_read_key: 2 * 3600 } });
     expect(r.out).toContain('KEYSTALE_DECISION=ALERT');
-    expect(r.out).toContain('ageSec=14400'); // the OLDEST (4h) drives the signal
+    expectAgeSecNear(r.out, 14400); // the OLDEST (4h) drives the signal (±5s wall-clock tolerance)
   });
 
   it('present-but-stale 55h (op failing for days) → fires IMMEDIATELY, no grace delay', () => {
     const r = runCheck({ ages: { hubapp_prod_read_key: 55 * 3600, helpdesk_prod_read_key: 55 * 3600 } });
     expect(r.out).toContain('KEYSTALE_DECISION=ALERT');
-    expect(r.out).toContain('ageSec=198000'); // 55h in seconds — age of the last successful refresh
+    expectAgeSecNear(r.out, 198000); // 55h in seconds — age of the last successful refresh (±5s wall-clock tolerance)
   });
 
   // ---- MISSING-cache GRACE (kills the routine-rotation false positive) ----
