@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Sidebar } from './sidebar';
 import { Topbar } from './topbar';
 import { BottomNav } from './bottom-nav';
@@ -16,21 +16,37 @@ interface DashboardShellProps {
 }
 
 export function DashboardShell({ orgs, children }: DashboardShellProps) {
-  const [currentOrg, setCurrentOrg] = useState<string>(() => {
-    if (typeof window !== 'undefined') {
-      // URL is authoritative: if ?org= is present, use it so server and client agree.
-      // Fall back to localStorage for the common case of navigating without a param.
-      const urlOrg = new URLSearchParams(window.location.search).get('org');
-      if (urlOrg && (urlOrg === 'all' || orgs.includes(urlOrg))) return urlOrg;
-      const saved = localStorage.getItem('cortextos-org');
-      if (saved && (saved === 'all' || orgs.includes(saved))) return saved;
-    }
-    return 'all';
-  });
+  // Initialize deterministically so the first client render matches the server
+  // (which has no window/localStorage). Reading the URL/localStorage in the
+  // useState initializer caused a hydration mismatch: the server rendered
+  // org='all' while the client's first render read a saved org from
+  // localStorage, producing different nav hrefs.
+  const [currentOrg, setCurrentOrg] = useState<string>('all');
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  // Persist org selection to localStorage
+  // After mount, resolve the org: URL is authoritative (?org=), else localStorage.
   useEffect(() => {
+    const urlOrg = new URLSearchParams(window.location.search).get('org');
+    if (urlOrg && (urlOrg === 'all' || orgs.includes(urlOrg))) {
+      setCurrentOrg(urlOrg);
+      return;
+    }
+    const saved = localStorage.getItem('cortextos-org');
+    if (saved && (saved === 'all' || orgs.includes(saved))) {
+      setCurrentOrg(saved);
+    }
+    // Run once on mount; orgs is stable for the shell's lifetime.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist org selection to localStorage, but skip the initial mount write so
+  // we don't clobber a saved value before the resolver effect above reads it.
+  const didInit = useRef(false);
+  useEffect(() => {
+    if (!didInit.current) {
+      didInit.current = true;
+      return;
+    }
     localStorage.setItem('cortextos-org', currentOrg);
   }, [currentOrg]);
 

@@ -171,9 +171,45 @@ busCommand
     // Auto-notify assignee so the task is visible immediately (issue #78)
     if (opts.assignee && opts.assignee !== env.agentName) {
       const assigneePaths = resolvePaths(opts.assignee, env.instanceId, env.org);
-      const desc = opts.desc ? ` — ${opts.desc.slice(0, 120)}` : '';
+      // SEND THE WHOLE DESCRIPTION. Do not truncate, do not preview.
+      //
+      // This was `opts.desc.slice(0, 120)`. The full text lived in the task JSON, so only the
+      // NOTIFICATION was lossy — the worst possible shape, because a truncated instruction LOOKS
+      // like a complete one. On 2026-07-14 a task reading "Do NOT change the GBP categories
+      // unilaterally — live listings at #3 in the map pack" was delivered as "…Do not ". The
+      // negation arrived without its object. An agent acting on that fragment does the exact thing
+      // it was told not to do.
+      //
+      // The first fix added a loud [TRUNCATED …] banner pointing at the authoritative task JSON.
+      // The seo agent — which had caught the original bug by refusing to act on the fragment —
+      // then made the better argument: a banner only works if the reader CHOOSES to follow it,
+      // so the safety is conventional, not structural. "A fragment you cannot read is safer than
+      // a fragment you might."
+      //
+      // It is right. There is no size constraint here — the notification is a JSON file on disk,
+      // not a rate-limited channel. Truncation bought tidiness and sold instruction integrity.
+      // So: no fragment exists to be misread. The class of bug is gone rather than sign-posted.
+      //
+      // BELT AND BRACES. The structural fix (send it all) is the PRIMARY. The loud-truncation
+      // banner is the FLOOR beneath it, not an alternative to it — because if a future change
+      // ever imposes a size cap and this code silently truncates again, we would regress to the
+      // original bug with the warning now removed. So a description may only be cut at a ceiling
+      // far above any real instruction, and if it ever is, it says so. A cut instruction must
+      // never read as a whole one, at any size. (seo agent, 2026-07-14: "the two fixes are not
+      // alternatives; the structural one is the primary and the loud-truncation one is the floor.")
+      // The correlation is ADVERSARIAL, not random: truncation now only bites the LONGEST
+      // descriptions, which are the most caveated, most conditional, highest-stakes tasks — the
+      // ones you least want cut are the ones most likely to overflow. Selection, not chance.
+      // That is precisely why the banner below is not optional. (seo agent, 2026-07-14.)
+      const HARD_CEILING = 16000;
+      const raw = opts.desc ?? '';
+      const desc = raw
+        ? raw.length > HARD_CEILING
+          ? `\n\n${raw.slice(0, HARD_CEILING)}\n\n… [TRUNCATED at ${HARD_CEILING} chars — ${raw.length - HARD_CEILING} more. THIS IS NOT THE FULL INSTRUCTION. Read the authoritative task before acting: cortextos bus list-tasks --format json, id ${taskId}]`
+          : `\n\n${raw}`
+        : '';
       sendMessage(assigneePaths, env.agentName, opts.assignee, 'normal',
-        `Task assigned: [${opts.priority}] ${title}${desc} (id: ${taskId})`);
+        `Task assigned: [${opts.priority}] ${title} (id: ${taskId})${desc}`);
     }
   });
 

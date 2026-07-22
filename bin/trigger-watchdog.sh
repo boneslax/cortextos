@@ -18,10 +18,43 @@
 # non-used-region flap on 2026-06-24). Region-awareness falls out for free: if his runs
 # execute, no page, regardless of which region the status page flags.
 #
+# ALERT SEND-PATH (send_alert) — 3 tiers, each a fallback for the one before:
+#   tier 1  bus CLI (cortextos bus send-telegram)         — DNS-dependent
+#   tier 2  raw-curl to ${TELEGRAM_API_BASE}/bot.../sendMessage — DNS-dependent
+#   tier 3  DNS-BYPASS raw-curl: same send, but pinned to a cached last-good IP via
+#           `curl --resolve <host>:443:<cachedIP>` so NO resolver is consulted. Closes the
+#           2026-07-07 blind spot where a link-up-but-DNS-flaky window (a flapping WiFi NIC)
+#           took DNS + BOTH send tiers down together, so a BLIND-RISK/prod-stall alert fired
+#           but could NOT be delivered — the alert rode the very resolver that was broken.
+#     - The cached IP is ONLY a ROUTING HINT; the api.telegram.org TLS cert is the IDENTITY
+#       guarantee and stays FULLY validated — NEVER -k/--insecure. A stale/rotated IP that now
+#       fronts a different host → cert mismatch → TLS fails → the send fails CLOSED and falls
+#       through, so tier 3 can NEVER mis-deliver an alert to a wrong host.
+#     - On each SUCCESSFUL tier-1/tier-2 send, the current api.telegram.org IP is resolved and
+#       written 0600+atomic to $STATE_DIR/telegram-api-ip.cache (a successful send means DNS is
+#       healthy this tick) — a self-updating last-good IP. Cold cache (no prior success) → tier 3
+#       can't fire → the delivery failure is logged LOUDLY, never swallowed.
+#     - The cached value is format-validated against a strict single-IP-literal regex before it is
+#       ever fed to curl (anti corrupt-cache/injection); a bad value skips tier 3 and logs loud.
+#   This covers "Mode 1" (link up, DNS flaky). "Mode 2" (Solo totally dark, no route at all) is
+#   uncoverable by ANY local send — the backstop is the EXTERNAL vault-memory-health heartbeat:
+#   when Solo's 30-min heartbeat POSTs STOP, checkVaultMemoryHealth() (src/lib/watchdog-checks.ts)
+#   fires a cloud-side (Trigger.dev→Teams) critical alert on heartbeat ABSENCE. See [[watchdog-resilience]].
+#
 # Tunables (env):
 #   WATCHDOG_STALL_MIN     minutes: a project is STALLED when nothing has COMPLETED in this
 #                          window AND there's 0 executing + a queued backlog (default 10)
 #   WATCHDOG_MIN_QUEUED    queued count that counts as a backlog (default 1)
+#   WATCHDOG_KEY_STALE_ALERT_SEC   BLIND-RISK self-alert floor: seconds since the last SUCCESSFUL
+#                          op key-refresh (oldest keycache mtime) before the watchdog pages that
+#                          it's going blind (default 10800 = 3h; a FIXED floor well under any
+#                          plausible read-key rotation, and > KEY_TTL so a normal refresh never trips it)
+#   WATCHDOG_KEY_STALE_REALERT_SEC re-alert BLIND-RISK at most once per this many seconds while
+#                          degraded (default 21600 = 6h); marker cleared when the read-path recovers
+#   WATCHDOG_KEY_MISSING_GRACE_SEC grace for a MISSING (not just stale) keycache file: it must stay
+#                          missing this long before counting as blind, so a routine key rotation
+#                          (401 → bust → re-fetch next tick) never false-fires (default 1800 = 30m).
+#                          A PRESENT-but-stale cache is UNAFFECTED — it still fires at the 3h floor.
 #   WATCHDOG_DRY_RUN       "1" => classify + log + print DECISION, skip send + state writes
 #   WATCHDOG_STATUS_FIXTURE / WATCHDOG_RUNS_FIXTURE_<LABEL>_<STATUS>  test injection (read a
 #                          local JSON fixture instead of curling status / a project's runs)
@@ -58,12 +91,28 @@ STATE_DIR="$CTX_ROOT/state/trigger-watchdog"
 LOG="$STATE_DIR/watchdog.log"
 KEYCACHE_DIR="$STATE_DIR/keycache"      # 0600 cached read keys (avoid op-per-tick rate limit)
 KEY_TTL="${WATCHDOG_KEY_TTL:-3600}"     # seconds before a cached key is refreshed from op
+KEY_STALE_ALERT_SEC="${WATCHDOG_KEY_STALE_ALERT_SEC:-10800}"    # blind-risk self-alert floor (3h; validated below)
+KEY_STALE_REALERT_SEC="${WATCHDOG_KEY_STALE_REALERT_SEC:-21600}" # re-alert cadence while degraded (6h; validated below)
+KEY_MISSING_GRACE_SEC="${WATCHDOG_KEY_MISSING_GRACE_SEC:-1800}"  # a MISSING cache must persist this long before it counts as blind (30m; validated below)
 HTTP_CODE_FILE="$STATE_DIR/.lasthttp.$$" # fetch_runs writes the HTTP status here (survives
                                         # command-substitution subshells so the loop can read it);
                                         # per-PID so overlapping runs can't clobber each other's code
 mkdir -p "$STATE_DIR"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "[$(ts)] $*" >> "$LOG"; }
+
+# Validate numeric tunables — a typo'd env must NOT silently disable the blind-risk self-alert
+# (a non-numeric threshold breaks the `-ge`/`-lt` compares → the watchdog stops watching itself)
+# nor break arithmetic under set -u. Fall back to the documented default. (Mirrors disk-watchdog.sh.)
+numdef() {
+  case "$2" in
+    ''|*[!0-9]*) log "WARN: $1='$2' is not a positive integer — using default $3"; printf '%s' "$3"; return ;;
+  esac
+  if [ "$2" -gt 0 ]; then printf '%s' "$2"; else log "WARN: $1='$2' must be > 0 — using default $3"; printf '%s' "$3"; fi
+}
+KEY_STALE_ALERT_SEC="$(numdef WATCHDOG_KEY_STALE_ALERT_SEC "$KEY_STALE_ALERT_SEC" 10800)"
+KEY_STALE_REALERT_SEC="$(numdef WATCHDOG_KEY_STALE_REALERT_SEC "$KEY_STALE_REALERT_SEC" 21600)"
+KEY_MISSING_GRACE_SEC="$(numdef WATCHDOG_KEY_MISSING_GRACE_SEC "$KEY_MISSING_GRACE_SEC" 1800)"
 
 export CTX_ROOT CTX_FRAMEWORK_ROOT CTX_ORG
 export CTX_AGENT_NAME="$BUS_AGENT"
@@ -83,31 +132,155 @@ CHAT_ID="${WATCHDOG_CHAT_ID:-$(env_get CHAT_ID)}"
 THREAD_ID="${WATCHDOG_THREAD_ID:-$(env_get TOPIC_ID)}"
 BOT_TOKEN_FALLBACK="$(env_get BOT_TOKEN)"
 
+GETENT="${GETENT_BIN:-$(command -v getent 2>/dev/null || echo /usr/bin/getent)}"
+TIMEOUT="${TIMEOUT_BIN:-$(command -v timeout 2>/dev/null || echo /usr/bin/timeout)}"
+RESOLVE_TIMEOUT="${WATCHDOG_RESOLVE_TIMEOUT:-3}"   # hard cap (sec) on the cache-warm resolve (never block a tick)
+
+# Derive the Telegram API HOST from TELEGRAM_API_BASE (default real). ONE source of truth shared by
+# tier-2/tier-3's curl config, the cache-write resolve, AND the per-tick cache warm — so the tier-3
+# `--resolve` host can NEVER drift from the host the cache is warmed/read for. Drift would break both
+# tier-3 routing AND test isolation (a test's dead base must neutralize EVERY path, tick-warm included).
+telegram_api_host() {
+  local b="${TELEGRAM_API_BASE:-https://api.telegram.org}"
+  b="${b#*://}"; b="${b%%/*}"; b="${b%%:*}"; printf '%s' "$b"
+}
+
+# Strict single-IP-literal validator — ONE IPv4 dotted-quad (octets 0-255) OR one IPv6
+# hex:colon literal, and NOTHING else: no newlines, no spaces, no extra tokens, no comments,
+# no shell/curl-config metacharacters. Used BOTH before writing telegram-api-ip.cache AND before
+# feeding a cached value to `curl --resolve` (anti corrupt-cache / anti injection). A value that
+# does not pass this MUST NEVER reach curl. (The cache read strips a trailing newline via command
+# substitution; an INTERNAL newline / multi-line file trips the charset reject below.)
+valid_ip_literal() {
+  local ip="$1"
+  # fast reject: empty, or any char outside the IP-literal alphabet (catches spaces, newlines,
+  # ';', '"', backslashes, '=', etc. — so a corrupt/tampered cache can never inject curl-config).
+  case "$ip" in
+    ''|*[!0-9a-fA-F:.]*) return 1 ;;
+  esac
+  # exactly one IPv4 dotted-quad, each octet 0-255
+  if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    local o1 o2 o3 o4
+    IFS=. read -r o1 o2 o3 o4 <<< "$ip"
+    [ "$o1" -le 255 ] && [ "$o2" -le 255 ] && [ "$o3" -le 255 ] && [ "$o4" -le 255 ]
+    return
+  fi
+  # one IPv6 literal (hex + colons; must contain at least one colon). Not exhaustively RFC-valid,
+  # but metacharacter-free so it can't inject; curl rejects a truly malformed one → fail closed.
+  if [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then return 0; fi
+  return 1
+}
+
+# BEST-EFFORT cache write: resolve the Telegram API host's current IP and store it 0600+atomic in
+# $STATE_DIR/telegram-api-ip.cache as a self-updating last-good DNS-bypass hint for tier 3. Called on
+# BOTH (1) a successful tier-1/tier-2 send (DNS is healthy that tick → captures a known-good IP) and
+# (2) every healthy monitor tick (preheat, so the FIRST alert of an incident is protected even if it
+# lands during a DNS flap). Host derives from TELEGRAM_API_BASE (same knob as tiers 2+3) so a test
+# pointing it at a dead base stays fully isolated. Best-effort — always returns 0, so a failed cache
+# write can NEVER undo an already-delivered alert nor affect a tick.
+#
+# TWO hardening invariants (both send + tick paths inherit them, since both call this one function):
+#   * TIMEOUT-BOUND the resolve — a flaky/hung resolver must not make this hang. `timeout` caps the
+#     getent at RESOLVE_TIMEOUT sec; on timeout/failure the resolve yields empty → the write is SKIPPED.
+#   * ONLY-WRITE-ON-SUCCESS — validate FIRST, then write via temp + atomic mv. A failed/empty/timed-out
+#     resolve or a non-IP result leaves the existing last-good cache UNTOUCHED (the real file is never
+#     opened for truncation), so a flap can NEVER clobber/empty the very last-good IP tier-3 needs then.
+cache_telegram_ip() {
+  local host="$1" ip cf t
+  [ -n "$host" ] || return 0
+  # TIMEOUT-BOUND resolve (first A record). If `timeout` is unavailable, fall back to a bare resolve.
+  if command -v "$TIMEOUT" >/dev/null 2>&1; then
+    ip="$("$TIMEOUT" "$RESOLVE_TIMEOUT" "$GETENT" ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')"
+  else
+    ip="$("$GETENT" ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')"
+  fi
+  # ONLY-WRITE-ON-SUCCESS: bail (leaving last-good intact) on an empty/timed-out or non-IP resolve.
+  [ -n "$ip" ] || return 0
+  valid_ip_literal "$ip" || return 0
+  cf="$STATE_DIR/telegram-api-ip.cache"
+  t="$(mktemp "$STATE_DIR/.tgip-XXXXXX" 2>/dev/null)" || return 0
+  printf '%s' "$ip" > "$t" 2>/dev/null && chmod 600 "$t" 2>/dev/null && mv -f "$t" "$cf" 2>/dev/null
+  rm -f "$t" 2>/dev/null
+  return 0
+}
+
 send_alert() {
   local msg="$1"
   if [ "$DRY_RUN" = "1" ]; then log "DRY_RUN alert: $msg"; return 0; fi
+
+  # ONE knob drives tiers 2 AND 3 (and the cache-resolve): the API base + its derived host. Tests
+  # point TELEGRAM_API_BASE at a dead endpoint to make EVERY send structurally impossible — incl.
+  # tier 3, because the `--resolve <api_host>:443:...` directive only takes effect for the API host
+  # on 443, and against a dead base (different host/port) it is a no-op. NEVER hardcode
+  # api.telegram.org below, or a test could escape isolation and hit the real Telegram API.
+  local api_base api_host
+  api_base="${TELEGRAM_API_BASE:-https://api.telegram.org}"
+  api_host="$(telegram_api_host)"   # SAME derivation the tick-warm uses — can't drift
+
+  # ---- tier 1: bus CLI (DNS-dependent) ----
   local args=("$CHAT_ID" "$msg" --plain-text)
   [ -n "$THREAD_ID" ] && args+=(--thread "$THREAD_ID")
   if [ -x "$CORTEXTOS" ] && "$CORTEXTOS" bus send-telegram "${args[@]}" >/dev/null 2>&1; then
-    log "alert sent via bus CLI"; return 0
+    log "alert sent via bus CLI"; cache_telegram_ip "$api_host"; return 0
   fi
+
   log "bus CLI send failed — raw-curl Telegram fallback"
+  # ---- tier 2: raw-curl (DNS-dependent) ----
   if [ -n "$BOT_TOKEN_FALLBACK" ]; then
     local cfg; cfg="$(mktemp "${TMPDIR:-/tmp}/twd-XXXXXX")" || return 1
     chmod 600 "$cfg"; trap 'rm -f "$cfg"' RETURN
     {
       # TELEGRAM_API_BASE override (default real) lets tests point the raw-curl
       # fallback at a dead endpoint so a send is structurally impossible.
-      printf 'url = "%s/bot%s/sendMessage"\n' "${TELEGRAM_API_BASE:-https://api.telegram.org}" "$BOT_TOKEN_FALLBACK"
+      printf 'url = "%s/bot%s/sendMessage"\n' "$api_base" "$BOT_TOKEN_FALLBACK"
       printf 'data-urlencode = "chat_id=%s"\n' "$CHAT_ID"
       printf 'data-urlencode = "text=%s"\n' "$msg"
       [ -n "$THREAD_ID" ] && printf 'data-urlencode = "message_thread_id=%s"\n' "$THREAD_ID"
       printf 'max-time = 15\nsilent\nshow-error\nfail\n'
     } > "$cfg"
     local ok=1; "$CURL" --config "$cfg" >/dev/null 2>&1 && ok=0; rm -f "$cfg"
-    [ "$ok" = 0 ] && { log "alert sent via raw-curl fallback"; return 0; }
+    [ "$ok" = 0 ] && { log "alert sent via raw-curl fallback"; cache_telegram_ip "$api_host"; return 0; }
   fi
-  log "ALERT DELIVERY FAILED (both bus CLI and raw curl)"; return 1
+
+  # ---- tier 3: DNS-BYPASS via cached last-good IP (closes Mode 1: link up, resolver flaky) ----
+  # Tiers 1+2 both failed — the resolver is likely misbehaving. Retry the SAME send pinned to the
+  # cached last-good IP via `curl --resolve <host>:443:<ip>`, so NO DNS lookup is needed. The cached
+  # IP is ONLY a ROUTING HINT; the api.telegram.org TLS certificate stays FULLY validated and is the
+  # IDENTITY guarantee. NEVER -k/--insecure here: a stale/rotated IP now fronting a different host →
+  # cert mismatch → TLS handshake fails → the send fails CLOSED and falls through, so an alert can
+  # NEVER be mis-delivered to the wrong host. A stale-IP TLS failure is CORRECT fail-closed behavior.
+  local cache="$STATE_DIR/telegram-api-ip.cache"
+  if [ -n "$BOT_TOKEN_FALLBACK" ] && [ -f "$cache" ]; then
+    local cip; cip="$(cat "$cache" 2>/dev/null)"   # command-sub strips a trailing newline
+    if valid_ip_literal "$cip"; then
+      local raddr="$cip"; case "$cip" in *:*) raddr="[$cip]" ;; esac   # bracket IPv6 for --resolve
+      local cfg3; cfg3="$(mktemp "${TMPDIR:-/tmp}/twd3-XXXXXX")" || return 1
+      chmod 600 "$cfg3"; trap 'rm -f "$cfg3"' RETURN
+      {
+        printf 'url = "%s/bot%s/sendMessage"\n' "$api_base" "$BOT_TOKEN_FALLBACK"
+        # Pin the route to the cached IP on 443 while keeping SNI/Host/cert validation for api_host.
+        # NO `insecure` line — TLS identity is enforced; a wrong IP fails the handshake (fail closed).
+        printf 'resolve = "%s:443:%s"\n' "$api_host" "$raddr"
+        printf 'data-urlencode = "chat_id=%s"\n' "$CHAT_ID"
+        printf 'data-urlencode = "text=%s"\n' "$msg"
+        [ -n "$THREAD_ID" ] && printf 'data-urlencode = "message_thread_id=%s"\n' "$THREAD_ID"
+        printf 'max-time = 15\nsilent\nshow-error\nfail\n'
+      } > "$cfg3"
+      local ok3=1; "$CURL" --config "$cfg3" >/dev/null 2>&1 && ok3=0; rm -f "$cfg3"
+      [ "$ok3" = 0 ] && { log "alert sent via tier-3 DNS-bypass (cached IP, TLS-validated)"; return 0; }
+      log "tier-3 DNS-bypass send FAILED (cached IP $cip — cert mismatch fails CLOSED, or still no route)"
+    else
+      log "ALERT DELIVERY FAILED — cached Telegram IP failed format validation (corrupt cache; tier-3 skipped, nothing fed to curl)"
+    fi
+  fi
+
+  # ---- all tiers exhausted — degrade LOUD, never silent ----
+  if [ ! -f "$cache" ]; then
+    log "ALERT DELIVERY FAILED (both bus CLI and raw curl; no cached IP — tier-3 DNS-bypass cold, cannot fire)"
+  else
+    log "ALERT DELIVERY FAILED (bus CLI, raw curl, and tier-3 DNS-bypass all failed)"
+  fi
+  return 1
 }
 
 age_secs() { # iso8601 -> seconds ago (echo big number if empty/unparseable)
@@ -225,9 +398,122 @@ get_key() {
   echo ""
 }
 
+# ---- watcher-unwatched: BLIND-RISK self-alert on a stale read-key refresh ----
+# The gap this closes (2026-07-07): the watchdog can go BLIND for hours — op key-refresh
+# failing → get_key serves a last-good STALE cached key → every Trigger read reads UNKNOWN
+# (or 401s once the key rotates) — while the watchdog says NOTHING. A real prod stall in that
+# window would be missed silently. So the watchdog now watches ITS OWN read path.
+#
+# Signal = the OLDEST keycache-file mtime across the configured read-key fields. get_key writes
+# the cache ONLY on a SUCCESSFUL op-fetch (and a fresh hit never rewrites it), so the mtime IS
+# the time of the last successful refresh. A configured key whose cache file is MISSING entirely
+# (never fetched, or busted-with-no-refetch) = maximally stale. Healthy op keeps the mtime within
+# KEY_TTL (1h); a failing op freezes it → it ages past the floor → we page.
+#
+# ALERT-BEFORE-BLIND: fire while the cached key is still likely VALID, to give LEAD TIME to fix
+# the op-fetch before a key rotation 401s it. So the threshold is a FIXED FLOOR (default 3h) —
+# well under any plausible read-key rotation and > KEY_TTL so a normal refresh never trips it —
+# NOT the (unpredictable) rotation interval, which would only alert once already blind.
+#
+# This is INDEPENDENT of the per-project prod-stall page and runs every tick. Its message is
+# DISTINCT (a monitoring-gap warning, "NOT a prod-stall page") and rate-limited via a STATE_DIR
+# marker to at most once per KEY_STALE_REALERT_SEC while degraded; the marker is CLEARED on
+# recovery (oldest cache fresh again) so a future degradation re-alerts. Echoes a KEYSTALE_DECISION
+# line under DRY_RUN (like the prod-stall DECISION) for unit tests; always logs its decision.
+check_key_refresh_staleness() {
+  local marker="$STATE_DIR/keystale-alerted.marker"
+  local now oldest_age=-1 spec field cache mt age missmark missing_for smt
+  now="$(date -u +%s)"
+  for spec in "${PROJECTS[@]}"; do
+    field="${spec##*:}"                 # label:projref:field -> field
+    cache="$KEYCACHE_DIR/$field.key"
+    missmark="$STATE_DIR/keymissing.$field.since"
+    if [ -f "$cache" ]; then
+      # Present — a successful (re)fetch this-or-a-prior tick. Clear any missing-since marker so a
+      # transient rotation-bust that self-heals never accrues toward the blind threshold; the age
+      # is just the mtime staleness (the ORIGINAL, unchanged present-but-stale path).
+      [ "$DRY_RUN" = "1" ] || rm -f "$missmark" 2>/dev/null
+      mt="$(stat -c %Y "$cache" 2>/dev/null || echo 0)"; age=$(( now - mt ))
+    else
+      # MISSING — apply a GRACE so a routine key rotation (401 → bust deletes the cache mid-loop →
+      # re-fetch repopulates it next tick) never false-fires. A missing cache counts as blind ONLY
+      # after it has stayed missing longer than KEY_MISSING_GRACE_SEC (a persistent op-fetch failure),
+      # tracked by a first-seen-missing marker (its mtime = when the cache first went missing).
+      missing_for=0
+      if [ -f "$missmark" ]; then
+        smt="$(stat -c %Y "$missmark" 2>/dev/null || echo "$now")"; missing_for=$(( now - smt ))
+      else
+        [ "$DRY_RUN" = "1" ] || { : > "$missmark" 2>/dev/null && chmod 600 "$missmark" 2>/dev/null; }
+      fi
+      if [ "$missing_for" -gt "$KEY_MISSING_GRACE_SEC" ]; then
+        age=999999999                   # persistently missing beyond grace = fully blind
+      else
+        age=0                           # within grace — a transient bust; treat as fresh (don't fire)
+      fi
+    fi
+    [ "$age" -gt "$oldest_age" ] && oldest_age="$age"
+  done
+  # Human-friendly age for the message; a never-refreshed (missing/sentinel) key isn't "277777h".
+  local agelabel; if [ "$oldest_age" -ge 315360000 ]; then agelabel="never-refreshed"; else agelabel="$(( oldest_age / 3600 ))h"; fi
+
+  if [ "$oldest_age" -ge "$KEY_STALE_ALERT_SEC" ]; then
+    # Degraded. Rate-limit: alert at most once per KEY_STALE_REALERT_SEC (marker mtime = last alert).
+    local last_alert_age=999999999 mmt
+    if [ -f "$marker" ]; then mmt="$(stat -c %Y "$marker" 2>/dev/null || echo 0)"; last_alert_age=$(( now - mmt )); fi
+    if [ -f "$marker" ] && [ "$last_alert_age" -lt "$KEY_STALE_REALERT_SEC" ]; then
+      log "[keystale] read-path stale ${oldest_age}s (>= ${KEY_STALE_ALERT_SEC}s) — re-alert suppressed (last ${last_alert_age}s ago < ${KEY_STALE_REALERT_SEC}s)"
+      [ "$DRY_RUN" = "1" ] && echo "KEYSTALE_DECISION=SUPPRESSED ageSec=$oldest_age thresholdSec=$KEY_STALE_ALERT_SEC"
+      return 0
+    fi
+    [ "$DRY_RUN" = "1" ] && echo "KEYSTALE_DECISION=ALERT ageSec=$oldest_age thresholdSec=$KEY_STALE_ALERT_SEC"
+    if send_alert "$(printf '⚠️ WATCHDOG BLIND-RISK: Trigger read-path stale %s (op key-refresh failing) — prod visibility degrading, fix the op-fetch before a key rotation blinds it. This is NOT a prod-stall page.' "$agelabel")"; then
+      [ "$DRY_RUN" = "1" ] || { : > "$marker" 2>/dev/null && chmod 600 "$marker" 2>/dev/null; }
+      log "[keystale] BLIND-RISK alert fired (read-path stale ${oldest_age}s, oldest keycache mtime)"
+    else
+      log "[keystale] BLIND-RISK alert send FAILED — will retry next tick"
+    fi
+    return 0
+  fi
+
+  # Fresh — read path healthy (or recovered). If a BLIND-RISK was actually alerted (the rate-limit
+  # marker exists), announce the resolution ONCE — symmetric with the prod-stall recovery message —
+  # then clear the marker. The clear is UNCONDITIONAL (independent of whether this recovery send
+  # succeeds): the marker is the loop condition, so clearing it guarantees at most one recovery send.
+  # A never-degraded steady state has no marker and stays SILENT.
+  if [ -f "$marker" ]; then
+    send_alert "🟢 WATCHDOG read-path RECOVERED — Trigger key refresh healthy again (oldest cache $(( oldest_age / 60 ))m < $(( KEY_STALE_ALERT_SEC / 60 ))m). Blind-risk cleared." || true
+    [ "$DRY_RUN" = "1" ] || rm -f "$marker" 2>/dev/null
+    log "[keystale] read-path RECOVERED (oldest keycache ${oldest_age}s < ${KEY_STALE_ALERT_SEC}s) — sent recovery + cleared blind-risk marker"
+    [ "$DRY_RUN" = "1" ] && echo "KEYSTALE_DECISION=RECOVERED ageSec=$oldest_age thresholdSec=$KEY_STALE_ALERT_SEC"
+    return 0
+  fi
+  log "[keystale] read-path fresh (oldest keycache ${oldest_age}s < ${KEY_STALE_ALERT_SEC}s)"
+  [ "$DRY_RUN" = "1" ] && echo "KEYSTALE_DECISION=OK ageSec=$oldest_age thresholdSec=$KEY_STALE_ALERT_SEC"
+  return 0
+}
+
 # Test seam: sourcing with WATCHDOG_LIB_ONLY=1 loads the functions (get_key, fetch_runs,
-# bust_key_cache, …) WITHOUT running the monitor, so they can be unit-tested in isolation.
+# bust_key_cache, check_key_refresh_staleness, …) WITHOUT running the monitor, so they can be
+# unit-tested in isolation.
 if [ "${WATCHDOG_LIB_ONLY:-0}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
+
+# ---- PREHEAT the tier-3 DNS-bypass cache (every healthy tick, BEFORE any alert can fire) ----
+# On-successful-send warming alone can't protect the FIRST alert of a NEW incident if it lands during
+# a DNS-flaky window (no prior send this incident → cold cache → tier-3 can't fire) — and that first
+# stall/blind-risk page is the highest-value message a live watchdog sends. So preheat the cache on
+# every normal tick while DNS is healthy. It is TRULY FREE and CAN'T HARM THE TICK:
+#   * BACKGROUNDED (&) — the tick's real work (status fetch + stall check + blind-risk self-alert)
+#     proceeds immediately and is NEVER blocked/delayed, even if the resolver hangs during a flap.
+#   * TIMEOUT-BOUND inside cache_telegram_ip (RESOLVE_TIMEOUT, default 3s) — a hung resolve self-reaps
+#     instead of lingering as an orphan.
+#   * ONLY-WRITES-ON-SUCCESS — a failed/empty/timed-out resolve leaves the last-good cache UNTOUCHED,
+#     so a flap can never clobber the very last-good IP tier-3 depends on during that flap.
+# Host derives from TELEGRAM_API_BASE via the SAME helper tier-3 uses, so a test's dead base resolves a
+# harmless test host into the temp state dir — never the real API (isolation preserved). Skipped under
+# DRY_RUN (the file's state-write convention). Runs ONLY on the real-run path, never under LIB_ONLY.
+if [ "$DRY_RUN" != "1" ]; then
+  cache_telegram_ip "$(telegram_api_host)" >/dev/null 2>&1 &
+fi
 
 # ---- 1a status.trigger.dev as CONTEXT (never the trigger) ----
 STATUS_CTX="status:unknown"
@@ -239,7 +525,7 @@ if echo "$SJSON" | "$JQ" -e . >/dev/null 2>&1; then
 fi
 
 # ---- 1b impact check across both projects ----
-STALLED_NOW=(); CONTEXT_LINES=""
+STALLED_NOW=(); OK_NOW=(); CONTEXT_LINES=""
 for spec in "${PROJECTS[@]}"; do
   label="${spec%%:*}"; rest="${spec#*:}"; field="${rest##*:}"   # projref is implied by the project-scoped key
   fixvar="WATCHDOG_RUNS_FIXTURE_${label}_EXECUTING"; fixset=""   # guarded indirect, no eval
@@ -260,14 +546,28 @@ for spec in "${PROJECTS[@]}"; do
   esac
   log "[$label] $res ($STATUS_CTX)"
   CONTEXT_LINES="$CONTEXT_LINES\n$label: $res"
-  [ "${res%% *}" = "STALL" ] && STALLED_NOW+=("$label")
+  # Track STALL and OK as SEPARATE positive verdicts. A third verdict, UNKNOWN (an
+  # unparseable/failed read — the exact state an outage that also blinds the reader
+  # produces), is DELIBERATELY in neither set: it is not a stall to page on, and — the
+  # BUG-2 fix — it is not positive health to claim recovery on either.
+  case "${res%% *}" in
+    STALL) STALLED_NOW+=("$label") ;;
+    OK)    OK_NOW+=("$label") ;;
+  esac
 done
+
+# ---- watcher-unwatched: BLIND-RISK self-alert (runs EVERY tick, independent of the stall check) ----
+# Placed AFTER the impact loop so get_key has already exercised the read path this tick — a healthy
+# op refreshes the cache mtime (no false blind-risk), a failing op leaves it frozen (→ ages → pages).
+check_key_refresh_staleness
+
 [ "$DRY_RUN" = "1" ] && echo "DECISION=$([ "${#STALLED_NOW[@]}" -gt 0 ] && echo PAGE || echo OK) STALLED=[${STALLED_NOW[*]:-}] $STATUS_CTX"
 
 # ---- decide: PER-PROJECT debounce (>=2 consecutive cycles) + per-project marker ----
 # Each project alerts/recovers independently — a hubapp-then-helpdesk flap across two
 # cycles must NOT page (neither stalled 2 cycles in a row).
 is_stalled() { local x; for x in "${STALLED_NOW[@]:-}"; do [ "$x" = "$1" ] && return 0; done; return 1; }
+is_ok() { local x; for x in "${OK_NOW[@]:-}"; do [ "$x" = "$1" ] && return 0; done; return 1; }
 NEWLY=(); RECOVERED=()
 for spec in "${PROJECTS[@]}"; do
   label="${spec%%:*}"; pend="$STATE_DIR/pending.$label"; mk="$STATE_DIR/incident.$label.json"
@@ -279,9 +579,17 @@ for spec in "${PROJECTS[@]}"; do
       [ "$DRY_RUN" = "1" ] || echo "$cnt" > "$pend"
       if [ "$cnt" -ge 2 ]; then NEWLY+=("$label"); else log "[$label] stall cycle $cnt/2 — debouncing"; fi
     fi
-  else
+  elif is_ok "$label"; then
+    # POSITIVE health (verdict OK, a parsed read showing his prod executing/clear). ONLY here is it
+    # safe to reset the stall debounce and — if an incident is open — claim RECOVERY.
     [ "$DRY_RUN" = "1" ] || rm -f "$pend"
     [ -f "$mk" ] && RECOVERED+=("$label")
+  else
+    # UNKNOWN (blind read: unparseable/failed fetch, or key-unavailable). BUG-2 fix (2026-07-18):
+    # a blind tick is NOT recovery. Previously "not STALL" fell here and fired a false 🟢 RECOVERED +
+    # cleared the incident during the very outage — active misinformation. Now: HOLD the incident
+    # marker AND the pending counter (don't reset), stay silent, wait for a POSITIVE OK read.
+    log "[$label] UNKNOWN (blind read) — holding state; no recovery claim, debounce preserved"
   fi
 done
 
