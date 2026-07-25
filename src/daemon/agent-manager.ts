@@ -9,6 +9,18 @@ import { migrateCronsForAgent } from './cron-migration.js';
 import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { appendDeadLetter } from '../telegram/dead-letter.js';
+import { pollerIsStale } from '../telegram/poller.js';
+import { classifyMembershipProbe, type ChatType } from '../telegram/membership-probe.js';
+import { stepProbeStreak, INITIAL_PROBE_STREAK, type ProbeStreakState } from '../telegram/probe-streak.js';
+import { resolveOperatorCreds } from './operator-channel.js';
+
+// D0/D1 liveness (PLAN-v3 §4b/§5). A healthy poll loop records a successful
+// getUpdates every ~2s (long-poll ≤1s + 1s sleep), so 60s of silence means the
+// loop is wedged, not merely between cycles. The membership probe runs on the
+// same cadence with a per-agent random phase so the fleet never probes in
+// lockstep (avoids synchronized 429s).
+const D0_STALE_MS = 60_000;
+const LIVENESS_PROBE_INTERVAL_MS = 60_000;
 import { TelegramPoller } from '../telegram/poller.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
@@ -87,7 +99,25 @@ export function shouldSkipBeforeWatchdog(
  * Manages all agents in a cortextOS instance.
  */
 export class AgentManager {
-  private agents: Map<string, { process: AgentProcess; checker: FastChecker; poller?: TelegramPoller; activityPoller?: TelegramPoller; telegramRejectCount?: number; telegramLastRejectAlertAt?: number; topicId?: number; chatId?: string }> = new Map();
+  private agents: Map<string, {
+    process: AgentProcess;
+    checker: FastChecker;
+    poller?: TelegramPoller;
+    activityPoller?: TelegramPoller;
+    telegramRejectCount?: number;
+    telegramLastRejectAlertAt?: number;
+    topicId?: number;
+    chatId?: string;
+    // D0/D1 liveness state (PLAN-v3). `api` is the agent's own Telegram client
+    // (for the probe); the detectors alert via the OPERATOR channel, never this.
+    api?: TelegramAPI;
+    livenessTimer?: ReturnType<typeof setTimeout>;
+    pollerStartedAt?: number;
+    probeStreak?: ProbeStreakState;
+    chatType?: string;
+    canReadAllGroupMessages?: boolean;
+    canReadFetched?: boolean;
+  }> = new Map();
   private workers: Map<string, WorkerProcess> = new Map();
   /**
    * Forum-topic routing registry: "${chatId}:${topicId}" -> agentName.
@@ -1060,7 +1090,26 @@ export class AgentManager {
 
       // Store poller reference so stopAgent() can clean it up
       const entry = this.agents.get(name);
-      if (entry) entry.poller = poller;
+      if (entry) {
+        entry.poller = poller;
+        // D0/D1 liveness (PLAN-v3). Store the agent's own API for the probe,
+        // anchor D0's "never polled yet" grace on start time, and begin the
+        // detector cycle with a per-agent random phase so agents don't probe in
+        // lockstep. Math.random for jitter only — not correctness.
+        entry.api = telegramApi;
+        entry.pollerStartedAt = Date.now();
+        entry.probeStreak = INITIAL_PROBE_STREAK;
+        const jitter = Math.floor(Math.random() * LIVENESS_PROBE_INTERVAL_MS);
+        entry.livenessTimer = setTimeout(() => {
+          if (!this.agents.has(name)) return; // stopped during the jitter window
+          const live = this.agents.get(name);
+          if (live) {
+            live.livenessTimer = setInterval(() => {
+              this.runLivenessCheck(name).catch(e => log(`[liveness] check failed: ${e}`));
+            }, LIVENESS_PROBE_INTERVAL_MS);
+          }
+        }, jitter);
+      }
 
       log('Telegram poller started (with Conflict-restart wrapper)');
 
@@ -1199,6 +1248,119 @@ export class AgentManager {
   }
 
   /**
+   * D0 + D1 liveness cycle (PLAN-v3 §4b/§5). Runs on a timer per agent.
+   * Re-reads the agent entry EVERY tick (never captures it) so a heal or restart
+   * can't leave this writing into an orphaned entry. All decision logic is
+   * delegated to the pure, unit-tested cores; this is only the glue + I/O.
+   */
+  private async runLivenessCheck(name: string): Promise<void> {
+    const entry = this.agents.get(name);
+    if (!entry) return;
+    const chatId = entry.chatId;
+    const api = entry.api;
+    if (chatId === undefined || !api) return;
+    const now = Date.now();
+
+    // --- D0: is the poll loop alive? (orthogonal to membership) ---
+    const poller = entry.poller;
+    const anchor = poller && poller.lastSuccessfulPollAt > 0
+      ? poller.lastSuccessfulPollAt
+      : (entry.pollerStartedAt ?? now);
+    if (!poller || pollerIsStale(anchor, now, D0_STALE_MS)) {
+      this.emitProbeTelemetry(name, { layer: 'D0', chat_id: chatId, alive: false });
+      this.sendLivenessAlert(
+        name,
+        `D0: ${name} poll loop not confirmed alive (no successful getUpdates in ${D0_STALE_MS / 1000}s). Inbound Telegram may be dead.`,
+      );
+    }
+
+    // --- D1: is the bot a reachable member of its configured chat? ---
+    const botId = api.botId;
+    if (botId === undefined) return; // cannot probe without the own bot id
+
+    // can_read_all_group_messages: a BotFather setting, fetched once via getMe.
+    // Its failure leaves the flag undefined -> a member-in-group verdict is
+    // INCONCLUSIVE, never green.
+    if (!entry.canReadFetched) {
+      try {
+        const me = await api.getMe();
+        entry.canReadAllGroupMessages = me?.result?.can_read_all_group_messages;
+      } catch {
+        entry.canReadAllGroupMessages = undefined;
+      }
+      entry.canReadFetched = true;
+    }
+    // Chat type (best-effort; keep the last known type on failure).
+    try {
+      const chat = await api.getChat(chatId);
+      if (chat?.result?.type) entry.chatType = chat.result.type;
+    } catch {
+      /* keep cached type */
+    }
+
+    let verdict;
+    let telem: Record<string, any> = { layer: 'D1', chat_id: chatId };
+    try {
+      const member = await api.getChatMember(chatId, botId);
+      const status = member?.result?.status;
+      const isMember = member?.result?.is_member;
+      verdict = classifyMembershipProbe({
+        ok: true,
+        chatType: (entry.chatType ?? 'supergroup') as ChatType,
+        status,
+        isMember,
+        canReadAllGroupMessages: entry.canReadAllGroupMessages,
+      });
+      telem = { ...telem, status, class: verdict.klass, verdict: verdict.verdict };
+    } catch (err) {
+      const errorCode = (err as any)?.error_code;
+      verdict = classifyMembershipProbe({ ok: false, errorCode });
+      telem = { ...telem, error_code: errorCode, class: verdict.klass, verdict: verdict.verdict };
+    }
+    this.emitProbeTelemetry(name, telem);
+
+    const step = stepProbeStreak(entry.probeStreak ?? INITIAL_PROBE_STREAK, verdict, now);
+    entry.probeStreak = step.state;
+    if (step.fireAlert) {
+      this.sendLivenessAlert(
+        name,
+        `D1: ${name} configured chat ${chatId} is UNREACHABLE (${verdict.reason}). Inbound Telegram is broken.`,
+      );
+    }
+  }
+
+  /**
+   * Per-cycle structured telemetry (PLAN-v3 §4b) — emitted on EVERY probe,
+   * success or failure, so runs are countable from data rather than inferred
+   * from an error-only log (the trap this plan exists to avoid).
+   */
+  private emitProbeTelemetry(name: string, data: Record<string, any>): void {
+    console.log(`[liveness-telemetry] ${JSON.stringify({ agent: name, ts: Date.now(), ...data })}`);
+  }
+
+  /**
+   * Deliver a liveness alert via the OPERATOR channel — never the agent's own
+   * (possibly-broken) channel (PLAN-v3 §10). The operator channel is REQUIRED:
+   * no agent-.env fallback, because an alert about a broken channel must not ride
+   * that class of channel. If CTX_OPERATOR is unset/partial the alert is logged
+   * as UNDELIVERED (the dark-notifier condition the build precondition guards).
+   */
+  private sendLivenessAlert(name: string, text: string): void {
+    const r = resolveOperatorCreds(this.frameworkRoot, process.env, { allowAgentFallback: false });
+    if (!r.ok) {
+      console.error(
+        `[liveness] ${name} ALERT UNDELIVERED (operator channel ${r.reason}${r.reason === 'partial' && r.detail ? ': ' + r.detail : ''}): ${text} ` +
+          `— set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN (a bot+chat separate from every agent).`,
+      );
+      return;
+    }
+    const opApi = new TelegramAPI(r.creds.botToken);
+    opApi
+      .sendMessage(r.creds.chatId, `🔴 ${text}`)
+      .catch(e => console.error(`[liveness] alert send failed: ${e}`));
+  }
+
+  /**
    * Stop a specific agent.
    */
   async stopAgent(name: string): Promise<void> {
@@ -1210,6 +1372,10 @@ export class AgentManager {
 
     if (entry.poller) entry.poller.stop();
     if (entry.activityPoller) entry.activityPoller.stop();
+    // Clear the D0/D1 liveness timer, or it accumulates one per restart and
+    // keeps probing a deleted agent (Codex C4). clearInterval clears both the
+    // jitter setTimeout and the running setInterval (same Timeout handle type).
+    if (entry.livenessTimer) clearInterval(entry.livenessTimer);
     entry.checker.stop();
     await entry.process.stop();
     this.agents.delete(name);
