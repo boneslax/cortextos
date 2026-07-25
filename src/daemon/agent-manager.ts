@@ -8,6 +8,7 @@ import { CronScheduler } from './cron-scheduler.js';
 import { migrateCronsForAgent } from './cron-migration.js';
 import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
+import { appendDeadLetter } from '../telegram/dead-letter.js';
 import { TelegramPoller } from '../telegram/poller.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
@@ -756,6 +757,18 @@ export class AgentManager {
         // could inject into an agent. [Codex CB1]
         if (chatId !== undefined && String(msgChatId) !== String(chatId)) {
           log(`[topic-routing] ignoring message from non-configured chat ${msgChatId} (expected ${chatId})`);
+          // PLAN-v3 §9: this clean return advances the poller offset, so the
+          // dropped message is destroyed and Telegram forgets it. Capture it to
+          // the local dead-letter store first so a heal can replay it (replay is
+          // phase 2). Bounded + idempotent; a capture failure must never block
+          // the drop, so it is best-effort.
+          try {
+            if (msg.message_id !== undefined) {
+              appendDeadLetter(stateDir, `${msgChatId}:${msg.message_id}`, msg, Date.now());
+            }
+          } catch (e) {
+            log(`[dead-letter] capture failed: ${e}`);
+          }
           return;
         }
 

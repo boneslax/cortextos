@@ -80,15 +80,53 @@ export function formatValidateError(result: Extract<ValidateCredentialsResult, {
   }
 }
 
+/**
+ * A Telegram API error that PRESERVES the structured fields Telegram returns
+ * (`error_code`, `description`, `parameters`) instead of collapsing them into a
+ * prose string. Classification (PLAN-v3 §7) keys on `error_code`, and
+ * `parameters.migrate_to_chat_id` is the free healing signal for a migrated chat.
+ *
+ * INVARIANT (do not break): `.message` stays VERBATIM `Telegram API error:
+ * <description>`. Four consumers match on that string — poller.ts /Conflict/i
+ * self-die, the internal `startsWith('Telegram API error')` re-throws, and the
+ * validateCredentials `/Telegram API error/` classifiers. `error_code` and
+ * `parameters` are NEW fields alongside `.message`, never a replacement.
+ */
+export class TelegramApiError extends Error {
+  readonly error_code?: number;
+  readonly description: string;
+  readonly parameters?: Record<string, any>;
+
+  constructor(description: string, error_code?: number, parameters?: Record<string, any>) {
+    super(`Telegram API error: ${description}`);
+    this.name = 'TelegramApiError';
+    this.description = description;
+    this.error_code = error_code;
+    this.parameters = parameters;
+  }
+}
+
 export class TelegramAPI {
   private baseUrl: string;
   private lastSendTime: Map<string, number> = new Map();
   // Chat IDs already warned for the self_chat trap. Keeps the runtime
   // diagnostic emitted at most once per chat_id per process lifetime.
   private warnedSelfChat: Set<string> = new Set();
+  // The bot's own user id, derived from the token prefix (the numeric part
+  // before ':'). No network call — used by the D0 offset binding and the D1
+  // probe (PLAN-v3 §4b/§5e), both of which must NOT depend on getMe: a getMe
+  // failure would otherwise send user_id=NaN and page every cycle forever.
+  private readonly _botId: number | undefined;
 
   constructor(token: string) {
     this.baseUrl = `https://api.telegram.org/bot${token}`;
+    const prefix = token.split(':')[0];
+    this._botId = /^\d+$/.test(prefix) ? Number(prefix) : undefined;
+  }
+
+  /** The bot's own user id from the token prefix (no network). undefined if the token is malformed. */
+  get botId(): number | undefined {
+    return this._botId;
   }
 
   /**
@@ -309,7 +347,7 @@ export class TelegramAPI {
       });
       const result = await response.json() as any;
       if (!result.ok) {
-        throw new Error(`Telegram API error: ${result.description || 'Unknown error'}`);
+        throw new TelegramApiError(result.description || 'Unknown error', result.error_code, result.parameters);
       }
       return result;
     } catch (err) {
@@ -364,7 +402,7 @@ export class TelegramAPI {
       });
       const result = await response.json() as any;
       if (!result.ok) {
-        throw new Error(`Telegram API error: ${result.description || 'Unknown error'}`);
+        throw new TelegramApiError(result.description || 'Unknown error', result.error_code, result.parameters);
       }
       return result;
     } catch (err) {
@@ -405,6 +443,17 @@ export class TelegramAPI {
    */
   async getChat(chatId: string | number): Promise<any> {
     return this.post('getChat', { chat_id: chatId });
+  }
+
+  /**
+   * Get a chat member's status (getChatMember). Used by the D1 liveness probe
+   * (PLAN-v3 §5) to ask "is THIS bot still a reachable member of its configured
+   * chat?" — probed with the bot's OWN user id. Throws a TelegramApiError on a
+   * non-ok response (e.g. a permanent 400 `chat not found`), which the probe
+   * classifier reads via `error_code`.
+   */
+  async getChatMember(chatId: string | number, userId: number): Promise<any> {
+    return this.post('getChatMember', { chat_id: chatId, user_id: userId });
   }
 
   /**
@@ -639,7 +688,7 @@ export class TelegramAPI {
       });
       const result = await response.json() as any;
       if (!result.ok) {
-        throw new Error(`Telegram API error: ${result.description || 'Unknown error'}`);
+        throw new TelegramApiError(result.description || 'Unknown error', result.error_code, result.parameters);
       }
       return result;
     } catch (err) {

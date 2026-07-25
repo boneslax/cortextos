@@ -1,8 +1,8 @@
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import type { TelegramUpdate, TelegramMessage, TelegramCallbackQuery, TelegramMessageReaction } from '../types/index.js';
 import { TelegramAPI } from './api.js';
-import { ensureDir } from '../utils/atomic.js';
+import { ensureDir, atomicWriteSync } from '../utils/atomic.js';
 
 export type MessageHandler = (msg: TelegramMessage) => void;
 export type CallbackHandler = (query: TelegramCallbackQuery) => void;
@@ -33,6 +33,17 @@ export class TelegramPoller {
    *   - '' : loop still running / never exited.
    */
   lastExitReason: string = '';
+
+  /**
+   * D0 liveness facts (PLAN-v3 §4b). `lastSuccessfulPollAt` advances on EVERY
+   * successful getUpdates including an empty batch — it is the only proof the
+   * loop is alive when the offset has run past every real update_id (getUpdates
+   * then returns empty forever). `lastUpdateReceivedAt` advances only when
+   * updates arrive; zero updates is legitimate for an idle agent, so the PAIR
+   * distinguishes polling from receiving. Both are epoch-ms, 0 = never.
+   */
+  lastSuccessfulPollAt: number = 0;
+  lastUpdateReceivedAt: number = 0;
 
   /**
    * @param api Telegram API client scoped to a single bot token.
@@ -130,7 +141,12 @@ export class TelegramPoller {
    */
   async pollOnce(): Promise<void> {
     const result = await this.api.getUpdates(this.offset, 1);
+    // getUpdates returned without throwing = the loop is ALIVE, even on an empty
+    // batch. Record it BEFORE the early return, or an idle/killer-offset agent
+    // looks identical to a dead one (the whole D0 gap).
+    this.lastSuccessfulPollAt = Date.now();
     if (!result?.result?.length) return;
+    this.lastUpdateReceivedAt = Date.now();
 
     for (const update of result.result as TelegramUpdate[]) {
       const nextOffset = update.update_id + 1;
@@ -187,17 +203,48 @@ export class TelegramPoller {
    * Load persisted offset from state file.
    */
   private loadOffset(): void {
+    // D0 (PLAN-v3 §4b): the offset is bound to the bot identity. An offset that
+    // does not belong to the current bot (token rotation, stateDir clobber, a
+    // legacy provenance-less file) is DISCARDED — otherwise getUpdates can
+    // return empty forever while every liveness layer reads green. Parsing is
+    // strict: a whole non-negative integer only. `this.offset` defaults to 0, so
+    // every reject path simply leaves it there.
     const offsetFile = join(this.stateDir, this.offsetFileName);
     try {
-      if (existsSync(offsetFile)) {
-        const content = readFileSync(offsetFile, 'utf-8').trim();
-        const parsed = parseInt(content, 10);
-        if (!isNaN(parsed)) {
-          this.offset = parsed;
+      if (!existsSync(offsetFile)) return;
+      const content = readFileSync(offsetFile, 'utf-8').trim();
+      if (!content) return;
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(content);
+      } catch {
+        parsed = undefined;
+      }
+
+      // New bound format: { botId, offset }.
+      if (parsed && typeof parsed === 'object' && 'botId' in parsed && 'offset' in parsed) {
+        if (parsed.botId !== this.api.botId) {
+          console.warn(
+            `[telegram-poller] offset botId ${parsed.botId} != current bot ${this.api.botId} — discarding, reset to 0`,
+          );
+          return; // provenance mismatch: discard
         }
+        const off = parsed.offset;
+        if (typeof off === 'number' && Number.isInteger(off) && off >= 0) {
+          this.offset = off;
+        }
+        return; // matching record; invalid offset already left at 0
+      }
+
+      // Legacy bare-integer file (or garbage). No botId => no provenance =>
+      // unknown => discard to 0. Log the legacy case so a first-deploy re-read
+      // is a recorded expected event, not a mystery (solo, decision A).
+      if (/^\d+$/.test(content)) {
+        console.warn(`[telegram-poller] legacy offset ${content} discarded, no botId, reset to 0`);
       }
     } catch {
-      // Start from 0 if can't read
+      // Any read/parse failure: stay at 0.
     }
   }
 
@@ -208,7 +255,10 @@ export class TelegramPoller {
     ensureDir(this.stateDir);
     const offsetFile = join(this.stateDir, this.offsetFileName);
     try {
-      writeFileSync(offsetFile, String(this.offset), 'utf-8');
+      // Bound + atomic (PLAN-v3 §4b): stamp the botId so a later load can verify
+      // provenance, and use atomicWriteSync so a torn write can't corrupt the
+      // offset into a negative (which Telegram reads with special meaning).
+      atomicWriteSync(offsetFile, JSON.stringify({ botId: this.api.botId, offset: this.offset }));
     } catch {
       // Ignore write errors
     }
@@ -217,4 +267,16 @@ export class TelegramPoller {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * D0 staleness decision (PLAN-v3 §4b) — PURE. The poll loop is stuck if no
+ * successful getUpdates has landed within `thresholdMs`. A healthy loop records
+ * `lastSuccessfulPollAt` every ~2s (getUpdates long-poll ≤1s + 1s sleep), so a
+ * threshold well above that (e.g. 60s) means the loop is genuinely wedged, not
+ * merely between cycles. `lastSuccessfulPollAt === 0` (never polled) is stale
+ * once enough time has passed for at least one poll to have been expected.
+ */
+export function pollerIsStale(lastSuccessfulPollAt: number, now: number, thresholdMs: number): boolean {
+  return now - lastSuccessfulPollAt > thresholdMs;
 }

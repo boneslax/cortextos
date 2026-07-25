@@ -5,6 +5,7 @@ import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
+import { classifyOperatorEnv } from './operator-channel.js';
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
 // fast-checker.ts:102). With >10 active agents the default Node listener cap
@@ -112,12 +113,21 @@ export function writeDaemonCrashedMarkers(ctxRoot: string): void {
 
 function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken: string } | null {
   // Priority 1: explicit operator env (recommended for production).
-  const envChat = process.env.CTX_OPERATOR_CHAT_ID;
-  const envToken = process.env.CTX_OPERATOR_BOT_TOKEN;
-  if (envChat && envToken && /^\d+:[A-Za-z0-9_-]+$/.test(envToken)) {
-    return { chatId: envChat, botToken: envToken };
+  // PLAN-v3 §10 precondition 2: partial config is worse than none. If either
+  // var is present, require BOTH and validate BOTH — half-set is a hard refuse,
+  // never a fall-through that cross-wires the operator chat to an agent bot.
+  const cfg = classifyOperatorEnv(process.env.CTX_OPERATOR_CHAT_ID, process.env.CTX_OPERATOR_BOT_TOKEN);
+  if (cfg.kind === 'complete') {
+    return { chatId: cfg.chatId, botToken: cfg.botToken };
   }
-  // Priority 2: fall back to the first agent's .env. Good enough for
+  if (cfg.kind === 'partial') {
+    console.error(
+      `[operator-channel] REFUSING partial CTX_OPERATOR config: ${cfg.reason}. ` +
+        `Set BOTH CTX_OPERATOR_CHAT_ID and CTX_OPERATOR_BOT_TOKEN (a bot+chat separate from every agent), or neither.`,
+    );
+    return null; // do NOT fall through to the priority-2 agent-.env walk
+  }
+  // Priority 2 (only when CTX_OPERATOR is entirely absent): fall back to the first agent's .env. Good enough for
   // small single-operator installs — alert still lands SOMEWHERE visible.
   try {
     const orgsRoot = join(frameworkRoot, 'orgs');
@@ -136,7 +146,9 @@ function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken
           const chatMatch = content.match(/^CHAT_ID=(.+)$/m);
           if (!tokenMatch || !chatMatch) continue;
           const botToken = tokenMatch[1].trim();
-          const chatId = envChat || chatMatch[1].trim();
+          // Reached only when CTX_OPERATOR is absent, so the pairing is the
+          // agent's own chat + its own token — a coherent, deliverable pair.
+          const chatId = chatMatch[1].trim();
           if (/^\d+:[A-Za-z0-9_-]+$/.test(botToken)) {
             return { chatId, botToken };
           }
