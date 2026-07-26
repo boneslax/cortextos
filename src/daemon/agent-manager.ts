@@ -1340,17 +1340,18 @@ export class AgentManager {
 
   /**
    * Deliver a liveness alert via the OPERATOR channel — never the agent's own
-   * (possibly-broken) channel (PLAN-v3 §10). The operator channel is REQUIRED:
-   * no agent-.env fallback, because an alert about a broken channel must not ride
-   * that class of channel. If CTX_OPERATOR is unset/partial the alert is logged
-   * as UNDELIVERED (the dark-notifier condition the build precondition guards).
+   * (possibly-broken) channel (PLAN-v3 §10). The operator channel is REQUIRED
+   * and named by CTX_OPERATOR_AGENT: there is no arbitrary-agent fallback,
+   * because an alert about a broken channel must not ride that class of
+   * channel. If it cannot be resolved the alert is logged as UNDELIVERED with
+   * the agent, path and specific condition named (the dark-notifier condition
+   * the build precondition guards).
    */
   private sendLivenessAlert(name: string, text: string): void {
-    const r = resolveOperatorCreds(this.frameworkRoot, process.env, { allowAgentFallback: false });
+    const r = resolveOperatorCreds(this.frameworkRoot, process.env);
     if (!r.ok) {
       console.error(
-        `[liveness] ${name} ALERT UNDELIVERED (operator channel ${r.reason}${r.reason === 'partial' && r.detail ? ': ' + r.detail : ''}): ${text} ` +
-          `— set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN (a bot+chat separate from every agent).`,
+        `[liveness] ${name} ALERT UNDELIVERED (operator channel ${r.reason}): ${text} — ${r.detail}`,
       );
       return;
     }

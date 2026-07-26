@@ -69,8 +69,10 @@ describe('runLivenessCheck — D0/D1 glue + operator-channel routing', () => {
     await (mgr as any).runLivenessCheck('seo'); // run 2 — alert
     const u = undelivered();
     expect(u.length).toBe(1);
-    // Routed to the operator channel and refused (absent), NOT the agent's chat.
-    expect(String(u[0][0])).toMatch(/operator channel absent/i);
+    // Routed to the operator channel and REFUSED, NOT sent to the agent's own
+    // chat. Reason is 'unset' under the one-var design (CTX_OPERATOR_AGENT
+    // absent); the behaviour is unchanged — only the label moved.
+    expect(String(u[0][0])).toMatch(/operator channel unset/i);
     expect(String(u[0][0])).toMatch(/UNREACHABLE/);
   });
 

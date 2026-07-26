@@ -8,8 +8,13 @@ export const ecosystemCommand = new Command('ecosystem')
   .option('--instance <id>', 'Instance ID', 'default')
   .option('--org <name>', 'Organization name (auto-detected if not specified)')
   .option('--output <path>', 'Output file', 'ecosystem.config.js')
+  .option(
+    '--operator-agent <name>',
+    'Agent whose own .env supplies the operator alert channel (BOT_TOKEN + CHAT_ID)',
+    'solo',
+  )
   .description('Generate PM2 ecosystem.config.js from agent configs')
-  .action(async (options: { instance: string; org?: string; output: string }) => {
+  .action(async (options: { instance: string; org?: string; output: string; operatorAgent?: string }) => {
     const ctxRoot = join(homedir(), '.cortextos', options.instance);
     // BUG-035 (companion fix): same project-root discovery as enable-agent.ts
     // so `cortextos ecosystem` works from outside ~/cortextos.
@@ -139,6 +144,13 @@ module.exports = {
         CTX_FRAMEWORK_ROOT: ${JSON.stringify(projectRoot)},
         CTX_PROJECT_ROOT: ${JSON.stringify(projectRoot)},
         CTX_ORG: process.env.CTX_ORG || ${JSON.stringify(detectedOrg)},
+        // Operator alert channel (PLAN-v3 §10). NOT a secret — it names the
+        // agent whose own .env supplies BOT_TOKEN + CHAT_ID, so it is safe in
+        // this git-tracked generated file. Emitted HERE rather than hand-added
+        // to the output: this generator writes a FIXED env list, so anything
+        // added by hand is silently dropped on the next regeneration
+        // run — and the operator channel would go dark with nothing saying so.
+        CTX_OPERATOR_AGENT: process.env.CTX_OPERATOR_AGENT || ${JSON.stringify(options.operatorAgent ?? 'solo')},
       },
       max_restarts: 50,
       restart_delay: 5000,

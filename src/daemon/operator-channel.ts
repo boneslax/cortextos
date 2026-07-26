@@ -1,105 +1,169 @@
 /**
- * Operator alert-channel config guard (PLAN-v3 §10, precondition 2) — PURE.
+ * Operator alert-channel resolution (PLAN-v3 §10, precondition 2).
  *
- * The operator channel (CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN) is the
- * out-of-band route for "your Telegram is broken" alerts — it must not depend on
- * the very channel it reports on. The trap: PARTIAL configuration is worse than
- * none. If only CTX_OPERATOR_CHAT_ID is set, the legacy fallback pairs the
- * operator chat id with the FIRST AGENT'S bot token — a bot that is not in that
- * chat — so every alert fails SILENTLY while looking configured.
+ * The operator channel is the out-of-band route for "your Telegram is broken"
+ * alerts. It must not depend on the channel it reports on.
  *
- * Rule: if EITHER var is present, require BOTH and validate BOTH. Half-set is a
- * config ERROR, not a fall-through.
+ * ## Why ONE non-secret var (supersedes the two-var design)
+ *
+ * The original design took `CTX_OPERATOR_CHAT_ID` + `CTX_OPERATOR_BOT_TOKEN`.
+ * That could not be made durable: the only persistence path for daemon env is
+ * `ecosystem.config.js`, which is **tracked in git** — so the token var would
+ * have committed a live credential. Exporting it in a shell instead dies on a
+ * reboot or a pm2 resurrect.
+ *
+ * So the channel is NAMED, not carried. **`CTX_OPERATOR_AGENT`** holds an agent
+ * name — not a secret, safe in a tracked file — and the creds are read from that
+ * agent's own `.env`: the single existing copy, already git-ignored and mode
+ * 600. Zero secret duplication, nothing to paste, survives reboots.
+ *
+ * ## Read at ALERT time, never cached
+ *
+ * This feature exists because an in-memory value went stale while the on-disk
+ * truth was correct. A cache here would re-introduce exactly that, in the
+ * alerting path, where a stale read means the alert goes nowhere and nothing
+ * says so. Alerts are an exception path, not a hot path — one small file read
+ * per alert is free.
+ *
+ * ## Refuse, never fall through
+ *
+ * There is no "first agent alphabetically" fallback and no override vars. The
+ * partial-config guard that defended the old two-var design is gone with it:
+ * the trap no longer exists rather than being defended. Every failure returns a
+ * typed reason and names the agent, the path, and the specific condition — this
+ * path fires when something else is already broken, which is the worst possible
+ * moment for an ambiguous message.
  */
 
-import { existsSync, readFileSync, readdirSync } from 'fs';
+import { existsSync, readFileSync, statSync } from 'fs';
 import { join } from 'path';
 
 const TOKEN_RE = /^\d+:[A-Za-z0-9_-]+$/;
+/** The value indexes into orgs/<org>/agents/<name> — reject path escapes. */
+const AGENT_NAME_RE = /^[A-Za-z0-9._-]+$/;
 
 export interface OperatorCreds {
   chatId: string;
   botToken: string;
+  /** Which agent's channel this resolved to — for logging; never a secret. */
+  agent: string;
 }
+
+export type OperatorFailure =
+  | 'unset'
+  | 'invalid-agent-name'
+  | 'agent-not-in-org'
+  | 'env-unreadable'
+  | 'env-torn';
 
 export type OperatorResolution =
   | { ok: true; creds: OperatorCreds }
-  | { ok: false; reason: 'partial' | 'absent'; detail?: string };
-
-export type OperatorConfig =
-  | { kind: 'complete'; chatId: string; botToken: string }
-  | { kind: 'partial'; reason: string }
-  | { kind: 'absent' };
-
-export function classifyOperatorEnv(
-  envChat: string | undefined,
-  envToken: string | undefined,
-): OperatorConfig {
-  const chat = envChat?.trim() || '';
-  const token = envToken?.trim() || '';
-
-  // Neither present — the caller may (for non-alert uses) fall back. Liveness
-  // alerts refuse the fallback separately (§10).
-  if (!chat && !token) return { kind: 'absent' };
-
-  // At least one present => require BOTH, valid.
-  if (!chat) return { kind: 'partial', reason: 'CTX_OPERATOR_BOT_TOKEN set but CTX_OPERATOR_CHAT_ID missing' };
-  if (!token) return { kind: 'partial', reason: 'CTX_OPERATOR_CHAT_ID set but CTX_OPERATOR_BOT_TOKEN missing' };
-  if (!TOKEN_RE.test(token)) return { kind: 'partial', reason: 'CTX_OPERATOR_BOT_TOKEN is malformed' };
-
-  return { kind: 'complete', chatId: chat, botToken: token };
-}
+  | { ok: false; reason: OperatorFailure; detail: string };
 
 /**
- * Resolve operator-alert-channel creds (PLAN-v3 §10). `env` is injectable so it
- * is testable under the CTX_*-stripping clean room.
+ * Resolve the operator alert channel from `CTX_OPERATOR_AGENT`.
  *
- *  - complete CTX_OPERATOR  => use it.
- *  - partial CTX_OPERATOR    => { ok:false, reason:'partial' } — REFUSE, never
- *    cross-wire (a half-set config is a startup error, not a fall-through).
- *  - absent + allowAgentFallback => first agent's own {chat, token} (a coherent,
- *    deliverable pair — only when CTX_OPERATOR is entirely unset).
- *  - absent + !allowAgentFallback (liveness alerts) => { ok:false, reason:'absent' }.
- *    The alert about a broken channel must not ride an agent's own channel.
+ * Scoped to the CURRENT org only — a misconfigured var must not reach another
+ * org's channel. `env` is injectable so this is testable under the
+ * CTX_*-stripping clean room.
  */
 export function resolveOperatorCreds(
   frameworkRoot: string,
   env: NodeJS.ProcessEnv = process.env,
-  opts: { allowAgentFallback?: boolean } = {},
 ): OperatorResolution {
-  const allowAgentFallback = opts.allowAgentFallback ?? true;
-  const cfg = classifyOperatorEnv(env.CTX_OPERATOR_CHAT_ID, env.CTX_OPERATOR_BOT_TOKEN);
-  if (cfg.kind === 'complete') return { ok: true, creds: { chatId: cfg.chatId, botToken: cfg.botToken } };
-  if (cfg.kind === 'partial') return { ok: false, reason: 'partial', detail: cfg.reason };
+  const agent = env.CTX_OPERATOR_AGENT?.trim() || '';
+  const org = env.CTX_ORG?.trim() || '';
 
-  // Absent. Liveness alerts require the dedicated operator channel.
-  if (!allowAgentFallback) return { ok: false, reason: 'absent' };
-
-  // Priority 2: first agent's own .env (coherent chat+token pair).
-  try {
-    const orgsRoot = join(frameworkRoot, 'orgs');
-    if (!existsSync(orgsRoot)) return { ok: false, reason: 'absent' };
-    for (const org of readdirSync(orgsRoot, { withFileTypes: true }).filter((d) => d.isDirectory())) {
-      const agentsRoot = join(orgsRoot, org.name, 'agents');
-      if (!existsSync(agentsRoot)) continue;
-      for (const a of readdirSync(agentsRoot, { withFileTypes: true }).filter((d) => d.isDirectory())) {
-        const envFile = join(agentsRoot, a.name, '.env');
-        if (!existsSync(envFile)) continue;
-        try {
-          const content = readFileSync(envFile, 'utf-8');
-          const tokenMatch = content.match(/^BOT_TOKEN=(.+)$/m);
-          const chatMatch = content.match(/^CHAT_ID=(.+)$/m);
-          if (!tokenMatch || !chatMatch) continue;
-          const botToken = tokenMatch[1].trim();
-          const chatId = chatMatch[1].trim();
-          if (TOKEN_RE.test(botToken)) return { ok: true, creds: { chatId, botToken } };
-        } catch {
-          /* skip this agent */
-        }
-      }
-    }
-  } catch {
-    /* fall through */
+  if (!agent) {
+    return {
+      ok: false,
+      reason: 'unset',
+      detail:
+        'CTX_OPERATOR_AGENT is not set — no operator alert channel is configured. ' +
+        'Set it to an agent name in this org (e.g. "solo"); that agent\'s own .env supplies BOT_TOKEN + CHAT_ID.',
+    };
   }
-  return { ok: false, reason: 'absent' };
+
+  if (!AGENT_NAME_RE.test(agent)) {
+    return {
+      ok: false,
+      reason: 'invalid-agent-name',
+      detail: `CTX_OPERATOR_AGENT="${agent}" is not a valid agent name (expected [A-Za-z0-9._-]+).`,
+    };
+  }
+
+  if (!org) {
+    return {
+      ok: false,
+      reason: 'agent-not-in-org',
+      detail: `CTX_OPERATOR_AGENT="${agent}" cannot be resolved: CTX_ORG is not set, so there is no org to look in.`,
+    };
+  }
+
+  const agentDir = join(frameworkRoot, 'orgs', org, 'agents', agent);
+  const envFile = join(agentDir, '.env');
+
+  if (!existsSync(agentDir)) {
+    return {
+      ok: false,
+      reason: 'agent-not-in-org',
+      detail: `CTX_OPERATOR_AGENT="${agent}" is not an agent in org "${org}" (looked for ${agentDir}).`,
+    };
+  }
+
+  let content: string;
+  try {
+    if (!existsSync(envFile) || !statSync(envFile).isFile()) {
+      return {
+        ok: false,
+        reason: 'env-unreadable',
+        detail: `Operator agent "${agent}" has no readable .env at ${envFile}.`,
+      };
+    }
+    content = readFileSync(envFile, 'utf-8');
+  } catch (e) {
+    return {
+      ok: false,
+      reason: 'env-unreadable',
+      detail: `Operator agent "${agent}" .env could not be read (${envFile}): ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    };
+  }
+
+  const botToken = content.match(/^BOT_TOKEN=(.+)$/m)?.[1]?.trim() || '';
+  const chatId = content.match(/^CHAT_ID=(.+)$/m)?.[1]?.trim() || '';
+
+  // "Torn" = the file exists but carries no usable, coherent pair. Name WHICH
+  // key is missing rather than reporting a generic failure.
+  if (!botToken && !chatId) {
+    return {
+      ok: false,
+      reason: 'env-torn',
+      detail: `Operator agent "${agent}" .env (${envFile}) has neither BOT_TOKEN nor CHAT_ID.`,
+    };
+  }
+  if (!botToken) {
+    return {
+      ok: false,
+      reason: 'env-torn',
+      detail: `Operator agent "${agent}" .env (${envFile}) has CHAT_ID but no BOT_TOKEN.`,
+    };
+  }
+  if (!chatId) {
+    return {
+      ok: false,
+      reason: 'env-torn',
+      detail: `Operator agent "${agent}" .env (${envFile}) has BOT_TOKEN but no CHAT_ID.`,
+    };
+  }
+  if (!TOKEN_RE.test(botToken)) {
+    return {
+      ok: false,
+      reason: 'env-torn',
+      detail: `Operator agent "${agent}" .env (${envFile}) has a malformed BOT_TOKEN.`,
+    };
+  }
+
+  return { ok: true, creds: { chatId, botToken, agent } };
 }

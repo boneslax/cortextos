@@ -112,17 +112,12 @@ export function writeDaemonCrashedMarkers(ctxRoot: string): void {
 }
 
 function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken: string } | null {
-  // PLAN-v3 §10: single resolver. Partial CTX_OPERATOR is refused (never
-  // cross-wired to an agent bot); absent falls back to the first agent's own
-  // coherent chat+token pair for these general (crash-loop) alerts.
-  const r = resolveOperatorCreds(frameworkRoot, process.env, { allowAgentFallback: true });
+  // PLAN-v3 §10: single resolver, CTX_OPERATOR_AGENT only. There is no
+  // arbitrary-agent fallback — routing a broken-channel alert to whichever
+  // agent sorted first delivers it somewhere nobody is watching.
+  const r = resolveOperatorCreds(frameworkRoot, process.env);
   if (r.ok) return r.creds;
-  if (r.reason === 'partial') {
-    console.error(
-      `[operator-channel] REFUSING partial CTX_OPERATOR config: ${r.detail}. ` +
-        `Set BOTH CTX_OPERATOR_CHAT_ID and CTX_OPERATOR_BOT_TOKEN (a bot+chat separate from every agent), or neither.`,
-    );
-  }
+  console.error(`[operator-channel] UNAVAILABLE (${r.reason}): ${r.detail}`);
   return null;
 }
 
