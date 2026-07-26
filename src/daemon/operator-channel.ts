@@ -36,10 +36,16 @@
  */
 
 import { existsSync, readFileSync, statSync } from 'fs';
-import { join } from 'path';
+import { join, resolve, sep } from 'path';
 
 const TOKEN_RE = /^\d+:[A-Za-z0-9_-]+$/;
-/** The value indexes into orgs/<org>/agents/<name> — reject path escapes. */
+/**
+ * Cheap first filter only. NOT the security boundary — `.` is in the class, so
+ * `..` passes this and resolves one level UP out of the agents dir. Containment
+ * is proven below by resolving the path and asserting it is still inside
+ * `orgs/<org>/agents/`: a name pattern is a blocklist you keep guessing at,
+ * path containment is a property you can prove.
+ */
 const AGENT_NAME_RE = /^[A-Za-z0-9._-]+$/;
 
 export interface OperatorCreds {
@@ -100,7 +106,27 @@ export function resolveOperatorCreds(
     };
   }
 
-  const agentDir = join(frameworkRoot, 'orgs', org, 'agents', agent);
+  const agentsRoot = resolve(frameworkRoot, 'orgs', org, 'agents');
+  const agentDir = resolve(agentsRoot, agent);
+
+  // Containment, proven rather than pattern-matched. `..` and `.` satisfy the
+  // regex above; only this check stops them resolving outside the agents dir
+  // (e.g. `..` -> orgs/<org>/, which sits beside real org-level env files).
+  if (agentDir !== agentsRoot && !agentDir.startsWith(agentsRoot + sep)) {
+    return {
+      ok: false,
+      reason: 'invalid-agent-name',
+      detail: `CTX_OPERATOR_AGENT="${agent}" resolves outside the agents directory (${agentsRoot}) — refusing.`,
+    };
+  }
+  if (agentDir === agentsRoot) {
+    return {
+      ok: false,
+      reason: 'invalid-agent-name',
+      detail: `CTX_OPERATOR_AGENT="${agent}" resolves to the agents directory itself, not an agent.`,
+    };
+  }
+
   const envFile = join(agentDir, '.env');
 
   if (!existsSync(agentDir)) {

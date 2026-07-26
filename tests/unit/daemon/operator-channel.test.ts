@@ -100,6 +100,33 @@ describe('resolveOperatorCreds — refuse, and NAME the reason', () => {
     expect(r.ok === false && r.reason).toBe('invalid-agent-name');
   });
 
+  // Found in review: the name regex allows `.`, so `..` and `.` SATISFY it and
+  // resolve out of / onto the agents dir. A blocklist pattern is something you
+  // keep guessing at; containment is a property that can be proven. These are
+  // the exact strings that slipped past the pattern.
+  it.each(['..', '.', '../x', 'a/b', '$(id)'])(
+    'refuses agent name %j — containment is proven, not pattern-matched',
+    (name) => {
+      // `..` would resolve to orgs/<org>/, which sits beside real org-level env
+      // files (secrets.env, activity-channel.env). It fails safe today only
+      // because orgs/<org>/.env happens not to exist.
+      mkdirSync(join(root, 'orgs', 'vault'), { recursive: true });
+      writeFileSync(join(root, 'orgs', 'vault', '.env'), `BOT_TOKEN=${TOKEN}\nCHAT_ID=${CHAT}\n`);
+      const r = resolveOperatorCreds(root, { CTX_OPERATOR_AGENT: name, CTX_ORG: 'vault' });
+      expect(r.ok).toBe(false);
+      expect(r.ok === false && r.reason).toBe('invalid-agent-name');
+    },
+  );
+
+  it('"..." is NOT a traversal — it stays inside agents/ and is just a missing agent', () => {
+    // Worth pinning: `...` satisfies the regex AND resolves inside the agents
+    // dir, so it is a legitimate (if odd) directory name. Classifying it as a
+    // traversal would be the guard over-reaching; the honest answer is that no
+    // such agent exists.
+    const r = resolveOperatorCreds(root, { CTX_OPERATOR_AGENT: '...', CTX_ORG: 'vault' });
+    expect(r.ok === false && r.reason).toBe('agent-not-in-org');
+  });
+
   it('agent dir exists but no .env => env-unreadable, naming the file', () => {
     makeAgent('vault', 'solo', null);
     const r = resolveOperatorCreds(root, { CTX_OPERATOR_AGENT: 'solo', CTX_ORG: 'vault' });
