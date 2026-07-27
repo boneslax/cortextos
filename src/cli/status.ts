@@ -48,7 +48,7 @@ export const statusCommand = new Command('status')
           const hb: Heartbeat = JSON.parse(readFileSync(hbPath, 'utf-8'));
           const ts = hb.last_heartbeat || hb.timestamp || new Date().toISOString();
           const age = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
-          const ageStr = age < 60 ? `${age}s ago` : age < 3600 ? `${Math.floor(age / 60)}m ago` : `${Math.floor(age / 3600)}h ago`;
+          const ageStr = formatAge(age);
           rows.push({
             agent: hb.agent || agent,
             status: hb.status || 'unknown',
@@ -64,14 +64,14 @@ export const statusCommand = new Command('status')
         console.log('  No agents have reported heartbeats.');
       } else {
         console.log('\n  Last Known Heartbeats\n');
-        const header = '  Name              Status      Last Seen    Current Task';
+        const header = '  Name              Status      Last Seen       Current Task';
         const separator = '  ' + '-'.repeat(header.length - 2);
         console.log(header);
         console.log(separator);
         for (const r of rows) {
           const name = r.agent.padEnd(18);
           const status = r.status.padEnd(12);
-          const age = r.age.padEnd(13);
+          const age = r.age.padEnd(16);
           console.log(`  ${name}${status}${age}${r.task}`);
         }
         console.log('');
@@ -88,27 +88,62 @@ function displayStatuses(statuses: AgentStatus[]): void {
 
   console.log('\n  Agent Status\n');
 
-  // Table header
-  const header = '  Name              Status      PID       Uptime      Model';
+  // Crash column makes crash-loops visible (session uptime alone resets and looks healthy).
+  const header = '  Name              Status      PID       Uptime        Crashes  Model';
   const separator = '  ' + '-'.repeat(header.length - 2);
   console.log(header);
   console.log(separator);
 
   for (const s of statuses) {
     const name = s.name.padEnd(18);
-    const status = s.status.padEnd(12);
+    const crashes = s.crashCount ?? 0;
+    // Surface crash loops even when current session uptime is short
+    const statusLabel = crashes > 0 ? `${s.status}⚠` : s.status;
+    const status = statusLabel.padEnd(12);
     const pid = (s.pid?.toString() || '-').padEnd(10);
-    const uptime = s.uptime ? formatUptime(s.uptime).padEnd(12) : '-'.padEnd(12);
+    const uptime = s.uptime != null ? formatUptime(s.uptime).padEnd(14) : '-'.padEnd(14);
+    const crashCol = String(crashes).padEnd(9);
     const model = s.model || '-';
-    console.log(`  ${name}${status}${pid}${uptime}${model}`);
+    console.log(`  ${name}${status}${pid}${uptime}${crashCol}${model}`);
   }
 
   console.log('');
+  if (statuses.some(s => (s.crashCount ?? 0) > 0)) {
+    console.log('  ⚠ = crashCount > 0 this process life (short uptime alone can look healthy).');
+    console.log('');
+  }
 }
 
+/** Full unit ladder — never drop hours when days/minutes are present. */
 function formatUptime(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
-  return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`;
+  if (seconds < 0 || !Number.isFinite(seconds)) return '?';
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  const days = Math.floor(s / 86400);
+  const hours = Math.floor((s % 86400) / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0 || days > 0) parts.push(`${hours}h`); // keep hours even when 0d is not shown but days>0
+  if (days === 0 && hours === 0) {
+    parts.push(`${mins}m`);
+  } else if (mins > 0 || parts.length === 0) {
+    parts.push(`${mins}m`);
+  }
+  // If we only had days and hours is 0 we still included 0h above when days>0 — good for crash diagnosis
+  return parts.join(' ');
+}
+
+/** Age since last heartbeat — always keep hours when past 60m. */
+function formatAge(seconds: number): string {
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  const hours = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  if (hours < 48) {
+    return mins > 0 ? `${hours}h ${mins}m ago` : `${hours}h ago`;
+  }
+  const days = Math.floor(hours / 24);
+  const remH = hours % 24;
+  return remH > 0 ? `${days}d ${remH}h ago` : `${days}d ago`;
 }

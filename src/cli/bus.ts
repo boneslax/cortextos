@@ -535,7 +535,10 @@ busCommand
     }
 
     for (const hb of heartbeats) {
-      const stale = new Date(hb.last_heartbeat) < new Date(Date.now() - 2 * 60 * 60 * 1000);
+      // Heartbeat cron is 4h; 2h STALE falsely flagged healthy agents ~half the time.
+      // Threshold = schedule + 1h grace (must exceed the slowest heartbeat cron).
+      const HEARTBEAT_STALE_MS = 5 * 60 * 60 * 1000;
+      const stale = new Date(hb.last_heartbeat) < new Date(Date.now() - HEARTBEAT_STALE_MS);
       const staleFlag = stale ? ' [STALE]' : '';
       const label = hb.display_name ? `${hb.display_name} (${hb.agent})` : hb.agent;
       console.log(`${label} (${hb.org}) — ${hb.status}${staleFlag} — last seen ${hb.last_heartbeat}`);
