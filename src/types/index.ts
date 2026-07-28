@@ -29,6 +29,20 @@ export interface InboxMessage {
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'cancelled';
 
+/**
+ * `StatusReason` is DEFINED in `src/utils/status-reason.ts`, not here.
+ *
+ * That module imports nothing at all, which is what lets the dashboard's
+ * sync derivation use the same renderer without dragging `fs` into a
+ * Next.js bundle. Defining the type here and the renderer there would put
+ * the two halves of one contract in two places and let them drift.
+ *
+ * Imported for use in `Task` below, and re-exported so existing consumers
+ * of this module keep a single import site.
+ */
+import type { StatusReason } from '../utils/status-reason.js';
+export type { StatusReason };
+
 export interface TaskOutput {
   /** Output kind. "file" links to a saved deliverable; other shapes reserved. */
   type: 'file';
@@ -57,6 +71,26 @@ export interface Task {
   due_date: string | null;
   archived: boolean;
   result?: string;
+  /**
+   * Monotonic transition counter, incremented on every status write.
+   *
+   * Exists so `status_reason` can prove it belongs to the CURRENT
+   * transition. Comparing statuses instead does not work: after
+   * `blocked → in_progress → blocked` the statuses agree again, and a
+   * status-comparison resurrects a closed-episode reason as the current
+   * explanation. A counter cannot recycle.
+   *
+   * Optional because every task file written before this shipped lacks
+   * one. See `src/utils/status-reason.ts` — a missing `rev` on either side
+   * renders as history, never as current.
+   */
+  rev?: number;
+  /**
+   * Why the task arrived at its current status. Distinct from `result`,
+   * which is what the work PRODUCED — a task can honestly carry both
+   * ("shipped the connector" + "ended early, auth deferred").
+   */
+  status_reason?: StatusReason;
   /** Linked deliverables (files saved via `cortextos bus save-output`). */
   outputs?: TaskOutput[];
   /**
