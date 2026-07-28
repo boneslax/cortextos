@@ -45,11 +45,22 @@ Human tasks reference: `.claude/skills/human-tasks/SKILL.md`
 # Check all agent heartbeats
 cortextos bus read-all-heartbeats
 
-# Check all pending approvals
-cortextos bus list-approvals --format json 2>/dev/null
+# Check all pending approvals. No 2>/dev/null -- see the note below; a swallowed
+# error here reads identically to "no approvals pending".
+cortextos bus list-approvals --format json
 
-# Check stale human tasks
-cortextos bus list-tasks --project human-tasks --status pending 2>/dev/null
+# Check stale human tasks.
+# NO --project: the flag does not exist and `list-tasks` exits 1 with
+#   error: unknown option '--project'
+# The 2>/dev/null this line used to carry then ate the error, so the step
+# printed nothing and read exactly like "no human tasks pending".
+# NO --status pending either: it hides `blocked` and `in_progress`. On
+# 2026-07-28 that was 13 of 36 open tasks.
+# Query unfiltered and treat any non-terminal status as open. Never
+# redirect stderr here -- a failed sweep is UNKNOWN, not clean.
+cortextos bus list-tasks --format json
+# Then filter: status not in (completed, cancelled) = open;
+# escalate open rows whose title carries [HUMAN] and are older than 4h.
 ```
 
 For each agent: if heartbeat is older than 5 hours, send an alert to that agent and flag in memory.
@@ -70,6 +81,7 @@ Full reference: `.claude/skills/tasks/SKILL.md`
 ```bash
 cortextos bus list-tasks --agent $CTX_AGENT_NAME --status pending
 cortextos bus list-tasks --agent $CTX_AGENT_NAME --status in_progress
+cortextos bus list-tasks --agent $CTX_AGENT_NAME --status blocked
 ```
 
 - If you have pending tasks: pick the highest priority one
