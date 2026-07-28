@@ -264,6 +264,7 @@ export function updateTask(
   paths: BusPaths,
   taskId: string,
   status: TaskStatus,
+  reason?: string,
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -280,11 +281,34 @@ export function updateTask(
     assignee = task.assigned_to;
     task.status = status;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    // Bump on EVERY transition, with or without a reason. This is what lets a
+    // stamp prove it belongs to the current transition: after
+    // blocked -> in_progress -> blocked the statuses agree again, so only a
+    // counter distinguishes the second visit from the first.
+    task.rev = (task.rev ?? 0) + 1;
+    // Written ONLY when a reason was supplied. A reason-less transition leaves
+    // any prior stamp untouched — it does not lie, because its rev no longer
+    // matches and it renders as history. Clearing it would destroy the record;
+    // rewriting it would fabricate one.
+    if (reason !== undefined) {
+      task.status_reason = {
+        status,
+        reason,
+        at: task.updated_at,
+        rev: task.rev,
+      };
+    }
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
-  appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
+  appendTaskAudit(paths, taskId, {
+    event: 'update',
+    agent: assignee || 'unknown',
+    from: prevStatus,
+    to: status,
+    ...(reason !== undefined ? { note: reason } : {}),
+  });
 }
 
 /**
@@ -463,6 +487,7 @@ export function completeTask(
   paths: BusPaths,
   taskId: string,
   result?: string,
+  reason?: string,
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -482,8 +507,21 @@ export function completeTask(
     task.status = 'completed';
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     task.completed_at = task.updated_at;
+    task.rev = (task.rev ?? 0) + 1;
+    // `result` and `status_reason` are DIFFERENT things and a completed task
+    // can honestly carry both: result is what the work PRODUCED, status_reason
+    // is why it ended here. "shipped the connector" + "ended early, auth
+    // deferred" are not the same sentence.
     if (result) {
       task.result = result;
+    }
+    if (reason !== undefined) {
+      task.status_reason = {
+        status: 'completed',
+        reason,
+        at: task.updated_at,
+        rev: task.rev,
+      };
     }
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {

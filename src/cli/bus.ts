@@ -213,11 +213,22 @@ busCommand
     }
   });
 
+/**
+ * Upper bound on a status reason. Matches the dashboard's own
+ * MAX_FREE_TEXT_LEN, which is the producer that will feed this, so the two
+ * ends agree rather than one silently swallowing the other's input.
+ *
+ * REJECTED, never truncated. A silently cut explanation is the same defect
+ * this whole feature exists to fix: it reads as complete and is not.
+ */
+const MAX_REASON_LEN = 2000;
+
 busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
-  .action((id: string, status: string) => {
+  .option('--reason <text>', 'Why the task moved to this status. Distinct from --result on complete-task, which is what the work PRODUCED.')
+  .action((id: string, status: string, opts: { reason?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -237,8 +248,16 @@ busCommand
       }
     }
 
-    updateTask(paths, id, status as TaskStatus);
-    console.log(`Updated ${id} -> ${status}`);
+    if (opts.reason !== undefined && opts.reason.length > MAX_REASON_LEN) {
+      console.error(
+        `--reason is ${opts.reason.length} chars, over the ${MAX_REASON_LEN} limit. ` +
+        `Rejected rather than truncated: a cut explanation reads as a whole one.`,
+      );
+      process.exit(1);
+    }
+
+    updateTask(paths, id, status as TaskStatus, opts.reason);
+    console.log(`Updated ${id} -> ${status}${opts.reason !== undefined ? ' (reason recorded)' : ''}`);
   });
 
 busCommand
@@ -332,8 +351,9 @@ busCommand
   .command('complete-task')
   .argument('<id>', 'Task ID')
   .argument('[result]', 'Completion result (optional positional form)')
-  .option('--result <text>', 'Completion result')
-  .action((id: string, resultArg: string | undefined, opts: { result?: string }) => {
+  .option('--result <text>', 'What the work PRODUCED')
+  .option('--reason <text>', 'Why it ended here. Different from --result: a task can honestly carry both ("shipped the connector" + "ended early, auth deferred").')
+  .action((id: string, resultArg: string | undefined, opts: { result?: string; reason?: string }) => {
     // Accept result as either positional arg or --result flag (P1 fix #8)
     const effectiveResult = opts.result ?? resultArg;
     const env = resolveEnv();
@@ -348,8 +368,16 @@ busCommand
       }
     }
 
-    completeTask(paths, id, effectiveResult);
-    console.log(`Completed ${id}`);
+    if (opts.reason !== undefined && opts.reason.length > MAX_REASON_LEN) {
+      console.error(
+        `--reason is ${opts.reason.length} chars, over the ${MAX_REASON_LEN} limit. ` +
+        `Rejected rather than truncated: a cut explanation reads as a whole one.`,
+      );
+      process.exit(1);
+    }
+
+    completeTask(paths, id, effectiveResult, opts.reason);
+    console.log(`Completed ${id}${opts.reason !== undefined ? ' (reason recorded)' : ''}`);
   });
 
 busCommand
