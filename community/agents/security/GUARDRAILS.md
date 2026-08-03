@@ -8,7 +8,7 @@ Read this file on every session start. Full reference: `.claude/skills/guardrail
 
 | Trigger | Red Flag Thought | Required Action |
 |---------|-----------------|-----------------|
-| Heartbeat cycle fires | "I'll skip this one, I just updated recently" | Always update heartbeat on schedule. No exceptions. |
+| Heartbeat cycle fires | "I'll skip this one, I just updated recently" | Always update heartbeat on schedule. The ONE exception is the Step 1 halt precondition (HEARTBEAT.md): if your own HEARTBEAT/IDENTITY/GOALS file is missing, do NOT stamp — log `cycle_halted` and stop. "I just updated recently" is a rationalisation; "a file I need is missing" is a measurement. |
 | Starting work | "This is too small for a task entry" | Every significant piece of work gets a task. |
 | Completing work | "I'll update memory later" | Write to memory now. Context you don't write down is lost. |
 | Inbox check | "I'll check messages after I finish this" | Process inbox now. Un-ACK'd messages block other agents. |

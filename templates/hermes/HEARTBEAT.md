@@ -1,15 +1,30 @@
-# Heartbeat Checklist — EXECUTE EVERY STEP. SKIP NOTHING.
+# Heartbeat Checklist — EXECUTE EVERY STEP. SKIP NOTHING — except where the halt precondition in Step 1 fires, in which case
+# you stop at Step 1, skip the rest, and log `cycle_halted`. A halt is a completed cycle, not a skipped one.
 
 This runs on your heartbeat cron (every 4 hours). Execute EVERY step in order.
 Skipping steps = broken system.
+The ONE exception is the Step 1 halt precondition: when it fires you stop at Step 1 and log `cycle_halted`.
+That is compliance, not a skip — and the resulting staleness is the intended signal, not a state to repair.
 
-## Step 1: Update heartbeat (DO THIS FIRST)
+## Step 1: Update heartbeat (FIRST — but only after the halt precondition)
+
+> **Halt precondition.** Before stamping liveness, confirm you actually read your own
+> `HEARTBEAT.md`, `IDENTITY.md` and `GOALS.md` (your cron names them by absolute path). If ANY of
+> the three is missing or unreadable, **do not update the heartbeat and do not write a memory
+> entry** — run
+> `cortextos bus log-event action cycle_halted error --meta '{"agent":"'$CTX_AGENT_NAME'","missing":"<file>"}'`
+> and stop. Silent in the cadence channel, loud in the error channel.
+>
+> The PARTIAL case is the likely one: if HEARTBEAT.md reads and GOALS.md does not, a step-by-step
+> execution of the old step 1 would stamp you alive before noticing, and a halted cycle that stamps
+> liveness is indistinguishable from a healthy one. A halt is meant to surface as STALENESS. If you
+> later read STALE after a halt, that is the signal — do not helpfully repair it.
 
 ```bash
 cortextos bus update-heartbeat "<1-sentence summary of current work>"
 ```
 
-If this fails, your agent shows as DEAD on the dashboard. Fix it before anything else.
+If this command ERRORS, your agent shows as DEAD on the dashboard and the command itself is broken — fix that first. A DEAD reading after a deliberate halt is NOT that: it is the intended signal and the only thing the halt leaves behind. Never stamp liveness to clear a dashboard state you did not diagnose.
 
 **Note:** `update-heartbeat` (Step 1) and `log-event heartbeat agent_heartbeat` (Step 4) are NOT interchangeable.
 - `update-heartbeat` refreshes the dashboard status-string field (what the dashboard reads to know you're alive).
@@ -91,3 +106,10 @@ cortextos bus complete-task "<task_id>" "<summary of what was produced>"
 
 REMINDER: A heartbeat with 0 events logged and 0 memory updates means you did nothing visible.
 Target: >= 2 events and >= 1 memory update per heartbeat cycle.
+
+**This target does NOT apply to a halted cycle.** A halt produces 0 memory updates and exactly one
+event, `cycle_halted`, by design — the halt forbids the memory write, and the missing artifacts ARE
+the signal. Do not write a memory entry, fire filler events, or stamp a heartbeat to reach this
+target after a halt: that manufactures the appearance of a cycle that refused to run, which is the
+exact failure the halt exists to make visible. One `cycle_halted` event and nothing else is a
+COMPLETE halted cycle.

@@ -35,7 +35,7 @@ If you have nothing to do:
 3. Check GOALS.md - have new objectives been set?
 4. Check other agents - can you unblock someone?
 
-There is ALWAYS work. If you truly exhausted all 4 checks, create a task to improve your own processes, write documentation, or research something that advances the org's goals.
+There is ALWAYS work — **unless your GOALS Focus line says hold, or nothing in the queue is genuinely startable (unmet `blocked_by`, an unanswered human gate). Then an EMPTY QUEUE IS A VALID OUTCOME and reporting it is the work.** A held agent that produces nothing is doing its job; inventing output to avoid looking idle is the failure this section was meant to prevent, arriving from the other side. And a cycle that HALTED on a missing file is invisible ON PURPOSE — do not log your way out of it. If you truly exhausted all 4 checks, create a task to improve your own processes, write documentation, or research something that advances the org's goals.
 
 An idle agent with 0 events logged is indistinguishable from a crashed agent.
 

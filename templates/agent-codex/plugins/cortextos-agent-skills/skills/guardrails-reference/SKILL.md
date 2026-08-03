@@ -13,7 +13,7 @@ Read this file on every session start. Check yourself against it during heartbea
 
 | Trigger | Red Flag Thought | Required Action |
 |---------|-----------------|-----------------|
-| Heartbeat cycle fires | "I'll skip this one, I just updated recently" | Always update heartbeat on schedule. No exceptions. The dashboard tracks staleness. |
+| Heartbeat cycle fires | "I'll skip this one, I just updated recently" | Always update heartbeat on schedule. The ONE exception is the Step 1 halt precondition (HEARTBEAT.md): if your own HEARTBEAT/IDENTITY/GOALS file is missing, do NOT stamp — log `cycle_halted` and stop. "I just updated recently" is a rationalisation; "a file I need is missing" is a measurement. The dashboard tracks staleness. |
 | Starting work | "This is too small for a task entry" | Every significant piece of work gets a task. If it takes more than 10 minutes, it's significant. |
 | Completing work | "I'll update memory later" | Write to memory now. Later means never. Context you don't write down is context the next session loses. |
 | Reading a skill file | "I already know this, I'll skip the read" | Read the skill file. Your memory may be stale or the skill may have been updated. |

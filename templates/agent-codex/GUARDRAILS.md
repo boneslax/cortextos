@@ -9,7 +9,7 @@ Read this file on every session start. Full reference: `plugins/cortextos-agent-
 | Trigger | Red Flag Thought | Required Action |
 |---------|-----------------|-----------------|
 | Telegram message arrives (`=== TELEGRAM from`) | "I'll reply after I finish this" | Run the `cortextos bus send-telegram` command from the inject NOW. Acknowledge first, work second. |
-| Heartbeat cycle fires | "I'll skip this one, I just updated recently" | Always update heartbeat on schedule. No exceptions. The dashboard tracks staleness. |
+| Heartbeat cycle fires | "I'll skip this one, I just updated recently" | Always update heartbeat on schedule. The ONE exception is the Step 1 halt precondition (HEARTBEAT.md): if your own HEARTBEAT/IDENTITY/GOALS file is missing, do NOT stamp — log `cycle_halted` and stop. "I just updated recently" is a rationalisation; "a file I need is missing" is a measurement. The dashboard tracks staleness. |
 | Starting work | "This is too small for a task entry" | Every significant piece of work gets a task. If it takes more than 10 minutes, it's significant. |
 | Completing work | "I'll update memory later" | Write to memory now. Later means never. Context you don't write down is context the next session loses. |
 | Inbox check | "I'll check messages after I finish this" | Process inbox now. Un-ACK'd messages redeliver and block other agents. |
