@@ -326,8 +326,26 @@ export function checkGoalStaleness(
         continue;
       }
 
-      // Parse ISO 8601 timestamp
-      const parsedDate = new Date(updatedLine);
+      // Parse ISO 8601 timestamp.
+      //
+      // The line carries provenance after the timestamp — generate-md writes
+      // "2026-08-04T20:20:00Z (by dev-delegate)" — and new Date() on the WHOLE
+      // line returns Invalid Date. Every agent that recorded who set its goals
+      // therefore read as permanently stale, whatever its real age, and the
+      // summary said "3 stale, 0 fresh" for a fleet whose oldest goal was 30h.
+      //
+      // Found 2026-07-27 and worked around by blanking updated_by on all three
+      // agents. Ten days later every one of them carried it again and the
+      // monitor was dark a second time. A convention someone has to keep
+      // remembering is not a fix, so parse the timestamp out of the line
+      // instead and let the field be populated freely.
+      //
+      // Falls back to the full line when no ISO stamp matches, so a bare
+      // "2026-08-04" keeps parsing exactly as it did before.
+      const isoMatch = updatedLine.match(
+        /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})/
+      );
+      const parsedDate = new Date(isoMatch ? isoMatch[0] : updatedLine);
       if (isNaN(parsedDate.getTime())) {
         agents.push({
           agent: agentName,
