@@ -60,6 +60,12 @@ mkdir -p "$STATE" 2>/dev/null
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "[$(ts)] $*" >> "$LOG"; }
 
+if [ "$DRY_RUN" != "1" ]; then
+  command -v flock >/dev/null 2>&1 || { log "FATAL: flock not found"; exit 0; }
+  exec 9>"$STATE/staleness.lock"
+  flock -n 9 || { log "SKIP — prior staleness tick still running"; exit 0; }
+fi
+
 CORTEXTOS="${CORTEXTOS_BIN:-/usr/bin/cortextos}"
 JQ="${JQ_BIN:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 CURL="${CURL_BIN:-$(command -v curl 2>/dev/null || echo /usr/bin/curl)}"

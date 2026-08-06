@@ -126,6 +126,30 @@ function walk(dir: string): string[] {
   return out;
 }
 
+describe('ops-drain-staleness single-run guard', () => {
+  it('skips an overlapping production tick', () => {
+    const st = newState();
+    execFileSync('bash', [
+      '-c',
+      'exec 8>"$OPS_DRAIN_STATE_DIR/staleness.lock"; flock -n 8; exec bash "$TEST_SCRIPT"',
+    ], {
+      env: {
+        ...process.env,
+        TEST_SCRIPT: SCRIPT,
+        OPS_DRAIN_STATE_DIR: st,
+        OPS_DRAIN_DRY_RUN: '0',
+        CTX_FRAMEWORK_ROOT: isoFwRoot,
+        CORTEXTOS_BIN: '/nonexistent',
+        OPS_DRAIN_CHAT_ID: '000',
+        OP_SA_TOKEN_FILE: '/nonexistent',
+        TELEGRAM_API_BASE: 'http://127.0.0.1:9',
+      },
+    });
+
+    expect(logOf(st)).toContain('SKIP — prior staleness tick still running');
+  });
+});
+
 describe('ops-drain-staleness classification (mtime-only)', () => {
   it('heartbeat fresh (mtime now) → OK, no alert', () => {
     const st = newState();

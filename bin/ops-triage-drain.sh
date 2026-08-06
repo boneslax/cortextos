@@ -90,6 +90,12 @@ mkdir -p "$STATE" "$QDIR" "$IDCACHE" 2>/dev/null
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "[$(ts)] $*" >> "$LOG"; }
 
+if [ "$DRY_RUN" != "1" ]; then
+  command -v flock >/dev/null 2>&1 || { log "FATAL: flock not found"; exit 0; }
+  exec 9>"$STATE/drain.lock"
+  flock -n 9 || { log "SKIP — prior drainer tick still running"; exit 0; }
+fi
+
 if ! command -v "$JQ" >/dev/null 2>&1; then log "FATAL: jq not found ($JQ)"; exit 0; fi
 
 # --- alerting -----------------------------------------------------------------

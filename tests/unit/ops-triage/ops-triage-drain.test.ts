@@ -357,6 +357,36 @@ function walk(dir: string): string[] {
 
 // ================================================================ tests
 
+describe('ops-triage-drain: single-run guard', () => {
+  it('skips an overlapping production tick', () => {
+    const c = ctx();
+    execFileSync('bash', [
+      '-c',
+      'exec 8>"$OPS_DRAIN_STATE_DIR/drain.lock"; flock -n 8; exec bash "$TEST_SCRIPT"',
+    ], {
+      cwd: c.cwd,
+      env: {
+        ...process.env,
+        TEST_SCRIPT: SCRIPT,
+        OPS_DRAIN_STATE_DIR: c.state,
+        OPS_DRAIN_OUTBOX_DIR: c.outbox,
+        OPS_DRAIN_GATE_DIR: c.gate,
+        OPS_DRAIN_NO_SYNC: '1',
+        CORTEXTOS_BIN: stubBin,
+        STUB_DIR: c.stubDir,
+        CTX_ROOT: join(c.state, 'ctxroot'),
+        CTX_FRAMEWORK_ROOT: isoFwRoot,
+        OP_SA_TOKEN_FILE: '/nonexistent',
+        TELEGRAM_API_BASE: 'http://127.0.0.1:9',
+        OPS_DRAIN_CHAT_ID: '000',
+      },
+    });
+
+    expect(log(c)).toContain('SKIP — prior drainer tick still running');
+    expect(calls(c)).toHaveLength(0);
+  });
+});
+
 describe('ops-triage-drain: hash contract', () => {
   it('accepts a base36 hash (g-z letters, length 4) and drains it — the v2 hex-regex regression', () => {
     const c = ctx();
