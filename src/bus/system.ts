@@ -360,6 +360,35 @@ export function checkGoalStaleness(
 
       const ageMs = now - parsedDate.getTime();
       const ageDays = Math.floor(ageMs / 86400000);
+
+      // A FUTURE-DATED STAMP READS AS PERMANENTLY FRESH, AND SILENTLY.
+      // `isStale` is `ageMs > thresholdMs`, so a NEGATIVE age fails every
+      // threshold comparison that will ever be written here — an agent whose
+      // stamp is even seconds ahead of this clock is fresh forever, and the
+      // output is a clean `fresh` rather than an error.
+      //
+      // Found 2026-08-07 by dev-delegate, who hand-wrote `updated_at` 72
+      // seconds ahead of the checker and got `age_days: -1, stale: false`.
+      // Same class as the parse_error above — an input the code does not
+      // handle producing a confidently wrong PASS — one input over, and found
+      // by making the mistake rather than by looking for it.
+      //
+      // Three states, not two: FRESH · STALE · IMPOSSIBLE. Flag it like a
+      // parse failure, because that is what it is: the file says something
+      // that cannot be true, and "cannot be true" is never a pass.
+      if (ageMs < 0) {
+        agents.push({
+          agent: agentName,
+          org: orgName,
+          status: 'future_stamp',
+          updated: updatedLine,
+          age_days: ageDays,
+          stale: true,
+          reason: `stamp is ${Math.abs(Math.round(ageMs / 1000))}s in the FUTURE — cannot be aged, treat as UNKNOWN not fresh`,
+        });
+        continue;
+      }
+
       const isStale = ageMs > thresholdMs;
 
       agents.push({
