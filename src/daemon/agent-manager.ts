@@ -1121,7 +1121,7 @@ export class AgentManager {
       // — follow-up task_1776054009969_099 tracks migrating to a dedicated
       // singleton or Telegram webhook if the coupling ever causes real
       // operator pain. Non-orchestrator agents skip this entirely.
-      await this.maybeStartActivityChannelPoller(name, org, agentDir, log);
+      await this.maybeStartActivityChannelPoller(name, org, agentDir, botToken, log);
     }
   }
 
@@ -1139,6 +1139,7 @@ export class AgentManager {
     name: string,
     org: string | undefined,
     agentDir: string,
+    primaryBotToken: string | undefined,
     log: LogFn,
   ): Promise<void> {
     if (!org) return;
@@ -1180,6 +1181,13 @@ export class AgentManager {
 
     if (!activityBotToken || !activityChatId) {
       log('Activity-channel env present but missing BOT_TOKEN or CHAT_ID — skipping poller');
+      return;
+    }
+
+    // The primary poller already routes appr_* callbacks. Starting another
+    // getUpdates loop with the same token only makes the two loops evict each other.
+    if (activityBotToken === primaryBotToken) {
+      log('Activity-channel bot matches primary bot — using primary poller for callbacks');
       return;
     }
 
