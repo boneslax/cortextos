@@ -37,8 +37,8 @@ SCAN_DIR="${DISK_SCAN_DIR:-/var/log}"
 DF_FIXTURE="${DISK_DF_FIXTURE:-}"
 LOGSIZE_FIXTURE="${DISK_LOGSIZE_FIXTURE:-}"
 
-CTX_ROOT="${CTX_ROOT:-/home/bones/.cortextos/default}"
-CTX_FRAMEWORK_ROOT="${CTX_FRAMEWORK_ROOT:-/home/bones/cortextos}"
+CTX_ROOT="${CTX_ROOT:-$HOME/.cortextos/default}"
+CTX_FRAMEWORK_ROOT="${CTX_FRAMEWORK_ROOT:-$HOME/cortextos}"
 CTX_ORG="${CTX_ORG:-vault}"
 BUS_AGENT="${WATCHDOG_BUS_AGENT:-solo}"
 
