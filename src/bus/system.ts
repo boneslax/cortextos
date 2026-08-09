@@ -18,7 +18,7 @@ export interface AutoCommitReport {
 export interface AgentGoalStatus {
   agent: string;
   org: string;
-  status: 'fresh' | 'stale' | 'missing' | 'no_timestamp' | 'parse_error';
+  status: 'fresh' | 'stale' | 'missing' | 'no_timestamp' | 'parse_error' | 'future_stamp';
   updated?: string;
   age_days?: number;
   stale: boolean;

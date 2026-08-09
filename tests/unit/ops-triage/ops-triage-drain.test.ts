@@ -362,7 +362,7 @@ describe('ops-triage-drain: single-run guard', () => {
     const c = ctx();
     execFileSync('bash', [
       '-c',
-      'exec 8>"$OPS_DRAIN_STATE_DIR/drain.lock"; flock -n 8; exec bash "$TEST_SCRIPT"',
+      'if command -v flock >/dev/null; then exec 8>"$OPS_DRAIN_STATE_DIR/drain.lock"; flock -n 8; exec bash "$TEST_SCRIPT"; else lockf -t 0 "$OPS_DRAIN_STATE_DIR/drain.lock" env OPS_DRAIN_LOCK_HELD=0 bash "$TEST_SCRIPT"; fi',
     ], {
       cwd: c.cwd,
       env: {

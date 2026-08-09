@@ -159,7 +159,7 @@ if [ "$TRIGGERED" = 1 ]; then
     cnt=0; [ -f "$PEND" ] && cnt="$(cat "$PEND" 2>/dev/null || echo 0)"; cnt=$((cnt+1))
     [ "$DRY_RUN" = "1" ] || echo "$cnt" > "$PEND"
     if [ "$cnt" -ge 2 ]; then
-      msg="$(printf '🔴 Solo DISK alert: %s. Free space now or the host wedges (it filled to 100%% on 6/30). Fix a runaway log with: sudo truncate -s 0 <file> + restart the writer. Watchdog reports recovery.' "$(IFS='; '; echo "${REASONS[*]}")")"
+      msg="$(printf '🔴 SOLO2 STORAGE CRITICAL — disk space needs attention\n\nWhat this means: %s.\nImpact: If storage reaches 100%%, Cortex, memory, and other Solo2 services can stop or corrupt in-progress writes.\nWhat to do: Ask Codex to identify and safely clear the growing file. Do not delete files blindly. The watchdog will send one recovery.' "$(IFS='; '; echo "${REASONS[*]}")")"
       if send_alert "$msg"; then
         [ "$DRY_RUN" = "1" ] || { mt="$(mktemp "$STATE_DIR/.m-XXXXXX")"; printf '{"since":"%s","pct":%s}' "$(ts)" "$PCT" > "$mt" && mv -f "$mt" "$MARK"; rm -f "$PEND"; }
       fi
@@ -170,7 +170,11 @@ if [ "$TRIGGERED" = 1 ]; then
 else
   [ "$DRY_RUN" = "1" ] || rm -f "$PEND"
   if [ -f "$MARK" ] && [ "$PCT" -lt "$WARN_PCT" ]; then
-    if send_alert "🟢 Solo disk RECOVERED: ${MOUNT} back to ${PCT}% (< ${WARN_PCT}%), no runaway log. "; then
+    if send_alert "🟢 SOLO2 STORAGE RECOVERED — disk usage is safe again
+
+What changed: ${MOUNT} is at ${PCT}%, below the ${WARN_PCT}% warning threshold, with no runaway log detected.
+Impact: Storage is no longer threatening Cortex or memory services.
+What to do: Nothing."; then
       [ "$DRY_RUN" = "1" ] || rm -f "$MARK"; log "recovery sent (${PCT}%)"
     else
       log "recovery send FAILED — keeping marker, retry next tick"

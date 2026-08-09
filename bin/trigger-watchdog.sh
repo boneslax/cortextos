@@ -100,6 +100,7 @@ HTTP_CODE_FILE="$STATE_DIR/.lasthttp.$$" # fetch_runs writes the HTTP status her
 mkdir -p "$STATE_DIR"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "[$(ts)] $*" >> "$LOG"; }
+file_mtime() { stat -f "%m" "$1" 2>/dev/null || stat -c "%Y" "$1" 2>/dev/null; }
 
 # Validate numeric tunables — a typo'd env must NOT silently disable the blind-risk self-alert
 # (a non-numeric threshold breaks the `-ge`/`-lt` compares → the watchdog stops watching itself)
@@ -285,7 +286,13 @@ send_alert() {
 
 age_secs() { # iso8601 -> seconds ago (echo big number if empty/unparseable)
   local iso="$1"; [ -z "$iso" ] || [ "$iso" = "null" ] && { echo 999999999; return; }
-  local e; e="$(date -u -d "$iso" +%s 2>/dev/null)" || { echo 999999999; return; }
+  local e clean
+  if [ "$(uname -s)" = "Darwin" ]; then
+    clean="${iso%%.*}"; clean="${clean%Z}"
+    e="$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "$clean" +%s 2>/dev/null)" || { echo 999999999; return; }
+  else
+    e="$(date -u -d "$iso" +%s 2>/dev/null)" || { echo 999999999; return; }
+  fi
   echo $(( $(date -u +%s) - e ))
 }
 
@@ -370,7 +377,7 @@ get_key() {
   local cache="$KEYCACHE_DIR/$field.key" cached="" age=99999999 mt now
   if [ -f "$cache" ]; then
     cached="$(cat "$cache" 2>/dev/null)"
-    mt="$(stat -c %Y "$cache" 2>/dev/null || echo 0)"; now="$(date -u +%s)"; age=$(( now - mt ))
+    mt="$(file_mtime "$cache" || echo 0)"; now="$(date -u +%s)"; age=$(( now - mt ))
   fi
   # Fresh cache hit — reuse, no op call.
   if [ -n "$cached" ] && [ "$age" -lt "$KEY_TTL" ]; then echo "$cached"; return; fi
@@ -433,7 +440,7 @@ check_key_refresh_staleness() {
       # transient rotation-bust that self-heals never accrues toward the blind threshold; the age
       # is just the mtime staleness (the ORIGINAL, unchanged present-but-stale path).
       [ "$DRY_RUN" = "1" ] || rm -f "$missmark" 2>/dev/null
-      mt="$(stat -c %Y "$cache" 2>/dev/null || echo 0)"; age=$(( now - mt ))
+      mt="$(file_mtime "$cache" || echo 0)"; age=$(( now - mt ))
     else
       # MISSING — apply a GRACE so a routine key rotation (401 → bust deletes the cache mid-loop →
       # re-fetch repopulates it next tick) never false-fires. A missing cache counts as blind ONLY
@@ -441,7 +448,7 @@ check_key_refresh_staleness() {
       # tracked by a first-seen-missing marker (its mtime = when the cache first went missing).
       missing_for=0
       if [ -f "$missmark" ]; then
-        smt="$(stat -c %Y "$missmark" 2>/dev/null || echo "$now")"; missing_for=$(( now - smt ))
+        smt="$(file_mtime "$missmark" || echo "$now")"; missing_for=$(( now - smt ))
       else
         [ "$DRY_RUN" = "1" ] || { : > "$missmark" 2>/dev/null && chmod 600 "$missmark" 2>/dev/null; }
       fi
@@ -459,14 +466,14 @@ check_key_refresh_staleness() {
   if [ "$oldest_age" -ge "$KEY_STALE_ALERT_SEC" ]; then
     # Degraded. Rate-limit: alert at most once per KEY_STALE_REALERT_SEC (marker mtime = last alert).
     local last_alert_age=999999999 mmt
-    if [ -f "$marker" ]; then mmt="$(stat -c %Y "$marker" 2>/dev/null || echo 0)"; last_alert_age=$(( now - mmt )); fi
+    if [ -f "$marker" ]; then mmt="$(file_mtime "$marker" || echo 0)"; last_alert_age=$(( now - mmt )); fi
     if [ -f "$marker" ] && [ "$last_alert_age" -lt "$KEY_STALE_REALERT_SEC" ]; then
       log "[keystale] read-path stale ${oldest_age}s (>= ${KEY_STALE_ALERT_SEC}s) — re-alert suppressed (last ${last_alert_age}s ago < ${KEY_STALE_REALERT_SEC}s)"
       [ "$DRY_RUN" = "1" ] && echo "KEYSTALE_DECISION=SUPPRESSED ageSec=$oldest_age thresholdSec=$KEY_STALE_ALERT_SEC"
       return 0
     fi
     [ "$DRY_RUN" = "1" ] && echo "KEYSTALE_DECISION=ALERT ageSec=$oldest_age thresholdSec=$KEY_STALE_ALERT_SEC"
-    if send_alert "$(printf '⚠️ WATCHDOG BLIND-RISK: Trigger read-path stale %s (op key-refresh failing) — prod visibility degrading, fix the op-fetch before a key rotation blinds it. This is NOT a prod-stall page.' "$agelabel")"; then
+    if send_alert "$(printf '🟠 MONITOR DEGRADED — Trigger.dev checks may become stale\n\nWhat this means: Solo2 has not refreshed the read key used to inspect Trigger.dev for %s. The automations are not known to be down.\nImpact: If the key rotates before refresh recovers, this watchdog may stop seeing current production runs.\nWhat to do: No immediate action. The watchdog will retry automatically. If this persists for 6 hours, ask Codex to repair the 1Password key refresh on Solo2.' "$agelabel")"; then
       [ "$DRY_RUN" = "1" ] || { : > "$marker" 2>/dev/null && chmod 600 "$marker" 2>/dev/null; }
       log "[keystale] BLIND-RISK alert fired (read-path stale ${oldest_age}s, oldest keycache mtime)"
     else
@@ -481,7 +488,11 @@ check_key_refresh_staleness() {
   # succeeds): the marker is the loop condition, so clearing it guarantees at most one recovery send.
   # A never-degraded steady state has no marker and stays SILENT.
   if [ -f "$marker" ]; then
-    send_alert "🟢 WATCHDOG read-path RECOVERED — Trigger key refresh healthy again (oldest cache $(( oldest_age / 60 ))m < $(( KEY_STALE_ALERT_SEC / 60 ))m). Blind-risk cleared." || true
+    send_alert "🟢 TRIGGER.DEV MONITOR RECOVERED — production visibility is current again
+
+What changed: Solo2 refreshed the Trigger.dev read key successfully.
+Impact: The watchdog can see current production runs again.
+What to do: Nothing." || true
     [ "$DRY_RUN" = "1" ] || rm -f "$marker" 2>/dev/null
     log "[keystale] read-path RECOVERED (oldest keycache ${oldest_age}s < ${KEY_STALE_ALERT_SEC}s) — sent recovery + cleared blind-risk marker"
     [ "$DRY_RUN" = "1" ] && echo "KEYSTALE_DECISION=RECOVERED ageSec=$oldest_age thresholdSec=$KEY_STALE_ALERT_SEC"
@@ -594,12 +605,17 @@ for spec in "${PROJECTS[@]}"; do
 done
 
 if [ "${#NEWLY[@]}" -gt 0 ]; then
-  if send_alert "$(printf '🔴 Hub automations STALLED in Trigger.dev prod: %s. No executing runs + an aging queued backlog (>%dm) + nothing completing. Context %s.%b\nThe watchdog will report recovery.' "${NEWLY[*]}" "$STALL_MIN" "$STATUS_CTX" "$CONTEXT_LINES")"; then
+  if send_alert "$(printf '🔴 HUB AUTOMATIONS STALLED — Trigger.dev production work is not completing\n\nWhat this means: %s has no executing runs, queued work older than %d minutes, and no recent completions.\nImpact: Hub automations in the affected project may be delayed or stopped.\nWhat to do: Open Trigger.dev production and check the affected project queue. The watchdog will keep checking and send one recovery.\nContext: %s.%b' "${NEWLY[*]}" "$STALL_MIN" "$STATUS_CTX" "$CONTEXT_LINES")"; then
     [ "$DRY_RUN" = "1" ] || for l in "${NEWLY[@]}"; do mt="$(mktemp "$STATE_DIR/.m-XXXXXX")"; "$JQ" -n --arg s "$(ts)" --arg ll "$(ts)" '{since:$s,last:$ll}' > "$mt" && mv -f "$mt" "$STATE_DIR/incident.$l.json"; rm -f "$STATE_DIR/pending.$l"; done
   fi
 fi
 if [ "${#RECOVERED[@]}" -gt 0 ]; then
-  if send_alert "🟢 Hub automations RECOVERED in Trigger.dev prod: ${RECOVERED[*]} — executing again. $STATUS_CTX."; then
+  if send_alert "🟢 HUB AUTOMATIONS RECOVERED — Trigger.dev production is executing again
+
+What changed: ${RECOVERED[*]} resumed processing.
+Impact: Queued Hub automation work can complete again.
+What to do: Nothing.
+Context: $STATUS_CTX."; then
     [ "$DRY_RUN" = "1" ] || for l in "${RECOVERED[@]}"; do rm -f "$STATE_DIR/incident.$l.json"; done
     log "recovery sent: ${RECOVERED[*]}"
   else

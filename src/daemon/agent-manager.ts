@@ -625,7 +625,7 @@ export class AgentManager {
         if (chatId) {
           const alertApi = new TelegramAPI(botToken);
           alertApi.sendMessage(chatId,
-            `⚠️ WATCHDOG: ${name} has BOT_TOKEN but ALLOWED_USER is missing or malformed in .env. Telegram is DISABLED for this agent. Fix ALLOWED_USER and restart.`,
+            `🔴 CORTEX TELEGRAM DISABLED — ${name} cannot accept messages\n\nWhat this means: The approved-user setting is missing or invalid, so Cortex disabled Telegram for safety.\nImpact: Messages sent to ${name} will not be processed.\nWhat to do: Ask Codex to repair ALLOWED_USER on Solo2 and restart ${name}.`,
             undefined,
             { messageThreadId: topicId },
           ).catch(() => {});
@@ -666,11 +666,11 @@ export class AgentManager {
       agentProcess.onStatusChanged((status) => {
         if (status.status === 'crashed') {
           const crashNum = status.crashCount ?? '?';
-          tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`, undefined, { messageThreadId: tgThread }).catch(() => {});
+          tgApi.sendMessage(tgChatId, `🟠 CORTEX RESTARTING — ${name} crashed\n\nWhat this means: The agent process ended unexpectedly and Cortex is restarting it automatically.\nImpact: The current reply may have been interrupted.\nWhat to do: Wait one minute for the recovery message. Crash count: ${crashNum}.`, undefined, { messageThreadId: tgThread }).catch(() => {});
         } else if (status.status === 'halted') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} HALTED — exceeded crash limit. Restart manually with: cortextos start ${name}`, undefined, { messageThreadId: tgThread }).catch(() => {});
+          tgApi.sendMessage(tgChatId, `🔴 CORTEX STOPPED — ${name} exceeded its crash limit\n\nWhat this means: Automatic restarts were stopped to prevent a crash loop.\nImpact: ${name} is offline and will not answer.\nWhat to do: Ask Codex to diagnose and restart ${name}.`, undefined, { messageThreadId: tgThread }).catch(() => {});
         } else if (status.status === 'running' && prevStatus === 'crashed') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} recovered and is back online`, undefined, { messageThreadId: tgThread }).catch(() => {});
+          tgApi.sendMessage(tgChatId, `🟢 CORTEX RECOVERED — ${name} is back online\n\nImpact: New messages should work normally.\nWhat to do: Resend anything that was interrupted during the crash.`, undefined, { messageThreadId: tgThread }).catch(() => {});
         }
         prevStatus = status.status;
       });
@@ -758,7 +758,7 @@ export class AgentManager {
                 const lastAlert = entry.telegramLastRejectAlertAt ?? 0;
                 if (now - lastAlert > REJECT_ALERT_COOLDOWN_MS) {
                   entry.telegramLastRejectAlertAt = now;
-                  const alertText = `⚠️ WATCHDOG: ${name} rejected ${entry.telegramRejectCount} consecutive Telegram messages (ALLOWED_USER gate). Last from_id: ${fromId ?? 'unknown'}. Verify ALLOWED_USER in .env matches expected users, or this may be unsolicited contact.`;
+                  const alertText = `🟠 TELEGRAM MESSAGES BLOCKED — ${name} rejected ${entry.telegramRejectCount} messages\n\nWhat this means: The messages came from a Telegram account not approved for this bot.\nImpact: Cortex stayed secure; those messages were not processed.\nWhat to do: If they were yours, ask Codex to verify ALLOWED_USER. Otherwise, no action. Sender ID: ${fromId ?? 'unknown'}.`;
                   log(alertText);
                   if (telegramApi && chatId) {
                     telegramApi.sendMessage(chatId, alertText, undefined, { messageThreadId: topicId }).catch(() => {});
@@ -995,7 +995,7 @@ export class AgentManager {
                 const lastAlert = entry.telegramLastRejectAlertAt ?? 0;
                 if (now - lastAlert > REJECT_ALERT_COOLDOWN_MS) {
                   entry.telegramLastRejectAlertAt = now;
-                  const alertText = `⚠️ WATCHDOG: ${name} rejected ${entry.telegramRejectCount} consecutive Telegram interactions (ALLOWED_USER gate). Verify ALLOWED_USER in .env matches expected users, or this may be unsolicited contact.`;
+                  const alertText = `🟠 TELEGRAM INTERACTIONS BLOCKED — ${name} rejected ${entry.telegramRejectCount} interactions\n\nWhat this means: They came from a Telegram account not approved for this bot.\nImpact: Cortex stayed secure; those interactions were ignored.\nWhat to do: If they were yours, ask Codex to verify ALLOWED_USER. Otherwise, no action.`;
                   log(alertText);
                   if (telegramApi && chatId) {
                     telegramApi.sendMessage(chatId, alertText, undefined, { messageThreadId: topicId }).catch(() => {});
@@ -1081,7 +1081,7 @@ export class AgentManager {
         if (telegramApi && chatId) {
           telegramApi.sendMessage(
             String(chatId),
-            `${name}: Telegram poller wrapper crashed. Inbound messages may be dropped until restart. Check daemon log.`,
+            `🔴 CORTEX TELEGRAM INPUT FAILED — ${name} may not receive messages\n\nWhat this means: The Telegram listener crashed.\nImpact: New messages may be missed until Cortex restarts the listener.\nWhat to do: Ask Codex to check the Cortex daemon log and restart ${name} if it does not recover.`,
             undefined,
             { messageThreadId: topicId },
           ).catch(() => { /* swallow alert failure; original log already captured */ });
@@ -1365,7 +1365,7 @@ export class AgentManager {
     }
     const opApi = new TelegramAPI(r.creds.botToken);
     opApi
-      .sendMessage(r.creds.chatId, `🔴 ${text}`)
+      .sendMessage(r.creds.chatId, `🔴 CORTEX TELEGRAM OFFLINE — ${name} cannot reliably receive messages\n\nWhat this means: Cortex's independent liveness check failed.\nImpact: Messages to ${name} may not be seen or answered.\nWhat to do: Ask Codex to repair Telegram input on Solo2.\nTechnical detail: ${text}`)
       .catch(e => console.error(`[liveness] alert send failed: ${e}`));
   }
 

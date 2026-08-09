@@ -110,7 +110,7 @@ const writeHb = (st: string, ageSec: number, content = '') => {
   const t = nowSec() - ageSec;
   utimesSync(hb(st), t, t);
 };
-const STALE_MSG = '🔴 ops-triage drainer heartbeat STALE';
+const STALE_MSG = '🟠 CORTEX OPERATIONS DELAYED';
 
 // Recursively lists every FILE (not directory) under dir. Used to prove a curl-config
 // injection wrote no stray file anywhere it could plausibly land — mirrors the identical
@@ -131,7 +131,7 @@ describe('ops-drain-staleness single-run guard', () => {
     const st = newState();
     execFileSync('bash', [
       '-c',
-      'exec 8>"$OPS_DRAIN_STATE_DIR/staleness.lock"; flock -n 8; exec bash "$TEST_SCRIPT"',
+      'if command -v flock >/dev/null; then exec 8>"$OPS_DRAIN_STATE_DIR/staleness.lock"; flock -n 8; exec bash "$TEST_SCRIPT"; else lockf -t 0 "$OPS_DRAIN_STATE_DIR/staleness.lock" env OPS_DRAIN_LOCK_HELD=0 bash "$TEST_SCRIPT"; fi',
     ], {
       env: {
         ...process.env,
@@ -288,7 +288,8 @@ describe('ops-drain-staleness security boundary (mtime, not bytes)', () => {
 
   it('BOUNDARY (static): the script stats the heartbeat mtime and never reads its bytes via any command', () => {
     const src = readFileSync(SCRIPT, 'utf-8');
-    expect(src).toContain('stat -c %Y "$HB"'); // mtime only — the one legitimate touch
+    expect(src).toContain('stat -f %m "$HB"'); // BSD/macOS mtime-only path
+    expect(src).toContain('stat -c %Y "$HB"'); // GNU/Linux fallback
     expect(src).not.toMatch(/<\s*"\$HB"/);      // never redirects the file in
     // Broadened past cat/`<` alone: any command that can read the heartbeat's CONTENT
     // (head/tail/sed/awk/read/mapfile, in addition to cat) applied to "$HB" on the same

@@ -90,10 +90,16 @@ mkdir -p "$STATE" "$QDIR" "$IDCACHE" 2>/dev/null
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "[$(ts)] $*" >> "$LOG"; }
 
-if [ "$DRY_RUN" != "1" ]; then
-  command -v flock >/dev/null 2>&1 || { log "FATAL: flock not found"; exit 0; }
-  exec 9>"$STATE/drain.lock"
-  flock -n 9 || { log "SKIP — prior drainer tick still running"; exit 0; }
+if [ "$DRY_RUN" != "1" ] && [ "${OPS_DRAIN_LOCK_HELD:-0}" != "1" ]; then
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$STATE/drain.lock"
+    flock -n 9 || { log "SKIP — prior drainer tick still running"; exit 0; }
+  elif command -v lockf >/dev/null 2>&1; then
+    OPS_DRAIN_LOCK_HELD=1 lockf -t 0 "$STATE/drain.lock" "$0" "$@" && exit 0
+    log "SKIP — prior drainer tick still running"; exit 0
+  else
+    log "FATAL: neither flock nor lockf found"; exit 0
+  fi
 fi
 
 if ! command -v "$JQ" >/dev/null 2>&1; then log "FATAL: jq not found ($JQ)"; exit 0; fi
@@ -115,7 +121,11 @@ send_alert() {
   # directive (`output = /path` = arbitrary local write, a second `url =` = a second
   # request) and a double quote would terminate the quoted value early. Sanitize once, at
   # the single choke point, before either transport sees it.
-  local msg; msg="$(san "${1:-}" | tr -d '"')"
+  local raw msg; raw="$(san "${1:-}" | tr -d '"')"
+  case "$raw" in
+    🟢*) msg="🟢 CORTEX OPERATIONS RECOVERED | Meaning: the evidence-routing safety check is healthy again. | Impact: queued operational evidence can move normally. | Action: none. | Detail: $raw" ;;
+    *) msg="🟠 CORTEX OPERATIONS NEEDS ATTENTION | Meaning: the evidence router stopped or refused part of its work to protect data. | Impact: automation failure evidence may wait before reaching the developer queue; production work is not necessarily down. | Action: ask Codex to inspect the ops-triage drainer on Solo2. | Detail: $raw" ;;
+  esac
   if [ "$DRY_RUN" = "1" ]; then log "DRY_RUN alert: $msg"; return 0; fi
   local args=("$CHAT_ID" "$msg" --plain-text)
   [ -n "$THREAD_ID" ] && args+=(--thread "$THREAD_ID")
@@ -180,7 +190,7 @@ clear_cond() {
 # them, and timezone forms can differ — so every comparison converts to epoch seconds
 # first. A raw lexicographic compare on mixed forms inverts.
 #
-# SECURITY (review BLOCKER): `date -d` is a FREE-FORM parser. It happily accepts "now",
+# SECURITY (review BLOCKER): timestamp parsers accept FREE-FORM inputs such as "now",
 # "tomorrow", "+1 day" — relative expressions that are re-evaluated on every tick and are
 # therefore ALWAYS newer than any fixed close time. Feeding it the untrusted
 # `.newestFailureAt` inverted the whole settled timestamp gate: an item saying "now"
@@ -192,7 +202,7 @@ epoch() {
   local t="${1:-}" e now
   if [ -z "$t" ] || [ "$t" = "null" ]; then echo ""; return; fi
   if ! [[ "$t" =~ $ISO_INSTANT_RE ]]; then echo ""; return; fi
-  e="$(date -u -d "$t" +%s 2>/dev/null)" || { echo ""; return; }
+  e="$(node -e 'const n=Date.parse(process.argv[1]); if(Number.isFinite(n)) process.stdout.write(String(Math.floor(n/1000)))' "$t" 2>/dev/null)" || { echo ""; return; }
   case "$e" in ''|*[!0-9]*) echo ""; return ;; esac
   now="$(date -u +%s)"
   if [ "$e" -gt $(( now + MAX_FUTURE_SKEW )) ]; then echo ""; return; fi
@@ -535,7 +545,7 @@ for file in "$OUTBOX_DIR"/*.json; do
   fi
 
   # 3c-bis. TIMESTAMP CONTRACT. epoch() rejects anything that is not a strict ISO-8601
-  # instant (so `date -d`'s relative forms — "now", "tomorrow", "+1 day" — never reach it)
+  # instant (so relative forms — "now", "tomorrow", "+1 day" — never reach it)
   # and anything implausibly future-dated. An invalid timestamp SKIPS, never drains: the
   # whole terminal-carrier gate is a comparison against this value, so a value we cannot
   # trust cannot be allowed to win that comparison.

@@ -12,7 +12,7 @@
 #
 # THE SECURITY BOUNDARY (why the reviewer attacks this): the page TARGET (chat id / token)
 # comes ONLY from the solo agent .env / pinned env — NEVER from any file content. This
-# watcher reads the heartbeat's MTIME ONLY (`stat -c %Y`), never its bytes. It does NOT
+# watcher reads the heartbeat's MTIME ONLY (`stat`), never its bytes. It does NOT
 # cat / read / parse the heartbeat file. So there is no untrusted-input path that could
 # steer the alert anywhere: the message text is fixed, the target is env-resolved. A
 # monitoring alert that can be redirected is an external-write hazard; a mtime-only stat
@@ -60,10 +60,16 @@ mkdir -p "$STATE" 2>/dev/null
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "[$(ts)] $*" >> "$LOG"; }
 
-if [ "$DRY_RUN" != "1" ]; then
-  command -v flock >/dev/null 2>&1 || { log "FATAL: flock not found"; exit 0; }
-  exec 9>"$STATE/staleness.lock"
-  flock -n 9 || { log "SKIP — prior staleness tick still running"; exit 0; }
+if [ "$DRY_RUN" != "1" ] && [ "${OPS_DRAIN_LOCK_HELD:-0}" != "1" ]; then
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$STATE/staleness.lock"
+    flock -n 9 || { log "SKIP — prior staleness tick still running"; exit 0; }
+  elif command -v lockf >/dev/null 2>&1; then
+    OPS_DRAIN_LOCK_HELD=1 lockf -t 0 "$STATE/staleness.lock" "$0" "$@" && exit 0
+    log "SKIP — prior staleness tick still running"; exit 0
+  else
+    log "FATAL: neither flock nor lockf found"; exit 0
+  fi
 fi
 
 CORTEXTOS="${CORTEXTOS_BIN:-/usr/bin/cortextos}"
@@ -92,7 +98,11 @@ send_alert() {
   # is built only from a fixed string plus $STALE_MIN/$STATE (both env-derived, not file-
   # derived) so this is not exploitable yet — the point is that a future edit letting a
   # file-derived value into the message can't become a curl-config injection by surprise.
-  local msg; msg="$(printf '%s' "${1:-}" | tr -d '[:cntrl:]"')"
+  local raw msg; raw="$(printf '%s' "${1:-}" | tr -d '[:cntrl:]"')"
+  case "$raw" in
+    🟢*) msg="🟢 CORTEX OPERATIONS RECOVERED | Meaning: the evidence router heartbeat is current again. | Impact: operational evidence is moving normally. | Action: none. | Detail: $raw" ;;
+    *) msg="🟠 CORTEX OPERATIONS DELAYED | Meaning: the evidence router has stopped checking in. | Impact: automation failure evidence may not reach the developer queue until it recovers; this does not mean production is down. | Action: ask Codex to inspect the ops-triage drainer on Solo2. | Detail: $raw" ;;
+  esac
   if [ "$DRY_RUN" = "1" ]; then log "DRY_RUN alert: $msg"; return 0; fi
   local args=("$CHAT_ID" "$msg" --plain-text)
   [ -n "$THREAD_ID" ] && args+=(--thread "$THREAD_ID")
@@ -154,7 +164,7 @@ clear_cond() {
 }
 
 # --- staleness check: MTIME ONLY, never the file's bytes ----------------------
-# `stat -c %Y "$HB"` reads inode metadata (mtime) only. There is no code path that opens
+# `stat "$HB"` reads inode metadata (mtime) only. There is no code path that opens
 # the heartbeat's contents, so nothing written into the file — by the drainer or by anyone
 # who can write $STATE — can influence the alert or its target.
 STALE_MIN=$(( STALE_SEC / 60 ))
@@ -164,7 +174,7 @@ if [ ! -f "$HB" ]; then
   reason="heartbeat ABSENT ($HB)"
   stale=1
 else
-  mtime="$(stat -c %Y "$HB" 2>/dev/null)"
+  mtime="$(stat -f %m "$HB" 2>/dev/null || stat -c %Y "$HB" 2>/dev/null)"
   case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac   # unreadable mtime => treat as stale
   age=$(( now - mtime ))
   if [ "$age" -gt "$STALE_SEC" ]; then

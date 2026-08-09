@@ -133,10 +133,11 @@ function sendCrashLoopAlertBestEffort(
     return false;
   }
   const message =
-    `🚨 CRITICAL: cortextos daemon is crash-looping\n` +
-    `${crashCount} crashes in 15 minutes\n` +
-    `Last error: ${errStr.slice(0, 500)}\n` +
-    `Next alert in 30 min if the pattern continues.`;
+    `🔴 CORTEX SERVICE UNSTABLE — the main daemon is crash-looping\n\n` +
+    `What this means: Cortex crashed ${crashCount} times in 15 minutes and may not stay online.\n` +
+    `Impact: Agents may stop responding or repeatedly lose their current work.\n` +
+    `What to do: Ask Codex to diagnose the Cortex daemon on Solo2. A repeat alert will wait 30 minutes.\n` +
+    `Technical detail: ${errStr.slice(0, 500)}`;
   try {
     const r = spawnSync('curl', [
       '-s', '--max-time', '3',

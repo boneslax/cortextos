@@ -421,15 +421,15 @@ async function main(): Promise<void> {
       // itself add operator-level urgency; this is the per-agent variant
       // that replaces the misleading "🚨 agent crashed" message users
       // were getting on every daemon respawn.
-      message = `🚨 ${agentName} — daemon crashed, session was interrupted. Resuming.`;
-      if (reason) message += `\nCrash time: ${reason}`;
+      message = `🟠 CORTEX RESTARTING — ${agentName}'s session was interrupted\n\nWhat this means: The main Cortex service crashed and is restarting the agent.\nImpact: The current reply may have been interrupted.\nWhat to do: Wait one minute, then resend the message if there is no response.`;
+      if (reason) message += `\nTechnical detail: ${reason}`;
       break;
     case 'rate-limited':
-      message = `⏳ ${agentName} paused — Anthropic rate limit hit. Will resume when the window resets.`;
+      message = `🟠 CORTEX PAUSED — ${agentName} hit Anthropic's rate limit\n\nWhat this means: Anthropic temporarily stopped accepting requests.\nImpact: Replies are delayed, but Cortex is still running.\nWhat to do: No action; ${agentName} will resume when the limit resets.`;
       break;
     case 'crash':
-      message = `🚨 CRASH: ${agentName} died unexpectedly.`;
-      if (crashCount > 0) message += ` Crashes today: ${crashCount}.`;
+      message = `🔴 CORTEX AGENT CRASHED — ${agentName} stopped unexpectedly\n\nWhat this means: The agent process ended outside a planned restart.\nImpact: ${agentName} may not answer until Cortex restarts it.\nWhat to do: Wait for a recovery message; if none arrives within one minute, ask Codex to diagnose it.`;
+      if (crashCount > 0) message += `\nCrashes today: ${crashCount}.`;
       if (lastTask) message += `\nLast status: ${lastTask}`;
       break;
   }
