@@ -251,6 +251,18 @@ export class AgentPTY {
       args.push('--model', this.config.model);
     }
 
+    if (this.config.effort) {
+      const validEfforts = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+      if (validEfforts.has(this.config.effort)) {
+        args.push('--effort', this.config.effort);
+      } else {
+        console.warn(
+          `[agent-pty] ${this.env.agentName}: effort must be low, medium, high, xhigh, or max ` +
+          `(got ${JSON.stringify(this.config.effort)}); omitting --effort.`,
+        );
+      }
+    }
+
     // Local override pattern (feat #20): concatenate {agentDir}/local/*.md files
     // and append as system prompt. The local/ dir is gitignored so users can customize
     // agent behavior without merge conflicts on framework updates.

@@ -199,6 +199,11 @@ export interface AgentConfig {
   crash_window?: { seconds: number; max_crashes?: number };
   model?: string;
   /**
+   * Claude Code reasoning effort for this agent. Routine agents normally use
+   * medium; planning and debugging agents can opt into high.
+   */
+  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  /**
    * Whether to launch Claude Code with `--dangerously-skip-permissions`.
    * Defaults to true (back-compat: agents run unattended). Set to false to keep
    * Claude Code's permission system engaged so the PermissionRequest hook
