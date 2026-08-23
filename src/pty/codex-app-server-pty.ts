@@ -421,11 +421,7 @@ export class CodexAppServerPTY {
       }
 
       const spawnFn = this._spawnFn!;
-      const pty = spawnFn('codex', [
-        'app-server',
-        '--enable', 'goals',
-        '--listen', this._socketListenArg,
-      ], {
+      const pty = spawnFn('codex', this.buildAppServerArgs(), {
         name: 'xterm-256color',
         cols: 200,
         rows: 50,
@@ -450,6 +446,26 @@ export class CodexAppServerPTY {
 
       this.waitForSocket().then(resolve, reject);
     });
+  }
+
+  private buildAppServerArgs(): string[] {
+    const args = [
+      'app-server',
+      '--enable', 'goals',
+      '--listen', this._socketListenArg,
+    ];
+
+    if (this._config.model) {
+      args.push('--config', `model=${JSON.stringify(this._config.model)}`);
+    }
+
+    // Codex supports low/medium/high/xhigh. AgentConfig also accepts `max`
+    // for Claude Code, so do not pass that Claude-only value to app-server.
+    if (this._config.effort && this._config.effort !== 'max') {
+      args.push('--config', `model_reasoning_effort=${JSON.stringify(this._config.effort)}`);
+    }
+
+    return args;
   }
 
   private async waitForSocket(timeoutMs = 10000): Promise<void> {
@@ -938,7 +954,10 @@ export class CodexAppServerPTY {
   private buildEnv(): Record<string, string> {
     const env: Record<string, string> = {};
 
-    const keepVars = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR'];
+    const keepVars = [
+      'PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR',
+      'CODEX_HOME', 'CODEX_OSS_BASE_URL', 'OLLAMA_HOST',
+    ];
     for (const key of keepVars) {
       if (process.env[key]) env[key] = process.env[key]!;
     }
