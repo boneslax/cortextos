@@ -119,13 +119,15 @@ describe('CodexAppServerPTY socket path policy', () => {
 describe('CodexAppServerPTY model configuration', () => {
   it('passes the configured model and reasoning effort to app-server', () => {
     const pty = new CodexAppServerPTY(mockEnv, {
-      model: 'qwen3.8:27b-mlx',
+      model: 'qwen3.5:35b',
       effort: 'high',
     });
     const args = (pty as unknown as { buildAppServerArgs(): string[] }).buildAppServerArgs();
 
-    expect(args).toContain('model="qwen3.8:27b-mlx"');
+    expect(args).toContain('model="qwen3.5:35b"');
     expect(args).toContain('model_reasoning_effort="high"');
+    expect(args).toContain('browser_use');
+    expect(args).toContain('plugins');
   });
 
   it('does not pass Claude-only max effort to app-server', () => {
@@ -852,30 +854,30 @@ describe('CodexAppServerPTY thread lifecycle', () => {
     });
   });
 
-  it('resumes the persisted thread in fresh mode when state exists', async () => {
+  it('ignores persisted state and starts a new thread in fresh mode', async () => {
     fsMocks.existsSync.mockReturnValue(true);
     fsMocks.readFileSync.mockReturnValue(JSON.stringify({
       threadId: 'persisted-fresh-thread',
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       updatedAt: '2026-05-07T00:00:00Z',
     }));
-    requestMock.mockResolvedValue({ result: { thread: { id: 'persisted-fresh-thread' } } });
+    requestMock.mockResolvedValue({ result: { thread: { id: 'new-fresh-thread' } } });
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
 
-    expect(requestMock).toHaveBeenCalledWith('thread/resume', {
-      threadId: 'persisted-fresh-thread',
+    expect(requestMock).toHaveBeenCalledWith('thread/start', {
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
       config: { features: { goals: true } },
-      excludeTurns: true,
+      sessionStartSource: 'startup',
+      experimentalRawEvents: false,
       persistExtendedHistory: true,
     });
     expect(requestMock).not.toHaveBeenCalledWith(
-      'thread/start',
+      'thread/resume',
       expect.anything(),
     );
   });

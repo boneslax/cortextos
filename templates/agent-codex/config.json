@@ -2,7 +2,7 @@
   "agent_name": "{{agent_name}}",
   "enabled": true,
   "runtime": "codex-app-server",
-  "model": "qwen3.8:27b-mlx",
+  "model": "qwen3.5:35b",
   "effort": "medium",
   "startup_delay": 0,
   "max_session_seconds": 255600,

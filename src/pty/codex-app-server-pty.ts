@@ -455,6 +455,37 @@ export class CodexAppServerPTY {
       '--listen', this._socketListenArg,
     ];
 
+    // A persistent CortextOS agent needs shell/filesystem plus its configured
+    // MCP servers. Desktop-only capabilities add large tool schemas and severe
+    // prompt-evaluation latency for local models, so keep this runtime lean.
+    const disabledFeatures = [
+      'apps',
+      'auth_elicitation',
+      'browser_use',
+      'browser_use_external',
+      'browser_use_full_cdp_access',
+      'code_mode_host',
+      'computer_use',
+      'guardian_approval',
+      'image_generation',
+      'in_app_browser',
+      'in_app_chat',
+      'in_app_dictation',
+      'in_app_updates',
+      'multi_agent',
+      'plugin_sharing',
+      'plugins',
+      'remote_plugin',
+      'skill_mcp_dependency_install',
+      'skill_search',
+      'tool_call_mcp_elicitation',
+      'tool_suggest',
+      'workspace_dependencies',
+    ];
+    for (const feature of disabledFeatures) {
+      args.push('--disable', feature);
+    }
+
     if (this._config.model) {
       args.push('--config', `model=${JSON.stringify(this._config.model)}`);
     }
@@ -496,7 +527,7 @@ export class CodexAppServerPTY {
   }
 
   private async startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> {
-    const persisted = this.readThreadState();
+    const persisted = mode === 'continue' ? this.readThreadState() : null;
     if (persisted) {
       try {
         const resumed = await this.request<ThreadResponse>('thread/resume', {
