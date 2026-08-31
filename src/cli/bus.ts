@@ -1147,6 +1147,32 @@ busCommand
       const emojis = emoji === '' ? [] : [emoji];
       await api.setMessageReaction(chatId, messageId, emojis);
       console.log(emojis.length > 0 ? `Reacted ${emoji}` : 'Reaction cleared');
+
+      // Record the reaction as outbound. A reaction IS the agent's reply — the
+      // agent templates explicitly promote it as a "single emoji ack, no verbal
+      // noise" — but this path used to write nothing to outbound-messages.jsonl,
+      // so an emoji-only answer left the conversation looking unanswered.
+      //
+      // That is not merely cosmetic. The vault-memory-health probe decides whether
+      // Solo is wedged by comparing the newest inbound timestamp against the newest
+      // outbound one, so a thumbs-up reply would have read as silence and paged a
+      // false "running but not answering" alert. Found 2026-08-31 while verifying
+      // that check. Anything that answers a human has to leave a trace here.
+      //
+      // Clearing a reaction is a retraction, not a reply, so it logs nothing. The
+      // target message's id is recorded because a reaction creates no id of its own.
+      if (emojis.length > 0 && env.agentName && env.ctxRoot) {
+        logOutboundMessage(env.ctxRoot, env.agentName, chatId, emoji, messageId, {
+          parseMode: 'none',
+        });
+        // Deliberately no cacheLastSent: an emoji is not a message body worth
+        // deduping future sends against.
+        try {
+          const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+          logEvent(paths, env.agentName, env.org, 'message', 'telegram_reacted', 'info',
+            JSON.stringify({ chat_id: chatId, message_id: messageId, emoji }));
+        } catch { /* non-fatal */ }
+      }
     } catch (err: any) {
       console.error(`Failed to react: ${err.message || err}`);
       process.exit(1);

@@ -50,6 +50,69 @@ describe('Telegram Logging', () => {
     });
   });
 
+  describe('emoji-reaction acks count as answering', () => {
+    // REGRESSION, 2026-08-31. `bus react-telegram` set the Telegram reaction but
+    // never called logOutboundMessage, so an emoji-only reply left nothing in
+    // outbound-messages.jsonl. The agent templates promote exactly that reply
+    // ("single emoji ack, no verbal noise"), and the vault-memory-health probe
+    // decides Solo is wedged by comparing the newest inbound timestamp against the
+    // newest outbound one — so a thumbs-up read as silence and would have paged a
+    // false "running but not answering" alert.
+
+    /** Mirrors the probe's jq: strip millis on BOTH sides, compare newest per chat. */
+    const newestEpoch = (path: string, chat: string): number => {
+      let content = '';
+      try { content = readFileSync(path, 'utf-8'); } catch { return 0; }
+      const stamps = content.split('\n').filter(Boolean).flatMap((line) => {
+        try {
+          const row = JSON.parse(line);
+          if (String(row.chat_id) !== chat) return [];
+          return [Date.parse(String(row.timestamp).replace(/\.\d+Z$/, 'Z')) / 1000];
+        } catch { return []; }
+      });
+      return stamps.length ? Math.max(...stamps) : 0;
+    };
+
+    it('leaves an outbound trace the wedge check can see', () => {
+      const inbound = join(testDir, 'logs', 'bot1', 'inbound-messages.jsonl');
+      const outbound = join(testDir, 'logs', 'bot1', 'outbound-messages.jsonl');
+
+      logInboundMessage(testDir, 'bot1', {
+        message_id: 5091,
+        chat: { id: 111 },
+        from: { id: 111, first_name: 'B' },
+        text: 'you there?',
+      } as unknown as TelegramMessage);
+
+      // Before the ack the chat genuinely looks unanswered.
+      expect(newestEpoch(outbound, '111')).toBe(0);
+
+      // The ack: emoji as the text, target message id, no new id of its own.
+      logOutboundMessage(testDir, 'bot1', '111', '👍', 5091, { parseMode: 'none' });
+
+      const entry = JSON.parse(readFileSync(outbound, 'utf-8').trim());
+      expect(entry.text).toBe('👍');
+      expect(entry.chat_id).toBe('111');
+      expect(entry.message_id).toBe(5091);
+
+      // The invariant: newest outbound is not older than newest inbound, so the
+      // probe reads the chat as answered. Equality is the expected case — both
+      // sides have millis stripped, so an ack inside the same second ties.
+      expect(newestEpoch(outbound, '111')).toBeGreaterThanOrEqual(newestEpoch(inbound, '111'));
+    });
+
+    it('does not confuse a different chat', () => {
+      logInboundMessage(testDir, 'bot1', {
+        message_id: 1, chat: { id: 222 }, from: { id: 222, first_name: 'B' }, text: 'hi',
+      } as unknown as TelegramMessage);
+      logOutboundMessage(testDir, 'bot1', '111', '👍', 1, { parseMode: 'none' });
+
+      const outbound = join(testDir, 'logs', 'bot1', 'outbound-messages.jsonl');
+      // An ack in chat 111 must not mark chat 222 answered.
+      expect(newestEpoch(outbound, '222')).toBe(0);
+    });
+  });
+
   describe('logInboundMessage', () => {
     it('appends with archived_at and agent', () => {
       const raw = { message_id: 42, text: 'hi', from: { id: 1 } };
