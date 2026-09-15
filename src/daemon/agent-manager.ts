@@ -8,7 +8,7 @@ import { CronScheduler } from './cron-scheduler.js';
 import { migrateCronsForAgent } from './cron-migration.js';
 import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
-import { TelegramPoller } from '../telegram/poller.js';
+import { TelegramPoller, pollerIsStale } from '../telegram/poller.js';
 import { TelegramConnector, NullConnector } from '../connectors/index.js';
 import type { MessageConnector } from '../connectors/index.js';
 import { SlackSocketListener } from './slack-socket-listener.js';
@@ -23,8 +23,21 @@ import { stripBom } from '../utils/strip-bom.js';
 import { BuzzRelayClient, BuzzDispatcher, loadBuzzConfig, type NostrEvent } from '../buzz/index.js';
 import { computeDormancy, parseHeartbeatIntervalMs } from '../utils/dormancy.js';
 import { CRONS_DIRECTORY, CRONS_FILENAME } from '../bus/crons-schema.js';
+import { appendDeadLetter } from '../telegram/dead-letter.js';
+import { classifyMembershipProbe, type ChatType } from '../telegram/membership-probe.js';
+import { stepProbeStreak, INITIAL_PROBE_STREAK, type ProbeStreakState } from '../telegram/probe-streak.js';
+import { resolveOperatorCreds } from './operator-channel.js';
+import { resolvePendingCallback } from '../telegram/pending-callback.js';
 
 type LogFn = (msg: string) => void;
+
+// D0/D1 liveness (PLAN-v3 §4b/§5). A healthy poll loop records a successful
+// getUpdates every ~2s (long-poll ≤1s + 1s sleep), so 60s of silence means the
+// loop is wedged, not merely between cycles. The membership probe runs on the
+// same cadence with a per-agent random phase so the fleet never probes in
+// lockstep (avoids synchronized 429s).
+const D0_STALE_MS = 60_000;
+const LIVENESS_PROBE_INTERVAL_MS = 60_000;
 
 /**
  * Pure decision for routing an inline-button callback to a checker, given the
@@ -99,6 +112,18 @@ type AgentEntry = {
   slackListener?: SlackSocketListener;
   telegramRejectCount?: number;
   telegramLastRejectAlertAt?: number;
+  /** Forum-topic routing: this agent's own group chat + (optional) topic id. */
+  topicId?: number;
+  chatId?: string;
+  // D0/D1 liveness state (PLAN-v3). `api` is the agent's own Telegram client
+  // (for the probe); the detectors alert via the OPERATOR channel, never this.
+  api?: TelegramAPI;
+  livenessTimer?: ReturnType<typeof setTimeout>;
+  pollerStartedAt?: number;
+  probeStreak?: ProbeStreakState;
+  chatType?: string;
+  canReadAllGroupMessages?: boolean;
+  canReadFetched?: boolean;
   /**
    * Round 3 (F5/F2): set by stopAgent the moment a teardown of THIS entry begins.
    *
@@ -144,6 +169,27 @@ export class AgentManager {
    * connection.
    */
   private buzzClients: Map<string, { client: BuzzRelayClient; dispatcher: BuzzDispatcher; started: boolean }> = new Map();
+  /**
+   * Forum-topic routing registry: "${chatId}:${topicId}" -> agentName.
+   * Built in a pre-pass over every enabled agent's .env BEFORE any poller
+   * starts (avoids a start-order race where the orchestrator's poller would
+   * resolve against a partial agent map). A duplicate (chatId, topicId)
+   * fails closed: both entries are dropped and a warning is logged.
+   */
+  private topicRegistry: Map<string, string> = new Map();
+  /**
+   * Per-group throttle for the on-demand topic refresh (chatId -> last refresh
+   * ms). Bounds disk reads when an unmapped thread arrives, so a flood of
+   * unknown threads can't storm the poller hot path.
+   */
+  private lastTopicRefresh: Map<string, number> = new Map();
+  /**
+   * Project label per "${chatId}:${topicId}" (from config.project_topics),
+   * kept in lockstep with topicRegistry + the on-demand refresh. onMessage
+   * reads the label from HERE, not the agent's start-time config closure, so a
+   * topic added after start gets its [project: ...] label without a restart.
+   */
+  private topicLabels: Map<string, string> = new Map();
   /** Daemon-level cron scheduler registry: one CronScheduler per enabled agent. */
   private cronSchedulers: Map<string, CronScheduler> = new Map();
   // Tracks agents that received a start request while still stopping.
@@ -275,18 +321,28 @@ export class AgentManager {
     // re-discover and re-start any agent dir on disk regardless of user intent.
     const instanceEnabled = this.readInstanceEnableList();
 
-    for (const { name, dir, org, config } of agentDirs) {
+    const willStart = agentDirs.filter(({ name, config }) => {
       // Per-agent config.json `enabled: false` (existing behavior, unchanged)
       if (config.enabled === false) {
         console.log(`[agent-manager] Skipping disabled agent: ${name} (per-agent config.json)`);
-        continue;
+        return false;
       }
       // Instance-level enabled-agents.json `enabled: false` (BUG-028 fix)
       const entry = instanceEnabled[name];
       if (entry && entry.enabled === false) {
         console.log(`[agent-manager] Skipping disabled agent: ${name} (enabled-agents.json)`);
-        continue;
+        return false;
       }
+      return true;
+    });
+
+    // Pre-pass: build the forum-topic routing registry from every agent that
+    // WILL start, before starting any of them. This is race-free by
+    // construction — the orchestrator's poller (started inside startAgent)
+    // never resolves against a partial map.
+    this.buildTopicRegistry(willStart.map(({ name, dir, config }) => ({ name, dir, config })));
+
+    for (const { name, dir, org, config } of willStart) {
       // BUG-043 fix: pass the per-agent org so startAgent can use it instead
       // of falling back to `this.org` (the daemon's startup org).
       await this.startAgent(name, dir, config, org);
@@ -313,6 +369,147 @@ export class AgentManager {
       return JSON.parse(readFileSync(enabledFile, 'utf-8'));
     } catch {
       return {}; // corrupt or unreadable — fall through to default-enabled
+    }
+  }
+
+  /**
+   * Read CHAT_ID + TOPIC_ID from an agent's .env. Returns undefined fields
+   * when absent. Single source of truth for topic config is the .env
+   * (consistent with BOT_TOKEN/CHAT_ID/ALLOWED_USER resolution).
+   */
+  private readTopicEnv(agentDir: string): { chatId?: string; topicId?: number } {
+    const envFile = join(agentDir, '.env');
+    if (!existsSync(envFile)) return {};
+    try {
+      const content = stripBom(readFileSync(envFile, 'utf-8'));
+      const chatId = content.match(/^CHAT_ID=(.+)$/m)?.[1]?.trim();
+      const topicRaw = content.match(/^TOPIC_ID=(.+)$/m)?.[1]?.trim();
+      const topicId = topicRaw && /^\d+$/.test(topicRaw) ? parseInt(topicRaw, 10) : undefined;
+      return { chatId: chatId || undefined, topicId };
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Build the forum-topic routing registry keyed by "${chatId}:${topicId}".
+   * Duplicate (chatId, topicId) across agents fails closed: BOTH owners are
+   * dropped and a warning logged, so an ambiguous topic never mis-routes.
+   */
+  private buildTopicRegistry(agents: Array<{ name: string; dir: string; config?: AgentConfig }>): void {
+    this.topicRegistry.clear();
+    this.topicLabels.clear();
+    const dupes = new Set<string>();
+    for (const { name, dir, config } of agents) {
+      const { chatId, topicId } = this.readTopicEnv(dir);
+      if (chatId === undefined) continue; // no group/chat → nothing to map
+      // v1 single-group: one .env TOPIC_ID per agent.
+      if (topicId !== undefined) this.registerTopicKey(name, chatId, topicId, dupes);
+      // v2 per-agent-group: every project topic in this agent's own group →
+      // this agent. Required so the agent's OWN topic callbacks resolve to self
+      // (an unregistered topic would drop ask callbacks, fail-closed).
+      for (const [k, label] of Object.entries((config as any)?.project_topics ?? {})) {
+        const pt = /^\d+$/.test(k) ? parseInt(k, 10) : NaN;
+        if (Number.isFinite(pt)) {
+          this.registerTopicKey(name, chatId, pt, dupes);
+          this.topicLabels.set(`${chatId}:${pt}`, label as string);
+        }
+      }
+    }
+    console.log(`[agent-manager] Topic registry built: ${this.topicRegistry.size} topic(s) mapped.`);
+  }
+
+  /**
+   * Register one (chatId, topicId) → agent mapping with duplicate fail-closed:
+   * a conflicting owner drops BOTH entries so an ambiguous topic never routes.
+   */
+  private registerTopicKey(name: string, chatId: string, topicId: number, dupes?: Set<string>): void {
+    const key = `${chatId}:${topicId}`;
+    if (dupes?.has(key)) return; // already poisoned by a cross-owner collision
+    const existing = this.topicRegistry.get(key);
+    if (existing === name) return; // same agent re-registering (e.g. .env TOPIC_ID also in project_topics) — idempotent
+    if (existing !== undefined) {
+      // A DIFFERENT agent already claims this (chat, topic) — ambiguous; fail closed.
+      console.warn(`[agent-manager] Duplicate topic ${topicId} in chat ${chatId} (${existing} vs ${name}) — both unmapped, fail closed.`);
+      this.topicRegistry.delete(key);
+      dupes?.add(key);
+      return;
+    }
+    this.topicRegistry.set(key, name);
+  }
+
+  /**
+   * Resolve the agent that owns a forum topic for a given chat.
+   *   - threadId undefined  -> null (General / DM: caller keeps the message)
+   *   - mapped (chatId,thread) -> owning agent name
+   *   - set but unmapped    -> null (caller falls back + warns)
+   */
+  resolveTopicOwner(chatId: string | number, threadId?: number): string | null {
+    if (threadId === undefined) return null;
+    return this.topicRegistry.get(`${chatId}:${threadId}`) ?? null;
+  }
+
+  /**
+   * On-demand, throttled, ADDITIVE topic refresh for a group whose owning agent
+   * is already RUNNING. Covers the one real gap: a project topic added to a
+   * running per-agent group's config.json AFTER the agent started isn't in the
+   * in-memory registry, so its messages fall back + miss the project label.
+   *
+   * Finds the running agent that owns this group `chatId` (each PAG group maps
+   * to exactly one agent via its entry's chatId), re-reads ONLY that agent's
+   * config.json from disk, and upserts its project_topics (additive — never a
+   * full registry rebuild). Throttled per-chat to bound disk reads. Returns
+   * true if a refresh ran (caller may retry resolveTopicOwner once).
+   *
+   * Does NOT help the not-yet-running case (an agent absent from this.agents) —
+   * that correctly falls back, since it cannot receive the message anyway.
+   */
+  private refreshTopicsForChat(chatId: string | number, nowMs: number): boolean {
+    const key = String(chatId);
+    if (nowMs - (this.lastTopicRefresh.get(key) ?? 0) < 5000) return false; // throttle
+    this.lastTopicRefresh.set(key, nowMs);
+    // Only refresh when EXACTLY ONE running agent owns this group (the PAG
+    // invariant). A legacy v1 shared-group can have multiple agents on one
+    // CHAT_ID — refreshing then could upsert the wrong agent's topics, so skip.
+    const owners = [...this.agents].filter(([, e]) => e.chatId !== undefined && String(e.chatId) === key);
+    if (owners.length !== 1) return false;
+    const [aname, entry] = owners[0];
+    try {
+      const cfg = this.loadAgentConfig(entry.process.getAgentDir()); // fresh read from disk
+      this.upsertTopicRegistry(aname, entry.chatId, entry.topicId, cfg);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Add/refresh a single agent's topic mapping. Used when an agent is started
+   * dynamically (IPC enable / restart) AFTER the discoverAndStart pre-pass, so
+   * its topic resolves immediately instead of falling back to the orchestrator
+   * until the next daemon restart. Conflicting (chatId,topicId) fails closed.
+   */
+  private upsertTopicRegistry(name: string, chatId?: string, topicId?: number, config?: AgentConfig): void {
+    if (!chatId) return;
+    // Share ONE dupes set across this agent's TOPIC_ID + project_topics calls so
+    // a cross-owner collision stays poisoned for the whole upsert. Without it, a
+    // collision deleted in the first call would be silently re-added by the
+    // second (e.g. when .env TOPIC_ID is also a project_topics key). [Codex CB1]
+    const dupes = new Set<string>();
+    if (topicId !== undefined) this.registerTopicKey(name, chatId, topicId, dupes);
+    for (const [k, label] of Object.entries((config as any)?.project_topics ?? {})) {
+      const pt = /^\d+$/.test(k) ? parseInt(k, 10) : NaN;
+      if (Number.isFinite(pt)) {
+        this.registerTopicKey(name, chatId, pt, dupes);
+        this.topicLabels.set(`${chatId}:${pt}`, label as string);
+      }
+    }
+  }
+
+  /** Drop any topic mapping owned by `name` (on stop/disable). */
+  private removeFromTopicRegistry(name: string): void {
+    for (const [k, v] of this.topicRegistry) {
+      if (v === name) this.topicRegistry.delete(k);
     }
   }
 
@@ -636,6 +833,7 @@ export class AgentManager {
     const agentEnvFile = join(agentDir, '.env');
     let telegramApi: TelegramAPI | undefined;
     let chatId: string | undefined;
+    let topicId: number | undefined;
     let allowedUserId: string | undefined;
     let botToken: string | undefined;
     let connector: MessageConnector | null = null;
@@ -656,9 +854,12 @@ export class AgentManager {
       const envContent = stripBom(readFileSync(agentEnvFile, 'utf-8'));
       const botTokenMatch = envContent.match(/^BOT_TOKEN=(.+)$/m);
       const chatIdMatch = envContent.match(/^CHAT_ID=(.+)$/m);
+      const topicIdMatch = envContent.match(/^TOPIC_ID=(.+)$/m);
       const allowedUserMatch = envContent.match(/^ALLOWED_USER=(.+)$/m);
       botToken = botTokenMatch?.[1]?.trim();
       chatId = chatIdMatch?.[1]?.trim();
+      const topicIdRaw = topicIdMatch?.[1]?.trim();
+      topicId = topicIdRaw && /^\d+$/.test(topicIdRaw) ? parseInt(topicIdRaw, 10) : undefined;
       allowedUserId = allowedUserMatch?.[1]?.trim() || undefined;
 
       // Validate BOT_TOKEN format: must be numeric_id:alphanumeric_secret
@@ -734,6 +935,7 @@ export class AgentManager {
       log,
       telegramApi,
       chatId,
+      topicId,
       // FastChecker only needs the first ID for its single-recipient typing
       // indicator / quick-checks. Multi-user is enforced by the gates above.
       allowedUserId: allowedUserId ? parseInt(allowedUserId.split(',')[0].trim(), 10) : undefined,
@@ -762,8 +964,11 @@ export class AgentManager {
     // after at least one await, so looking the entry back up by name can return
     // a DIFFERENT instance's entry — attaching our poller to it would break that
     // entry's teardown and guarantee ours leaks.
-    const ownEntry: AgentEntry = { process: agentProcess, checker };
+    const ownEntry: AgentEntry = { process: agentProcess, checker, topicId, chatId };
     this.agents.set(name, ownEntry);
+    // Keep the topic registry current for agents started after the
+    // discoverAndStart pre-pass (IPC enable / restart).
+    this.upsertTopicRegistry(name, chatId, topicId, config);
 
     // Start agent
     await agentProcess.start();
@@ -845,8 +1050,22 @@ export class AgentManager {
 
       const REJECT_ALERT_THRESHOLD = 3;
       const REJECT_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+      // This agent's own bot user id (the numeric prefix of BOT_TOKEN). Used to
+      // exclude the agent's OWN messages (e.g. createForumTopic service msgs)
+      // from the ALLOWED_USER watchdog counter. Foreign senders still counted.
+      const ownBotId = botToken ? Number(botToken.split(':')[0]) : undefined;
 
       poller.onMessage((msg) => {
+        // Pre-gate filter: forum service messages + this agent's OWN bot's
+        // messages are dropped BEFORE the ALLOWED_USER gate so they never count
+        // toward the "unsolicited contact" watchdog. A FOREIGN sender still
+        // falls through to the gate below and still trips the watchdog.
+        const preSkip = shouldSkipBeforeWatchdog(msg, ownBotId);
+        if (preSkip) {
+          log(`[topic-routing] dropped ${preSkip} message (thread ${msg.message_thread_id ?? '?'}) — not counted by watchdog`);
+          return;
+        }
+
         // ALLOWED_USER gate: comma-separated list of numeric user IDs.
         // If configured, ignore messages from other users. Always log the
         // rejected user_id + name so operators can discover IDs to whitelist.
@@ -901,27 +1120,86 @@ export class AgentManager {
         const effectiveChatId = msgChatId ?? chatId ?? '';
         const stateDir = join(this.ctxRoot, 'state', name);
 
+        // Chat-scope guard: a forum topic id is only meaningful within its own
+        // chat. Never route on a thread id from a chat other than this agent's
+        // configured CHAT_ID — otherwise a foreign group's matching topic id
+        // could inject into an agent.
+        if (chatId !== undefined && String(msgChatId) !== String(chatId)) {
+          log(`[topic-routing] ignoring message from non-configured chat ${msgChatId} (expected ${chatId})`);
+          try {
+            if (msg.message_id !== undefined) {
+              appendDeadLetter(stateDir, `${msgChatId}:${msg.message_id}`, msg, Date.now());
+            }
+          } catch (e) {
+            log(`[dead-letter] capture failed: ${e}`);
+          }
+          return;
+        }
+
+        // Resolve the topic owner. undefined thread = General → this agent.
+        const threadId = msg.message_thread_id;
+        let resolvedOwner = this.resolveTopicOwner(effectiveChatId, threadId);
+        if (threadId !== undefined && resolvedOwner === null) {
+          // A topic added to a RUNNING group's config.json after the agent
+          // started won't be in the registry yet. Try one throttled, additive,
+          // disk-backed refresh for this group's owner, then re-resolve.
+          if (this.refreshTopicsForChat(effectiveChatId, Date.now())) {
+            resolvedOwner = this.resolveTopicOwner(effectiveChatId, threadId);
+          }
+          if (resolvedOwner === null) {
+            // Still unmapped: deliver to this agent (its own group / General).
+            log(`[topic-routing] thread ${threadId} in chat ${effectiveChatId} not yet in project map — handling under ${name} (no project label)`);
+          }
+        }
+        const targetName = resolvedOwner ?? name;
+        // Route state/history/inbound-log under the OWNER agent identity so a
+        // routed specialist sees its own last-sent/history, and per-agent state
+        // dirs keep each topic's traffic isolated.
+        const targetStateDir = join(this.ctxRoot, 'state', targetName);
+        const targetPaths = targetName === name ? paths : resolvePaths(targetName, this.instanceId, resolvedOrg);
+
+        // Single delivery decision point: inject into the owning agent's PTY,
+        // or queue to the orchestrator's own checker for General. Used by EVERY
+        // branch below (text, media-success, media-null, media-error) so no
+        // branch can silently self-queue a routed message.
+        const deliver = (formatted: string): void => {
+          if (targetName !== name) {
+            const res = this.injectAgentDetailed(targetName, formatted);
+            if (!res.ok && res.code !== 'DEDUPED') {
+              log(`[topic-routing] inject to ${targetName} failed (${res.code}) → orchestrator fallback`);
+              if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+            }
+            return;
+          }
+          if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+        };
+
         // Persist the inbound message to JSONL AND emit a
         // `message/telegram_received` bus event in one helper so
         // experiment cycles and dashboards can count inbound traffic.
         // Without the event, Rubi's v3 fleet measurement found 0
         // inbound messages on a window where Eros replied to multiple
         // agents — the JSONL had the data but it never reached the
-        // event log.
-        recordInboundTelegram(paths, this.ctxRoot, name, resolvedOrg, from, msg, log);
+        // event log. Recorded under the OWNER's identity.
+        recordInboundTelegram(targetPaths, this.ctxRoot, targetName, resolvedOrg, from, msg, log);
 
         // Check for media messages (photo, document, voice, audio, video, video_note)
         const isMedia = !!(msg.photo || msg.document || msg.voice || msg.audio || msg.video || msg.video_note);
         const replyToText = buildReplyContext(msg.reply_to_message);
 
         if (isMedia && telegramApi) {
-          const downloadDir = join(agentDir, 'telegram-images');
+          // Media must be downloaded into AND relativized against the OWNING
+          // agent's workspace, not the polling orchestrator's — otherwise the
+          // injected local_file path won't resolve when the target agent reads it.
+          const ownerProc = this.agents.get(targetName)?.process;
+          const ownerAgentDir = ownerProc?.getAgentDir?.() ?? agentDir;
+          const ownerConfig = ownerProc?.getConfig?.() ?? config;
+          const downloadDir = join(ownerAgentDir, 'telegram-images');
           processMediaMessage(msg, telegramApi, downloadDir).then((media) => {
             if (!media) {
               log('Media processing returned null - falling back to text format');
               const text = stripControlChars(msg.caption || '');
-              const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot, replyToText);
-              if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+              deliver(FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot, replyToText, undefined, undefined, threadId));
               return;
             }
 
@@ -930,7 +1208,7 @@ export class AgentManager {
             // agent never sees them. Relative paths survive injection.
             // BUG-049: Use the agent's actual launch cwd (config.working_directory
             // if set, else agentDir) so the path resolves when Read() is invoked.
-            const launchDir = config?.working_directory || agentDir;
+            const launchDir = ownerConfig?.working_directory || ownerAgentDir;
             const toRel = (p: string | undefined) => p ? relative(launchDir, p) : '';
             const relImagePath = toRel(media.image_path);
             const relFilePath = toRel(media.file_path);
@@ -938,37 +1216,36 @@ export class AgentManager {
             log(`[DEBUG] media.type=${media.type} image_path=${JSON.stringify(relImagePath)} file_path=${JSON.stringify(relFilePath)}`);
             let formatted: string;
             if (media.type === 'photo') {
-              formatted = FastChecker.formatTelegramPhotoMessage(from, effectiveChatId, media.text, relImagePath, replyToText);
+              formatted = FastChecker.formatTelegramPhotoMessage(from, effectiveChatId, media.text, relImagePath, replyToText, threadId);
             } else if (media.type === 'document') {
-              formatted = FastChecker.formatTelegramDocumentMessage(from, effectiveChatId, media.text, relFilePath, media.file_name!, replyToText);
+              formatted = FastChecker.formatTelegramDocumentMessage(from, effectiveChatId, media.text, relFilePath, media.file_name!, replyToText, threadId);
             } else if (media.type === 'voice' || media.type === 'audio') {
-              formatted = FastChecker.formatTelegramVoiceMessage(from, effectiveChatId, relFilePath, media.duration, media.transcript, replyToText);
+              formatted = FastChecker.formatTelegramVoiceMessage(from, effectiveChatId, relFilePath, media.duration, media.transcript, replyToText, threadId);
             } else {
               // video or video_note
-              formatted = FastChecker.formatTelegramVideoMessage(from, effectiveChatId, media.text, relFilePath, media.file_name || '', media.duration, replyToText);
+              formatted = FastChecker.formatTelegramVideoMessage(from, effectiveChatId, media.text, relFilePath, media.file_name || '', media.duration, replyToText, threadId);
             }
 
-            if (checker.isDuplicate(formatted)) {
-              log('Duplicate Telegram media message suppressed');
-              return;
-            }
             log(`Media message received: type=${media.type}, path=${media.image_path || media.file_path}`);
-            checker.queueTelegramMessage(formatted);
+            deliver(formatted);
           }).catch((err) => {
             log(`Media processing error: ${err} - falling back to text format`);
             const text = stripControlChars(msg.caption || '');
-            const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot, replyToText);
-            if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+            deliver(FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot, replyToText, undefined, undefined, threadId));
           });
           return;
         }
 
         // Text message (non-media)
         const text = stripControlChars(msg.text || '');
-        const lastSent = FastChecker.readLastSent(stateDir, effectiveChatId);
+        const lastSent = FastChecker.readLastSent(targetStateDir, effectiveChatId, threadId);
 
-        const recentHistory = buildRecentHistory(this.ctxRoot, name, effectiveChatId, 6) ?? undefined;
-        const formatted = FastChecker.formatTelegramTextMessage(
+        const recentHistory = buildRecentHistory(this.ctxRoot, targetName, effectiveChatId, 6, threadId) ?? undefined;
+        // PAG: label the project topic from the manager-level label map (kept in
+        // lockstep with the registry + the on-demand refresh), NOT the agent's
+        // start-time config closure — so a topic added after start is labelled.
+        const projectLabel = threadId !== undefined ? this.topicLabels.get(`${effectiveChatId}:${threadId}`) : undefined;
+        deliver(FastChecker.formatTelegramTextMessage(
           from,
           effectiveChatId,
           text,
@@ -976,19 +1253,50 @@ export class AgentManager {
           replyToText,
           lastSent ?? undefined,
           recentHistory,
-        );
-
-        if (checker.isDuplicate(formatted)) {
-          log('Duplicate Telegram message suppressed');
-          return;
-        }
-        checker.queueTelegramMessage(formatted);
+          threadId,
+          projectLabel,
+        ));
       });
 
       poller.onCallback((query) => {
-        // Route to fast-checker for hook response handling (perm_allow/deny, askopt, etc.)
-        // handleCallback writes hook-response files and edits Telegram messages
-        checker.handleCallback(query).catch(err => {
+        // Route the callback to the OWNING agent's checker so the hook-response
+        // file / PTY keystrokes land in the agent that posted the prompt — not
+        // always the polling orchestrator.
+        //
+        // Resolution order:
+        //   1. topic thread (normal case: the button sits in the agent's topic)
+        //   2. pending-callback index by the unique id in callback_data
+        //      (covers the case where Telegram omits message_thread_id on
+        //      perm/restart prompts)
+        const data = query.data || '';
+        const isAsk = /^(?:askopt|asktoggle|asksubmit)_/.test(data);
+        const cbChatId = query.message?.chat?.id ?? chatId ?? '';
+        const cbThread = query.message?.message_thread_id;
+        const answerExpired = () => {
+          if (telegramApi) telegramApi.answerCallbackQuery(query.id, 'Expired or unavailable').catch(() => {});
+        };
+
+        let owner = this.resolveTopicOwner(cbChatId, cbThread);
+        if (!owner) {
+          const id = data.match(/^(?:perm|restart)_(?:allow|deny|continue)_([a-f0-9]+)$/)?.[1];
+          if (id) owner = resolvePendingCallback(this.ctxRoot, id);
+        }
+
+        const route = decideCallbackRoute({
+          isAsk,
+          threadPresent: cbThread !== undefined,
+          owner,
+          selfName: name,
+          ownerRunning: owner ? this.agents.has(owner) : false,
+        });
+
+        if (route.action === 'drop') {
+          log(`[topic-routing] callback dropped (fail-safe): owner=${owner ?? '?'} thread=${cbThread ?? '?'} ask=${isAsk}`);
+          answerExpired();
+          return;
+        }
+        const targetChecker = route.action === 'agent' ? this.agents.get(route.owner)?.checker : checker;
+        (targetChecker ?? checker).handleCallback(query).catch(err => {
           log(`Callback handling error: ${err}`);
         });
       });
@@ -1132,6 +1440,20 @@ export class AgentManager {
       // Store poller reference so stopAgent() can clean it up. Assigned to the
       // entry we created, never to whatever the name resolves to now.
       ownEntry.poller = poller;
+      // D0/D1 liveness (PLAN-v3). Store the agent's own API for the probe,
+      // anchor D0's "never polled yet" grace on start time, and begin the
+      // detector cycle with a per-agent random phase so agents don't probe in
+      // lockstep. Math.random for jitter only — not correctness.
+      ownEntry.api = telegramApi;
+      ownEntry.pollerStartedAt = Date.now();
+      ownEntry.probeStreak = INITIAL_PROBE_STREAK;
+      const jitter = Math.floor(Math.random() * LIVENESS_PROBE_INTERVAL_MS);
+      ownEntry.livenessTimer = setTimeout(() => {
+        if (this.agents.get(name) !== ownEntry) return; // stopped/superseded during the jitter window
+        ownEntry.livenessTimer = setInterval(() => {
+          this.runLivenessCheck(name).catch(e => log(`[liveness] check failed: ${e}`));
+        }, LIVENESS_PROBE_INTERVAL_MS);
+      }, jitter);
 
       log('Telegram poller started (with Conflict-restart wrapper)');
 
@@ -1439,6 +1761,119 @@ export class AgentManager {
   }
 
   /**
+   * D0/D1 liveness check (PLAN-v3). D0: is the poll loop alive (orthogonal to
+   * membership)? D1: is the bot a reachable member of its configured chat?
+   * Alerts route via the OPERATOR channel — never the agent's own, possibly
+   * broken, channel.
+   */
+  private async runLivenessCheck(name: string): Promise<void> {
+    const entry = this.agents.get(name);
+    if (!entry) return;
+    const chatId = entry.chatId;
+    const api = entry.api;
+    if (chatId === undefined || !api) return;
+    const now = Date.now();
+
+    // --- D0: is the poll loop alive? (orthogonal to membership) ---
+    const poller = entry.poller;
+    const anchor = poller && poller.lastSuccessfulPollAt > 0
+      ? poller.lastSuccessfulPollAt
+      : (entry.pollerStartedAt ?? now);
+    if (!poller || pollerIsStale(anchor, now, D0_STALE_MS)) {
+      this.emitProbeTelemetry(name, { layer: 'D0', chat_id: chatId, alive: false });
+      this.sendLivenessAlert(
+        name,
+        `D0: ${name} poll loop not confirmed alive (no successful getUpdates in ${D0_STALE_MS / 1000}s). Inbound Telegram may be dead.`,
+      );
+    }
+
+    // --- D1: is the bot a reachable member of its configured chat? ---
+    const botId = api.botId;
+    if (botId === undefined) return; // cannot probe without the own bot id
+
+    // can_read_all_group_messages: a BotFather setting, fetched once via getMe.
+    // Its failure leaves the flag undefined -> a member-in-group verdict is
+    // INCONCLUSIVE, never green.
+    if (!entry.canReadFetched) {
+      try {
+        const me = await api.getMe();
+        entry.canReadAllGroupMessages = me?.result?.can_read_all_group_messages;
+      } catch {
+        entry.canReadAllGroupMessages = undefined;
+      }
+      entry.canReadFetched = true;
+    }
+    // Chat type (best-effort; keep the last known type on failure).
+    try {
+      const chat = await api.getChat(chatId);
+      if (chat?.result?.type) entry.chatType = chat.result.type;
+    } catch {
+      /* keep cached type */
+    }
+
+    let verdict;
+    let telem: Record<string, any> = { layer: 'D1', chat_id: chatId };
+    try {
+      const member = await api.getChatMember(chatId, botId);
+      const status = member?.result?.status;
+      const isMember = member?.result?.is_member;
+      verdict = classifyMembershipProbe({
+        ok: true,
+        chatType: (entry.chatType ?? 'supergroup') as ChatType,
+        status,
+        isMember,
+        canReadAllGroupMessages: entry.canReadAllGroupMessages,
+      });
+      telem = { ...telem, status, class: verdict.klass, verdict: verdict.verdict };
+    } catch (err) {
+      const errorCode = (err as any)?.error_code;
+      verdict = classifyMembershipProbe({ ok: false, errorCode });
+      telem = { ...telem, error_code: errorCode, class: verdict.klass, verdict: verdict.verdict };
+    }
+    this.emitProbeTelemetry(name, telem);
+
+    const step = stepProbeStreak(entry.probeStreak ?? INITIAL_PROBE_STREAK, verdict, now);
+    entry.probeStreak = step.state;
+    if (step.fireAlert) {
+      this.sendLivenessAlert(
+        name,
+        `D1: ${name} configured chat ${chatId} is UNREACHABLE (${verdict.reason}). Inbound Telegram is broken.`,
+      );
+    }
+  }
+
+  /**
+   * Per-cycle structured telemetry (PLAN-v3 §4b) — emitted on EVERY probe,
+   * success or failure, so runs are countable from data rather than inferred
+   * from an error-only log.
+   */
+  private emitProbeTelemetry(name: string, data: Record<string, any>): void {
+    console.log(`[liveness-telemetry] ${JSON.stringify({ agent: name, ts: Date.now(), ...data })}`);
+  }
+
+  /**
+   * Deliver a liveness alert via the OPERATOR channel — never the agent's own
+   * (possibly-broken) channel (PLAN-v3 §10). The operator channel is REQUIRED
+   * and named by CTX_OPERATOR_AGENT: there is no arbitrary-agent fallback,
+   * because an alert about a broken channel must not ride that class of
+   * channel. If it cannot be resolved the alert is logged as UNDELIVERED with
+   * the agent, path and specific condition named.
+   */
+  private sendLivenessAlert(name: string, text: string): void {
+    const r = resolveOperatorCreds(this.frameworkRoot, process.env);
+    if (!r.ok) {
+      console.error(
+        `[liveness] ${name} ALERT UNDELIVERED (operator channel ${r.reason}): ${text} — ${r.detail}`,
+      );
+      return;
+    }
+    const opApi = new TelegramAPI(r.creds.botToken);
+    opApi
+      .sendMessage(r.creds.chatId, `🔴 CORTEX TELEGRAM OFFLINE — ${name} cannot reliably receive messages\n\nWhat this means: Cortex's independent liveness check failed.\nImpact: Messages to ${name} may not be seen or answered.\nWhat to do: Ask Codex to repair Telegram input.\nTechnical detail: ${text}`)
+      .catch(e => console.error(`[liveness] alert send failed: ${e}`));
+  }
+
+  /**
    * Stop a specific agent.
    */
   async stopAgent(name: string, userInitiated = false): Promise<void> {
@@ -1475,6 +1910,11 @@ export class AgentManager {
 
       if (entry.poller) entry.poller.stop();
       if (entry.activityPoller) entry.activityPoller.stop();
+      // Clear the D0/D1 liveness timer, or it accumulates one per restart and
+      // keeps probing a deleted agent. clearInterval clears both the jitter
+      // setTimeout and the running setInterval (same Timeout handle type).
+      if (entry.livenessTimer) clearInterval(entry.livenessTimer);
+      this.removeFromTopicRegistry(name);
       // Unregister from every org's Buzz dispatcher — harmless no-op for orgs
       // this agent was never registered in. We don't track which org this
       // agent belongs to on the entry itself, so this sweeps all of them

@@ -8,6 +8,7 @@ import { checkInbox, ackInbox, sendMessage } from '../bus/message.js';
 import { updateApproval } from '../bus/approval.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
+import { lastSentFileName } from '../telegram/logging.js';
 import { KEYS } from '../pty/inject.js';
 import { stripControlChars, sanitizeForPtyInjection, wrapFenceSafe } from '../utils/validate.js';
 import { agentHoldsContextHandoffLease, releaseContextHandoffLease, requestContextHandoffLease } from './context-handoff-lease.js';
@@ -55,6 +56,7 @@ export class FastChecker {
   private frameworkRoot: string;
   private telegramApi?: TelegramAPI;
   private chatId?: string;
+  private topicId?: number;
   private allowedUserId?: number;
 
   // External Telegram handler (set by daemon)
@@ -122,6 +124,7 @@ export class FastChecker {
       log?: LogFn;
       telegramApi?: TelegramAPI;
       chatId?: string;
+      topicId?: number;
       allowedUserId?: number;
       connector?: import('../connectors/index.js').MessageConnector;
     } = {},
@@ -133,6 +136,7 @@ export class FastChecker {
     this.log = options.log || ((msg) => console.log(`[fast-checker/${agent.name}] ${msg}`));
     this.telegramApi = options.telegramApi;
     this.chatId = options.chatId;
+    this.topicId = options.topicId;
     this.allowedUserId = options.allowedUserId;
     this.connector = options.connector;
 
@@ -379,12 +383,20 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
     replyToText?: string,
     lastSentText?: string,
     recentHistory?: string,
+    threadId?: number,
+    projectLabel?: string,
   ): string {
     // Every externally-influenced field below is untrusted (the sender controls
     // text/display-name; reply-context, last-sent and recent-history are built
     // from prior external messages). Sanitize each so none can escape the fence
     // or forge a containment header. Unfenced context fields (reply/history) are
     // the weakest surface — they sit raw in [Replying to: "..."] / [Recent ...].
+    // projectLabel comes from the agent's own config.project_topics — trusted,
+    // but sanitize anyway (defense-in-depth against a malformed config).
+    let projectCx = '';
+    if (projectLabel) {
+      projectCx = `[project: ${sanitizeForPtyInjection(projectLabel.slice(0, 100))}]\n`;
+    }
     const replyCx = FastChecker.formatReplyContext(replyToText);
 
     let lastSentCtx = '';
@@ -408,8 +420,8 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
       ? sanitizeForPtyInjection(text).trim()
       : wrapFenceSafe(text);
     return `=== TELEGRAM from [USER: ${sanitizeForPtyInjection(from)}] (chat_id:${chatId}) ===
-${replyCx}${historyCx}${body}
-${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+${projectCx}${replyCx}${historyCx}${body}
+${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${threadId !== undefined ? ` --thread ${threadId}` : ''}
 
 `;
   }
@@ -504,13 +516,15 @@ Reply using: cortextos slack send ${channel} '<your reply>' --as ${agentName}
     chatId: string | number,
     caption: string,
     imagePath: string,
-    replyToText?: string,
+    replyToTextOrThreadId?: string | number,
+    threadId?: number,
   ): string {
+    const rt = FastChecker.splitReplyThread(replyToTextOrThreadId, threadId);
     return `=== TELEGRAM PHOTO from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
-${FastChecker.formatReplyContext(replyToText)}caption:
+${FastChecker.formatReplyContext(rt.replyToText)}caption:
 ${wrapFenceSafe(caption)}
 local_file: ${imagePath}
-Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${rt.threadId !== undefined ? ` --thread ${rt.threadId}` : ''}
 
 `;
   }
@@ -525,14 +539,16 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     caption: string,
     filePath: string,
     fileName: string,
-    replyToText?: string,
+    replyToTextOrThreadId?: string | number,
+    threadId?: number,
   ): string {
+    const rt = FastChecker.splitReplyThread(replyToTextOrThreadId, threadId);
     return `=== TELEGRAM DOCUMENT from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
-${FastChecker.formatReplyContext(replyToText)}caption:
+${FastChecker.formatReplyContext(rt.replyToText)}caption:
 ${wrapFenceSafe(caption)}
 local_file: ${filePath}
 file_name: ${sanitizeForPtyInjection(fileName)}
-Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${rt.threadId !== undefined ? ` --thread ${rt.threadId}` : ''}
 
 `;
   }
@@ -552,16 +568,18 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     filePath: string,
     duration: number | undefined,
     transcript?: string,
-    replyToText?: string,
+    replyToTextOrThreadId?: string | number,
+    threadId?: number,
   ): string {
+    const rt = FastChecker.splitReplyThread(replyToTextOrThreadId, threadId);
     const dur = duration !== undefined ? duration : 'unknown';
     const transcriptBlock = transcript && transcript.trim()
       ? `transcript:\n${wrapFenceSafe(transcript.trim())}\n`
       : '';
     return `=== TELEGRAM VOICE from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
-${FastChecker.formatReplyContext(replyToText)}duration: ${dur}s
+${FastChecker.formatReplyContext(rt.replyToText)}duration: ${dur}s
 local_file: ${filePath}
-${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${rt.threadId !== undefined ? ` --thread ${rt.threadId}` : ''}
 
 `;
   }
@@ -577,18 +595,40 @@ ${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your repl
     filePath: string,
     fileName: string,
     duration: number | undefined,
-    replyToText?: string,
+    replyToTextOrThreadId?: string | number,
+    threadId?: number,
   ): string {
+    const rt = FastChecker.splitReplyThread(replyToTextOrThreadId, threadId);
     const dur = duration !== undefined ? duration : 'unknown';
     return `=== TELEGRAM VIDEO from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
-${FastChecker.formatReplyContext(replyToText)}caption:
+${FastChecker.formatReplyContext(rt.replyToText)}caption:
 ${wrapFenceSafe(caption)}
 duration: ${dur}s
 local_file: ${filePath}
 file_name: ${sanitizeForPtyInjection(fileName)}
-Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+Reply using: cortextos bus send-telegram ${chatId} '<your reply>'${rt.threadId !== undefined ? ` --thread ${rt.threadId}` : ''}
 
 `;
+  }
+
+  /**
+   * Media formatters (photo/document/voice/video) share one trailing slot
+   * that historically carried `replyToText` (upstream's reply-context
+   * threading, merged independently of forum-topic routing) — the
+   * forum-topic port needs a `threadId` (number) in that same call
+   * position for legacy positional callers. Disambiguate by runtime type:
+   * a string is reply context, a number is a thread id. Callers that need
+   * BOTH pass replyToText in this slot and threadId explicitly in the next
+   * one (both accepted, never conflated).
+   */
+  private static splitReplyThread(
+    replyToTextOrThreadId?: string | number,
+    explicitThreadId?: number,
+  ): { replyToText?: string; threadId?: number } {
+    if (typeof replyToTextOrThreadId === 'number') {
+      return { replyToText: undefined, threadId: replyToTextOrThreadId };
+    }
+    return { replyToText: replyToTextOrThreadId, threadId: explicitThreadId };
   }
 
   private static formatReplyContext(replyToText?: string): string {
@@ -618,7 +658,11 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     const now = Date.now();
     if (now - this.typingLastSent >= 4000) {
       try {
-        await api.sendChatAction(chatId, 'typing');
+        if (this.topicId !== undefined) {
+          await api.sendChatAction(chatId, 'typing', this.topicId);
+        } else {
+          await api.sendChatAction(chatId, 'typing');
+        }
       } catch {
         // Ignore typing indicator failures (matches bash: || true)
       }
@@ -630,8 +674,8 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
    * Read the last-sent message file for conversation context.
    * Returns the content (up to 500 chars) or null if not available.
    */
-  static readLastSent(stateDir: string, chatId: string | number): string | null {
-    const filePath = join(stateDir, `last-telegram-${chatId}.txt`);
+  static readLastSent(stateDir: string, chatId: string | number, threadId?: number): string | null {
+    const filePath = join(stateDir, lastSentFileName(chatId, threadId));
     try {
       if (!existsSync(filePath)) return null;
       const content = readFileSync(filePath, 'utf-8');
