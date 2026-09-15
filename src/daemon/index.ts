@@ -129,7 +129,7 @@ function sendCrashLoopAlertBestEffort(
   const creds = getOperatorChatCreds(frameworkRoot);
   if (!creds) {
     console.error('[daemon] Crash-loop alert: no operator chat configured ' +
-      '(set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN, or ensure at least one agent .env exists)');
+      '(set CTX_OPERATOR_AGENT to a valid agent name, or ensure that agent has a .env with BOT_TOKEN + CHAT_ID)');
     return false;
   }
   const message =
