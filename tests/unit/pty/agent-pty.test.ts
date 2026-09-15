@@ -176,3 +176,25 @@ describe('AgentPTY structural no-keystroke-into-live-session invariant', () => {
     expect(mockPty.write).not.toHaveBeenCalled();
   });
 });
+
+describe('AgentPTY reasoning effort', () => {
+  it('passes a configured effort level to Claude Code', () => {
+    const args = argsFor({ effort: 'medium' });
+    expect(args).toContain('--effort');
+    expect(args[args.indexOf('--effort') + 1]).toBe('medium');
+  });
+
+  it('omits effort when it is not configured', () => {
+    expect(argsFor({})).not.toContain('--effort');
+  });
+
+  it('warns and omits an invalid effort value', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(argsFor({ effort: 'turbo' })).not.toContain('--effort');
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});

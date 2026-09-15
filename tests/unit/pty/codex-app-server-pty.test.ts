@@ -116,6 +116,28 @@ describe('CodexAppServerPTY socket path policy', () => {
   });
 });
 
+describe('CodexAppServerPTY model configuration', () => {
+  it('passes the configured model and reasoning effort to app-server', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {
+      model: 'qwen3.5:35b',
+      effort: 'high',
+    });
+    const args = (pty as unknown as { buildAppServerArgs(): string[] }).buildAppServerArgs();
+
+    expect(args).toContain('model="qwen3.5:35b"');
+    expect(args).toContain('model_reasoning_effort="high"');
+    expect(args).toContain('browser_use');
+    expect(args).toContain('plugins');
+  });
+
+  it('does not pass Claude-only max effort to app-server', () => {
+    const pty = new CodexAppServerPTY(mockEnv, { effort: 'max' });
+    const args = (pty as unknown as { buildAppServerArgs(): string[] }).buildAppServerArgs();
+
+    expect(args.some(arg => arg.includes('model_reasoning_effort'))).toBe(false);
+  });
+});
+
 describe('CodexAppServerPTY command mapping', () => {
   function makeReadyPty() {
     const pty = new CodexAppServerPTY(mockEnv, {});

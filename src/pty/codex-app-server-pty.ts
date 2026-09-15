@@ -423,11 +423,7 @@ export class CodexAppServerPTY {
       }
 
       const spawnFn = this._spawnFn!;
-      const pty = spawnFn('codex', [
-        'app-server',
-        '--enable', 'goals',
-        '--listen', this._socketListenArg,
-      ], {
+      const pty = spawnFn('codex', this.buildAppServerArgs(), {
         name: 'xterm-256color',
         cols: 200,
         rows: 50,
@@ -452,6 +448,57 @@ export class CodexAppServerPTY {
 
       this.waitForSocket().then(resolve, reject);
     });
+  }
+
+  private buildAppServerArgs(): string[] {
+    const args = [
+      'app-server',
+      '--enable', 'goals',
+      '--listen', this._socketListenArg,
+    ];
+
+    // A persistent CortextOS agent needs shell/filesystem plus its configured
+    // MCP servers. Desktop-only capabilities add large tool schemas and severe
+    // prompt-evaluation latency for local models, so keep this runtime lean.
+    const disabledFeatures = [
+      'apps',
+      'auth_elicitation',
+      'browser_use',
+      'browser_use_external',
+      'browser_use_full_cdp_access',
+      'code_mode_host',
+      'computer_use',
+      'guardian_approval',
+      'image_generation',
+      'in_app_browser',
+      'in_app_chat',
+      'in_app_dictation',
+      'in_app_updates',
+      'multi_agent',
+      'plugin_sharing',
+      'plugins',
+      'remote_plugin',
+      'skill_mcp_dependency_install',
+      'skill_search',
+      'tool_call_mcp_elicitation',
+      'tool_suggest',
+      'workspace_dependencies',
+    ];
+    for (const feature of disabledFeatures) {
+      args.push('--disable', feature);
+    }
+
+    if (this._config.model) {
+      args.push('--config', `model=${JSON.stringify(this._config.model)}`);
+    }
+
+    // Codex supports low/medium/high/xhigh. AgentConfig also accepts `max`
+    // for Claude Code, so do not pass that Claude-only value to app-server.
+    if (this._config.effort && this._config.effort !== 'max') {
+      args.push('--config', `model_reasoning_effort=${JSON.stringify(this._config.effort)}`);
+    }
+
+    return args;
   }
 
   private async waitForSocket(timeoutMs = 10000): Promise<void> {
@@ -990,7 +1037,10 @@ export class CodexAppServerPTY {
   private buildEnv(): Record<string, string> {
     const env: Record<string, string> = {};
 
-    const keepVars = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR'];
+    const keepVars = [
+      'PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR',
+      'CODEX_HOME', 'CODEX_OSS_BASE_URL', 'OLLAMA_HOST',
+    ];
     for (const key of keepVars) {
       if (process.env[key]) env[key] = process.env[key]!;
     }
