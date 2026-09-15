@@ -224,6 +224,39 @@ export function wrapFenceSafe(input: string): string {
 }
 
 /**
+ * Every `=== X ===` containment header the daemon injects into an agent PTY.
+ * This is the single source of truth: sanitizeForPtyInjection builds its
+ * forged-header quote pattern FROM this list, so the neutralizer can never lag
+ * the set. `TELEGRAM` covers its media variants (TELEGRAM PHOTO/DOCUMENT/VOICE/
+ * VIDEO) and `SLACK` covers any `=== SLACK …` sub-header via the `\b` rule.
+ *
+ * Before this was a single source of truth the quote pattern was a hand-written
+ * `AGENT MESSAGE|TELEGRAM` alternation, which was not extended when the BUZZ and
+ * SLACK transports (and REACTION / URGENT SIGNAL) began injecting their own
+ * headers — so a forged copy of an un-listed header in an unfenced context-
+ * preview field passed through un-quoted. The anti-drift census test
+ * (tests/unit/utils/validate.test.ts) now fails, naming the marker, if any
+ * daemon-emitted header is ever missing from this list again.
+ */
+export const DAEMON_STRUCTURAL_HEADERS = [
+  'AGENT MESSAGE', 'TELEGRAM', 'BUZZ', 'SLACK', 'REACTION', 'URGENT SIGNAL',
+] as const;
+export type DaemonStructuralHeader = typeof DAEMON_STRUCTURAL_HEADERS[number];
+
+// Reply-directive command verbs the daemon emits (`Reply using: cortextos <verb> …`).
+const DAEMON_REPLY_COMMANDS = ['bus', 'buzz', 'slack'] as const;
+
+// Built from the two lists above so it can never drift behind them. Matches a
+// forged containment header or reply directive at line-start (after any run of
+// the Unicode whitespace a downstream `.trim()` would strip — see below).
+const DAEMON_FORGERY_PATTERN = new RegExp(
+  '^([ \\t\\u00A0\\u1680\\u2000-\\u200A\\u202F\\u205F\\u3000\\uFEFF]*)' +
+    `(={3,}\\s*(?:${DAEMON_STRUCTURAL_HEADERS.join('|')})\\b` +
+    `|Reply using:\\s*cortextos\\s+(?:${DAEMON_REPLY_COMMANDS.join('|')})\\b)`,
+  'gim',
+);
+
+/**
  * Neutralize PTY structural-injection vectors in untrusted text that is
  * injected WITHOUT a protective fence — the context-preview fields
  * (`[Replying to: "..."]`, `[Your last message: "..."]`,
@@ -253,8 +286,5 @@ export function sanitizeForPtyInjection(input: string): string {
   return stripControlChars(input)
     .replace(/\r\n?/g, '\n')
     .replace(/`{3,}/g, '``')
-    .replace(
-      /^([ \t\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000\uFEFF]*)(={3,}\s*(?:AGENT MESSAGE|TELEGRAM)\b|Reply using:\s*cortextos\s+bus)/gim,
-      '$1[quoted] $2',
-    );
+    .replace(DAEMON_FORGERY_PATTERN, '$1[quoted] $2');
 }

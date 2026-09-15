@@ -234,18 +234,45 @@ export interface AgentConfig {
    */
   codex_context_cap?: number;
   /**
+   * Fallback context window cap (tokens) for opencode agents when the OpenCode
+   * model cache does not expose a context limit. Only applies to runtime:
+   * 'opencode'.
+   */
+  opencode_context_cap?: number;
+  /**
    * Agent runtime. Defaults to 'claude-code' when absent.
    * 'hermes' selects the HermesPTY spawn path (Python persistent REPL,
    * NousResearch/hermes-agent) with Hermes-specific bootstrap, session
    * continuity, and exit handling.
+   * 'opencode' selects the OpencodePTY spawn path, a native PTY terminal
+   * runtime for opencode.ai's OpenCode CLI.
    */
-  runtime?: 'claude-code' | 'hermes' | 'codex-app-server';
+  runtime?: 'claude-code' | 'hermes' | 'codex-app-server' | 'opencode';
+  /**
+   * Optional OpenCode agent name to pass as `opencode --agent <name>`.
+   * Only applies to runtime: 'opencode'.
+   */
+  opencode_agent?: string;
+  /**
+   * Communication connector kind. When absent, the daemon's legacy-compat
+   * resolver infers `'telegram'` iff the agent's .env passes the existing
+   * BOT_TOKEN + CHAT_ID + numeric ALLOWED_USER gate, else `'none'`. Explicit
+   * values override the inference. Added in the pluggable-connectors PR1
+   * (`work/feat-pluggable-connectors/PLAN.md`); follow-up PRs will add
+   * Matrix, RocketChat, and other kinds to this union and the runtime
+   * `CONNECTOR_ALLOWLIST` (`src/connectors/index.ts`) together.
+   */
+  connector?: 'telegram' | 'none';
   /**
    * Whether this agent runs a Telegram poller. Defaults to true when absent
    * (preserves existing behaviour). Set to false on specialist agents that
    * should not own a Telegram bot — only the designated orchestrator agent
    * should poll. Requires BOT_TOKEN + CHAT_ID to already be unset or the
    * poller will be skipped regardless.
+   *
+   * Note: for connectors other than `'telegram'`, this field is IGNORED
+   * (not an error) — the generic `inbound_polling` successor field lands
+   * with PR2 of the connector stack.
    */
   telegram_polling?: boolean;
   /**
@@ -257,11 +284,11 @@ export interface AgentConfig {
    * topic X is injected with a `[project: <label>]` context line.
    *
    * Distinct from v1 single-group mode (one shared bot, orchestrator routes to
-   * many agents by topic). Absent → v1/DM behavior unchanged.
+   * many agents by topic). Absent -> v1/DM behavior unchanged.
    *
    * The agent's `.env TOPIC_ID` doubles as its DEFAULT/proactive topic: inbound
    * replies thread the incoming topic via `--thread` (v1 reply symmetry), while
-   * proactive sends (cron/status/typing/hook prompts) go to `.env TOPIC_ID` —
+   * proactive sends (cron/status/typing/hook prompts) go to `.env TOPIC_ID` -
    * which for a PAG agent should be its "standup"/general project topic, NOT an
    * arbitrary one. Single source of truth for "which topic"; project_topics is
    * only the routing + label map.
@@ -298,6 +325,16 @@ export interface CronEntry {
 //
 // Example records
 // ---------------
+// WARNING: these are crons.json (CronDefinition) examples, not config.json.
+// The `enabled` field shown below belongs to CronDefinition ONLY — CronEntry
+// (config.json, above) has no `enabled` field. Setting `enabled: false` on a
+// config.json cron entry does nothing; it migrates as an enabled live cron
+// regardless. To disable a config.json cron, set `type: "disabled"` instead.
+//
+// Migration REPLACES crons.json, it does not merge: runMigrationCore() (see
+// src/daemon/cron-migration.ts) writes the full crons.json envelope from
+// config.json's crons array alone. A live cron with no config.json
+// counterpart is not preserved — it is deleted on the next migration run.
 //
 // Heartbeat — every 6 hours (interval shorthand):
 // {
@@ -821,6 +858,16 @@ export interface IPCRequest {
    * Optional for backwards compatibility — older clients fall back to 'unknown'.
    */
   source?: string;
+  /**
+   * disable-resurrection fix: for the `stop-agent` command, whether this stop was
+   * directly initiated by the user (`cortextos stop` / `cortextos disable`) — in
+   * which case a queued pendingRestart is DROPPED (stop wins) — vs an internal
+   * stop that is part of a larger restart (`cortextos restart`'s stop-half),
+   * which must set this to false so its own follow-up start-agent is honored via
+   * the pendingRestart path. The handler defaults to true when omitted so plain
+   * stop/disable keep "stop wins".
+   */
+  userInitiated?: boolean;
 }
 
 // Worker Types
@@ -874,4 +921,30 @@ export interface AgentStatus {
   sessionStart?: string;
   crashCount?: number;
   model?: string;
+  awaitingConfirmation?: boolean; // first-run observability fix: PTY parked on an
+  // interactive first-run prompt past the auto-accept backstop (wedged, not bootstrapped)
+  dormant?: boolean; // silent-dormancy fix: enabled agent whose heartbeat is stale
+  // relative to its own liveness baseline (uptime, or daemon uptime if absent-from-map)
+  dormancyReason?: string; // human explanation of the dormancy verdict
+}
+
+export type TrustLevel = 'owner' | 'manager' | 'member';
+
+export const VALID_TRUST_LEVELS: TrustLevel[] = ['owner', 'manager', 'member'];
+
+/**
+ * A human team member connected via Slack.
+ * Stored in org config or agent config under team_members.
+ */
+export interface TeamMember {
+  /** Display name (e.g. "Jordan Rivera") */
+  name: string;
+  /** Job role or title (e.g. "Operations Manager") */
+  role: string;
+  /** Slack handle without @ (e.g. "jordan.rivera") */
+  slack_handle: string;
+  /** Trust level — determines how the agent treats messages from this person */
+  trust_level: TrustLevel;
+  /** Optional persona-agent routing hint */
+  assigned_to_agent?: string;
 }

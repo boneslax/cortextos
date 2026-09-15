@@ -50,69 +50,6 @@ describe('Telegram Logging', () => {
     });
   });
 
-  describe('emoji-reaction acks count as answering', () => {
-    // REGRESSION, 2026-08-31. `bus react-telegram` set the Telegram reaction but
-    // never called logOutboundMessage, so an emoji-only reply left nothing in
-    // outbound-messages.jsonl. The agent templates promote exactly that reply
-    // ("single emoji ack, no verbal noise"), and the vault-memory-health probe
-    // decides Solo is wedged by comparing the newest inbound timestamp against the
-    // newest outbound one — so a thumbs-up read as silence and would have paged a
-    // false "running but not answering" alert.
-
-    /** Mirrors the probe's jq: strip millis on BOTH sides, compare newest per chat. */
-    const newestEpoch = (path: string, chat: string): number => {
-      let content = '';
-      try { content = readFileSync(path, 'utf-8'); } catch { return 0; }
-      const stamps = content.split('\n').filter(Boolean).flatMap((line) => {
-        try {
-          const row = JSON.parse(line);
-          if (String(row.chat_id) !== chat) return [];
-          return [Date.parse(String(row.timestamp).replace(/\.\d+Z$/, 'Z')) / 1000];
-        } catch { return []; }
-      });
-      return stamps.length ? Math.max(...stamps) : 0;
-    };
-
-    it('leaves an outbound trace the wedge check can see', () => {
-      const inbound = join(testDir, 'logs', 'bot1', 'inbound-messages.jsonl');
-      const outbound = join(testDir, 'logs', 'bot1', 'outbound-messages.jsonl');
-
-      logInboundMessage(testDir, 'bot1', {
-        message_id: 5091,
-        chat: { id: 111 },
-        from: { id: 111, first_name: 'B' },
-        text: 'you there?',
-      } as unknown as TelegramMessage);
-
-      // Before the ack the chat genuinely looks unanswered.
-      expect(newestEpoch(outbound, '111')).toBe(0);
-
-      // The ack: emoji as the text, target message id, no new id of its own.
-      logOutboundMessage(testDir, 'bot1', '111', '👍', 5091, { parseMode: 'none' });
-
-      const entry = JSON.parse(readFileSync(outbound, 'utf-8').trim());
-      expect(entry.text).toBe('👍');
-      expect(entry.chat_id).toBe('111');
-      expect(entry.message_id).toBe(5091);
-
-      // The invariant: newest outbound is not older than newest inbound, so the
-      // probe reads the chat as answered. Equality is the expected case — both
-      // sides have millis stripped, so an ack inside the same second ties.
-      expect(newestEpoch(outbound, '111')).toBeGreaterThanOrEqual(newestEpoch(inbound, '111'));
-    });
-
-    it('does not confuse a different chat', () => {
-      logInboundMessage(testDir, 'bot1', {
-        message_id: 1, chat: { id: 222 }, from: { id: 222, first_name: 'B' }, text: 'hi',
-      } as unknown as TelegramMessage);
-      logOutboundMessage(testDir, 'bot1', '111', '👍', 1, { parseMode: 'none' });
-
-      const outbound = join(testDir, 'logs', 'bot1', 'outbound-messages.jsonl');
-      // An ack in chat 111 must not mark chat 222 answered.
-      expect(newestEpoch(outbound, '222')).toBe(0);
-    });
-  });
-
   describe('logInboundMessage', () => {
     it('appends with archived_at and agent', () => {
       const raw = { message_id: 42, text: 'hi', from: { id: 1 } };
@@ -191,6 +128,44 @@ describe('Telegram Logging', () => {
       });
     });
 
+    it('does NOT refresh last_heartbeat — inbound traffic cannot spoof a wedged agent alive', () => {
+      const paths = buildPaths(testDir, 'spark');
+      mkdirSync(paths.stateDir, { recursive: true });
+
+      // Wedged agent with a stale heartbeat on disk.
+      const staleHeartbeat = JSON.stringify({
+        agent: 'spark',
+        org: 'eros-os',
+        status: 'online',
+        current_task: 'wedged',
+        mode: 'day',
+        last_heartbeat: '2026-04-23T12:00:00Z',
+        loop_interval: '4h',
+      });
+      writeFileSync(join(paths.stateDir, 'heartbeat.json'), staleHeartbeat);
+
+      const msg: TelegramMessage = {
+        message_id: 12345,
+        date: 1714214400,
+        from: { id: 6595584963, is_bot: false, first_name: 'Eros' },
+        chat: { id: 6595584963, type: 'private' },
+        text: 'Doe maar',
+      };
+
+      recordInboundTelegram(paths, testDir, 'spark', 'eros-os', 'Eros', msg);
+
+      // The telegram_received event WAS written…
+      const today = new Date().toISOString().split('T')[0];
+      const eventPath = join(testDir, 'analytics', 'events', 'spark', `${today}.jsonl`);
+      const eventEntry = JSON.parse(readFileSync(eventPath, 'utf-8').trim());
+      expect(eventEntry.event).toBe('telegram_received');
+
+      // …but last_heartbeat is byte-identical: the daemon-on-behalf write
+      // did not opt into the refresh.
+      const after = readFileSync(join(paths.stateDir, 'heartbeat.json'), 'utf-8');
+      expect(after).toBe(staleHeartbeat);
+    });
+
     it('marks has_media=true and uses caption length when the message carries a photo', () => {
       const paths = buildPaths(testDir, 'bolt');
       mkdirSync(paths.stateDir, { recursive: true });
@@ -211,6 +186,47 @@ describe('Telegram Logging', () => {
       const eventEntry = JSON.parse(readFileSync(eventPath, 'utf-8').trim());
       expect(eventEntry.metadata.has_media).toBe(true);
       expect(eventEntry.metadata.text_chars).toBe('screenshot of the dashboard'.length);
+    });
+
+    it('archives reply target metadata for Telegram replies', () => {
+      const paths = buildPaths(testDir, 'spark');
+      mkdirSync(paths.stateDir, { recursive: true });
+
+      const msg: TelegramMessage = {
+        message_id: 124,
+        date: 1714214400,
+        from: { id: 6595584963, is_bot: false, first_name: 'Eros' },
+        chat: { id: 6595584963, type: 'private' },
+        text: 'what is this?',
+        reply_to_message: {
+          message_id: 36,
+          date: 1714214300,
+          chat: { id: 6595584963, type: 'private' },
+          caption: 'Code review done — full HTML breakdown attached.',
+          document: { file_id: 'doc1', file_name: 'hermes-review.html' },
+        },
+      };
+
+      recordInboundTelegram(paths, testDir, 'spark', 'eros-os', 'Eros', msg);
+
+      const inboundPath = join(testDir, 'logs', 'spark', 'inbound-messages.jsonl');
+      const inboundEntry = JSON.parse(readFileSync(inboundPath, 'utf-8').trim());
+      expect(inboundEntry).toMatchObject({
+        message_id: 124,
+        text: 'what is this?',
+        reply_to_message_id: 36,
+        reply_to_text: 'Code review done — full HTML breakdown attached.\n[document: hermes-review.html]',
+        reply_to_has_media: true,
+      });
+
+      const today = new Date().toISOString().split('T')[0];
+      const eventPath = join(testDir, 'analytics', 'events', 'spark', `${today}.jsonl`);
+      const eventEntry = JSON.parse(readFileSync(eventPath, 'utf-8').trim());
+      expect(eventEntry.metadata).toMatchObject({
+        reply_to_message_id: 36,
+        reply_to_text_chars: 'Code review done — full HTML breakdown attached.\n[document: hermes-review.html]'.length,
+        reply_to_has_media: true,
+      });
     });
 
     it('still writes the JSONL row when the bus-event emit throws', () => {

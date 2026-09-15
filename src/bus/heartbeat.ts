@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, existsSync, unlinkSync, statSync } from 'fs'
 import { join } from 'path';
 import type { Heartbeat, BusPaths } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
+import { withFileLockSync } from '../utils/lock.js';
 
 /**
  * SessionEnd-hook end-type markers (see src/hooks/hook-crash-alert.ts). A
@@ -85,10 +86,18 @@ export function updateHeartbeat(
     loop_interval: options?.loopInterval ?? '',
   };
 
-  atomicWriteSync(
-    join(paths.stateDir, 'heartbeat.json'),
-    JSON.stringify(heartbeat),
-  );
+  // Serialize this full overwrite against the read-modify-write heartbeat
+  // refresh in event.ts: both take the same per-agent stateDir lock, so a
+  // concurrent refresh cannot load a stale heartbeat and then clobber the
+  // status/mode/current_task fields set here back to stale (TOCTOU lost
+  // update). withFileLockSync may throw on lock timeout — that surfaces
+  // rather than silently losing the update.
+  withFileLockSync(paths.stateDir, () => {
+    atomicWriteSync(
+      join(paths.stateDir, 'heartbeat.json'),
+      JSON.stringify(heartbeat),
+    );
+  });
 
   // The agent is alive in its (post-restart) session — clear stale SessionEnd
   // markers so the crash-alert hook cannot misclassify a later genuine crash

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { TelegramAPI } from '../../../src/telegram/api';
 
 // Phase-1 prerequisite (PLAN-v3 §7): post() must surface error_code AND
@@ -21,8 +21,18 @@ function mockFetchJson(body: any) {
 }
 
 describe('post() typed error — carries error_code + parameters (PLAN-v3 §7)', () => {
+  // Force pooled fetch: the resilient node:https transport is default-ON
+  // (CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS !== '0') and bypasses a mocked
+  // globalThis.fetch, hitting the real Telegram API. Match the convention
+  // used by tests/unit/telegram/api.test.ts.
+  const originalUnpooled = process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+  beforeEach(() => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '0';
+  });
   const originalFetch = globalThis.fetch;
   afterEach(() => {
+    if (originalUnpooled === undefined) delete process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+    else process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = originalUnpooled;
     globalThis.fetch = originalFetch;
     vi.restoreAllMocks();
   });

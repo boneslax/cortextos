@@ -2,6 +2,7 @@ import { appendFileSync, existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import type { EventCategory, EventSeverity, BusPaths, Heartbeat } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
+import { withFileLockSync } from '../utils/lock.js';
 import { randomString } from '../utils/random.js';
 import { validateEventCategory, validateEventSeverity, isValidJson } from '../utils/validate.js';
 
@@ -11,14 +12,19 @@ import { validateEventCategory, validateEventSeverity, isValidJson } from '../ut
  *
  * Events are stored at: {analyticsDir}/events/{agent}/{YYYY-MM-DD}.jsonl
  *
- * Side-effect: if this agent has an existing heartbeat.json, refresh its
- * `last_heartbeat` timestamp. Activity is liveness — if the agent is
- * logging events, it is by definition alive, so the stale-heartbeat
- * monitor should not page on it. Other fields (status, mode, etc.) are
- * preserved from the last explicit update-heartbeat call. Best-effort:
- * a failing heartbeat refresh never blocks the event write itself.
- * If no heartbeat file exists yet we do nothing — the first
- * update-heartbeat call creates it with full field values.
+ * Optional side-effect: when the caller opts in via `opts.refreshHeartbeat`
+ * and this agent has an existing heartbeat.json, refresh its
+ * `last_heartbeat` timestamp. "Activity is liveness" holds ONLY for an
+ * agent logging its OWN in-session activity, so opt-in is reserved for
+ * those call sites. Daemon-on-behalf writes (e.g. delivering an inbound
+ * message to another agent) must never opt in — otherwise a wedged
+ * agent's heartbeat would be spoofed fresh by traffic it did not act on.
+ * The default is off (fail-safe): a caller that says nothing never
+ * touches the heartbeat. Other fields (status, mode, etc.) are preserved
+ * from the last explicit update-heartbeat call. Best-effort: a failing
+ * heartbeat refresh never blocks the event write itself. If no heartbeat
+ * file exists yet we do nothing — the first update-heartbeat call creates
+ * it with full field values.
  */
 export function logEvent(
   paths: BusPaths,
@@ -28,6 +34,7 @@ export function logEvent(
   eventName: string,
   severity: EventSeverity,
   metadata?: Record<string, unknown> | string,
+  opts?: { refreshHeartbeat?: boolean },
 ): void {
   validateEventCategory(category);
   validateEventSeverity(severity);
@@ -64,8 +71,11 @@ export function logEvent(
 
   appendFileSync(join(eventsDir, `${today}.jsonl`), eventLine + '\n', 'utf-8');
 
-  // Refresh heartbeat timestamp as a side-effect. See doc comment above.
-  refreshHeartbeatTimestamp(paths, timestamp);
+  // Refresh heartbeat timestamp only when the caller opts in (in-session
+  // self-logging). Default off is fail-safe. See doc comment above.
+  if (opts?.refreshHeartbeat) {
+    refreshHeartbeatTimestamp(paths, timestamp);
+  }
 }
 
 /**
@@ -78,9 +88,19 @@ function refreshHeartbeatTimestamp(paths: BusPaths, timestamp: string): void {
   try {
     const hbPath = join(paths.stateDir, 'heartbeat.json');
     if (!existsSync(hbPath)) return;
-    const hb = JSON.parse(readFileSync(hbPath, 'utf-8')) as Heartbeat;
-    hb.last_heartbeat = timestamp;
-    atomicWriteSync(hbPath, JSON.stringify(hb));
+    // This read-modify-write is NOT atomic against a concurrent full overwrite
+    // in updateHeartbeat(): without a lock, this reader can load a stale
+    // heartbeat, an explicit update writes new status/mode/task fields, and then
+    // this write clobbers them back to stale (TOCTOU lost update). Take the same
+    // per-agent stateDir lock updateHeartbeat() takes so the read+write is
+    // serialized against it. withFileLockSync may throw on timeout; the
+    // surrounding try/catch keeps the refresh best-effort and never blocks the
+    // already-persisted event.
+    withFileLockSync(paths.stateDir, () => {
+      const hb = JSON.parse(readFileSync(hbPath, 'utf-8')) as Heartbeat;
+      hb.last_heartbeat = timestamp;
+      atomicWriteSync(hbPath, JSON.stringify(hb));
+    });
   } catch {
     // Best-effort — event already persisted, heartbeat refresh is secondary.
   }

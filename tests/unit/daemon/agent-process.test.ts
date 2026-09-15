@@ -9,6 +9,7 @@ const mockPty = {
   write: vi.fn(),
   getPid: vi.fn().mockReturnValue(12345),
   isAlive: vi.fn().mockReturnValue(true),
+  isAwaitingInteractiveConfirmation: vi.fn().mockReturnValue(false),
   onExit: vi.fn().mockImplementation((cb: (exitCode: number, signal?: number) => void) => {
     capturedOnExit = cb;
   }),
@@ -48,6 +49,7 @@ const fsMocks = {
   writeFileSync: vi.fn(),
   appendFileSync: vi.fn(),
   statSync: vi.fn(),
+  unlinkSync: vi.fn(),
 };
 
 vi.mock('fs', async () => {
@@ -76,6 +78,7 @@ vi.mock('fs', async () => {
     get writeFileSync() { return fsMocks.writeFileSync; },
     get appendFileSync() { return fsMocks.appendFileSync; },
     get statSync() { return fsMocks.statSync; },
+    get unlinkSync() { return fsMocks.unlinkSync; },
   };
 });
 
@@ -98,6 +101,8 @@ beforeEach(() => {
   mockPty.write.mockClear();
   mockPty.isAlive.mockClear();
   mockPty.isAlive.mockReturnValue(true);
+  mockPty.isAwaitingInteractiveConfirmation.mockClear();
+  mockPty.isAwaitingInteractiveConfirmation.mockReturnValue(false);
   mockPty.onExit.mockClear();
   mockInjectMessage.mockClear();
   fsMocks.existsSync.mockReset().mockReturnValue(false);
@@ -105,6 +110,7 @@ beforeEach(() => {
   fsMocks.writeFileSync.mockReset();
   fsMocks.appendFileSync.mockReset();
   fsMocks.statSync.mockReset();
+  fsMocks.unlinkSync.mockReset();
 });
 
 describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
@@ -271,6 +277,177 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
   });
 });
 
+describe('AgentProcess - duplicate-PTY fix (death-confirmed + join-in-flight stop)', () => {
+  // Model a SIGHUP-immune child: node-pty's kill() sends SIGHUP with no
+  // escalation, so a wedged child never fires onExit and stays alive to the
+  // signal-0 liveness probe until a real SIGKILL is delivered. The spy answers
+  // both the signal-0 probes (isChildAlive) and the SIGKILL escalation.
+  function installKillSpy() {
+    let killed = false;
+    let sigkillCount = 0;
+    const spy = vi.spyOn(process, 'kill').mockImplementation(((_pid: number, sig?: string | number) => {
+      if (sig === 'SIGKILL') {
+        killed = true;
+        sigkillCount++;
+        return true;
+      }
+      // signal-0 liveness probe (isChildAlive)
+      if (killed) {
+        const e = new Error('ESRCH') as NodeJS.ErrnoException;
+        e.code = 'ESRCH';
+        throw e;
+      }
+      return true; // still alive
+    }) as unknown as typeof process.kill);
+    return { spy, sigkills: () => sigkillCount };
+  }
+
+  it('W1: stop() escalates to SIGKILL and reaps a SIGHUP-immune child before resolving', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    expect(ap.getStatus().status).toBe('running');
+
+    const { spy, sigkills } = installKillSpy();
+    vi.useFakeTimers();
+    try {
+      let resolved = false;
+      const stopP = ap.stop().then(() => { resolved = true; });
+
+      // Advance through stop()'s graceful window: 1s (Ctrl-C) + 5s (/exit) +
+      // 15s (Promise.race bound). capturedOnExit is never fired — the child is
+      // wedged — so the sleep(15000) wins the race. stop() must NOT be resolved
+      // yet: the child is still alive and the SIGKILL escalation has to run.
+      await vi.advanceTimersByTimeAsync(1000 + 5000 + 14000);
+      expect(resolved).toBe(false);
+      expect(spy).not.toHaveBeenCalledWith(12345, 'SIGKILL');
+
+      // Cross the 15s race boundary. Now the graceful window has elapsed with the
+      // child still alive -> SIGKILL is delivered, the bounded poll observes death
+      // (signal-0 now throws ESRCH), and stop() resolves to 'stopped'.
+      await vi.advanceTimersByTimeAsync(2000);
+      await stopP;
+
+      expect(resolved).toBe(true);
+      expect(spy).toHaveBeenCalledWith(12345, 'SIGKILL');
+      expect(sigkills()).toBe(1);
+      expect(ap.getStatus().status).toBe('stopped');
+    } finally {
+      vi.useRealTimers();
+      spy.mockRestore();
+    }
+  });
+
+  it('W2: a re-entrant stop() joins the death-confirmed teardown (one SIGKILL, both resolve together)', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    const { spy, sigkills } = installKillSpy();
+    vi.useFakeTimers();
+    try {
+      let p1done = false;
+      let p2done = false;
+      const p1 = ap.stop().then(() => { p1done = true; });
+      // Re-enter stop() while the first teardown is parked in its graceful
+      // window. Before Change B this returned immediately (silent no-op),
+      // letting the manager's eviction path spawn a fresh PTY alongside the
+      // still-alive predecessor. Now it must JOIN the in-flight teardown.
+      const p2 = ap.stop().then(() => { p2done = true; });
+
+      // Through the graceful window: neither resolves — the re-entrant stop is
+      // waiting on the SAME teardown, not short-circuiting out early.
+      await vi.advanceTimersByTimeAsync(1000 + 5000 + 14000);
+      expect(p1done).toBe(false);
+      expect(p2done).toBe(false);
+
+      // Cross the race boundary -> single SIGKILL -> death confirmed -> BOTH
+      // callers unblock at the same time off the shared teardown promise.
+      await vi.advanceTimersByTimeAsync(2000);
+      await Promise.all([p1, p2]);
+
+      expect(p1done).toBe(true);
+      expect(p2done).toBe(true);
+      // Exactly one teardown ran: the join shares it, so SIGKILL fires once.
+      expect(sigkills()).toBe(1);
+      expect(ap.getStatus().status).toBe('stopped');
+    } finally {
+      vi.useRealTimers();
+      spy.mockRestore();
+    }
+  });
+
+  it('fast-exit path adds no SIGKILL and no added latency (Change A false-kill guard)', async () => {
+    // Regression control: when the child exits cleanly inside the graceful
+    // window, the SIGKILL escalation must NOT run. This proves Change A is
+    // scoped to the timed-out case only — a normal stop is unchanged.
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    let killed = false;
+    const spy = vi.spyOn(process, 'kill').mockImplementation(((_pid: number, sig?: string | number) => {
+      if (sig === 'SIGKILL') { killed = true; return true; }
+      // Child already exited (onExit fired): signal-0 reports dead.
+      const e = new Error('ESRCH') as NodeJS.ErrnoException;
+      e.code = 'ESRCH';
+      throw e;
+    }) as unknown as typeof process.kill);
+    // The PTY also reports not-alive after the exit, so pty.kill() is skipped.
+    mockPty.isAlive.mockReturnValue(false);
+
+    try {
+      const stopP = ap.stop();
+      // Fire the exit promptly — the child exits within the graceful window,
+      // winning the Promise.race well before the 15s bound.
+      await new Promise((r) => setTimeout(r, 50));
+      capturedOnExit!(0, 0);
+      await stopP;
+
+      expect(ap.getStatus().status).toBe('stopped');
+      expect(spy).not.toHaveBeenCalledWith(expect.anything(), 'SIGKILL');
+      expect(killed).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  }, 10000);
+});
+
+describe('AgentProcess - disable-resurrection fix (.user-disable gate)', () => {
+  it('disabled agent force-exit does NOT trigger crash recovery', async () => {
+    // A disabled agent that force-exits/crashes arrives at handleExit with
+    // stopRequested=false. The .user-disable marker must gate crash recovery.
+    fsMocks.existsSync.mockImplementation((p: any) =>
+      String(p).endsWith('/state/alice/.user-disable'),
+    );
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    // Force-exit with a non-zero code (would be a crash on old code).
+    capturedOnExit!(1, 0);
+
+    // handleExit returns early via the isUserDisabled() gate: status is
+    // 'stopped' (down, not crash-looping) and NO crash-recovery side effect
+    // (the restarts.log CRASH append) fired.
+    expect(ap.getStatus().status).toBe('stopped');
+    expect(fsMocks.appendFileSync).not.toHaveBeenCalled();
+  });
+
+  it('start() clears a lingering .user-disable marker (re-enabled agent crash-recovers again)', async () => {
+    const markerPath = '/tmp/test-ctx/state/alice/.user-disable';
+    // Marker present at start → start() must unlink it (agent re-enabled).
+    fsMocks.existsSync.mockImplementation((p: any) => String(p) === markerPath);
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    expect(fsMocks.unlinkSync).toHaveBeenCalledWith(markerPath);
+
+    // Marker now gone → a subsequent crash recovers normally.
+    fsMocks.existsSync.mockReturnValue(false);
+    capturedOnExit!(1, 0);
+    expect(ap.getStatus().status).toBe('crashed');
+  });
+});
+
 describe('AgentProcess - BUG-048 fix (session timer re-reads config)', () => {
   it('fires sessionRefresh when config on disk still matches original short duration', async () => {
     const refreshSpy = vi.fn().mockResolvedValue(undefined);
@@ -414,5 +591,72 @@ describe('AgentProcess — CrashLoopPauser (instar-inspired sliding window)', ()
     }
     // Should be 'crashed' (recovering), NOT 'halted', because daily max is 5
     expect(ap.getStatus().status).not.toBe('halted');
+  });
+});
+
+describe('AgentProcess - onboarding marker (do not auto-write .onboarded on heartbeat)', () => {
+  // Regression: buildStartupPrompt used to auto-write the .onboarded marker
+  // whenever a heartbeat.json existed, on the assumption the agent had
+  // onboarded and just forgot the marker. That silently suppressed FIRST BOOT
+  // for agents that were manually scaffolded (heartbeat present) but never
+  // actually ran onboarding. The marker must be explicit: a heartbeat alone
+  // must NOT mark an agent onboarded. This is general daemon behavior (it was
+  // surfaced via a manually-scaffolded opencode agent, but applies to any
+  // runtime).
+  it('does not auto-mark a heartbeat-only agent as onboarded (still routes to FIRST BOOT)', async () => {
+    fsMocks.existsSync.mockImplementation((path: string) => {
+      if (path.endsWith('/.force-fresh')) return false;
+      if (path.endsWith('/.onboarded')) return false;
+      if (path.endsWith('/heartbeat.json')) return true;
+      if (path.endsWith('/ONBOARDING.md')) return true;
+      return false;
+    });
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    const prompt = mockPty.spawn.mock.calls[0]?.[1] ?? '';
+    expect(prompt).toContain('FIRST BOOT');
+    expect(prompt).toContain('read ONBOARDING.md and complete the onboarding protocol');
+    // The buggy auto-write must be gone: no .onboarded written from heartbeat presence.
+    expect(fsMocks.writeFileSync).not.toHaveBeenCalledWith(
+      expect.stringContaining('/.onboarded'),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('respects an existing .onboarded marker (suppresses FIRST BOOT)', async () => {
+    fsMocks.existsSync.mockImplementation((path: string) => {
+      if (path.endsWith('/.force-fresh')) return false;
+      if (path.endsWith('/.onboarded')) return true;
+      if (path.endsWith('/heartbeat.json')) return true;
+      if (path.endsWith('/ONBOARDING.md')) return true;
+      return false;
+    });
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    const prompt = mockPty.spawn.mock.calls[0]?.[1] ?? '';
+    expect(prompt).not.toContain('FIRST BOOT');
+    expect(prompt).not.toContain('complete the onboarding protocol');
+  });
+});
+
+describe('AgentProcess - first-run observability (awaitingConfirmation)', () => {
+  it('surfaces awaitingConfirmation when the PTY reports a first-run wedge', async () => {
+    mockPty.isAwaitingInteractiveConfirmation.mockReturnValue(true);
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    expect(ap.getStatus().awaitingConfirmation).toBe(true);
+  });
+
+  it('reports awaitingConfirmation falsy for a normal running agent', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    expect(ap.getStatus().awaitingConfirmation).toBeFalsy();
   });
 });

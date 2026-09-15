@@ -548,7 +548,7 @@ export function completeTask(
       logEvent(eventPaths, assignee, taskOrg, 'task', 'task_completed', 'info', {
         task_id: taskId,
         ...(result ? { result } : {}),
-      });
+      }, { refreshHeartbeat: true });
     } catch {
       // Never let observability break task completion.
     }
@@ -565,6 +565,7 @@ export function listTasks(
     agent?: string;
     status?: TaskStatus;
     priority?: Priority;
+    project?: string;
     respectDeps?: boolean;
   },
 ): Task[] {
@@ -588,6 +589,7 @@ export function listTasks(
       if (filters?.agent && task.assigned_to !== filters.agent) continue;
       if (filters?.status && task.status !== filters.status) continue;
       if (filters?.priority && task.priority !== filters.priority) continue;
+      if (filters?.project && task.project !== filters.project) continue;
       if (task.archived) continue;
 
       tasks.push(task);
