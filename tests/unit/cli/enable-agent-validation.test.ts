@@ -11,7 +11,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { discoverProjectRoot, readEnabledAgents } from '../../../src/cli/enable-agent';
+import {
+  discoverProjectRoot,
+  readEnabledAgents,
+  shouldRequireTelegramForEnable,
+  missingTelegramEnvForEnable,
+} from '../../../src/cli/enable-agent';
 
 describe('BUG-035 + BUG-013: enable-agent validation', () => {
   let tmpHome: string;
@@ -135,6 +140,79 @@ describe('BUG-035 + BUG-013: enable-agent validation', () => {
       const backups = readdirSync(join(tmpHome, '.cortextos', 'default', 'config'))
         .filter(f => f.startsWith('enabled-agents.json.broken-'));
       expect(backups.length).toBe(0);
+    });
+  });
+});
+
+describe('internal-only Telegram preflight', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'cortextos-internal-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function writeConfig(content: string): string {
+    const path = join(tmpDir, 'config.json');
+    writeFileSync(path, content);
+    return path;
+  }
+
+  describe('shouldRequireTelegramForEnable', () => {
+    it('returns false when config.json has telegram_polling: false (internal-only)', () => {
+      const path = writeConfig('{"telegram_polling": false}');
+      expect(shouldRequireTelegramForEnable(path)).toBe(false);
+    });
+
+    it('returns true for a null path', () => {
+      expect(shouldRequireTelegramForEnable(null)).toBe(true);
+    });
+
+    it('returns true for a nonexistent config path', () => {
+      expect(shouldRequireTelegramForEnable(join(tmpDir, 'does-not-exist.json'))).toBe(true);
+    });
+
+    it('returns true for malformed JSON', () => {
+      const path = writeConfig('{not valid json{{{');
+      expect(shouldRequireTelegramForEnable(path)).toBe(true);
+    });
+
+    it('returns true for an empty object (no telegram_polling field)', () => {
+      const path = writeConfig('{}');
+      expect(shouldRequireTelegramForEnable(path)).toBe(true);
+    });
+
+    it('returns true when telegram_polling is true', () => {
+      const path = writeConfig('{"telegram_polling": true}');
+      expect(shouldRequireTelegramForEnable(path)).toBe(true);
+    });
+
+    it('requires strict boolean false — string "false", numeric 0, and array all return true', () => {
+      const strPath = writeConfig('{"telegram_polling": "false"}');
+      expect(shouldRequireTelegramForEnable(strPath)).toBe(true);
+
+      const numPath = writeConfig('{"telegram_polling": 0}');
+      expect(shouldRequireTelegramForEnable(numPath)).toBe(true);
+
+      const arrPath = writeConfig('[]');
+      expect(shouldRequireTelegramForEnable(arrPath)).toBe(true);
+    });
+  });
+
+  describe('missingTelegramEnvForEnable', () => {
+    it('returns [] when Telegram is not required, regardless of env', () => {
+      expect(missingTelegramEnvForEnable({}, false)).toEqual([]);
+    });
+
+    it('returns both keys when required and env is empty', () => {
+      expect(missingTelegramEnvForEnable({}, true)).toEqual(['BOT_TOKEN', 'CHAT_ID']);
+    });
+
+    it('returns only the missing key when one is present', () => {
+      expect(missingTelegramEnvForEnable({ BOT_TOKEN: 'x' }, true)).toEqual(['CHAT_ID']);
     });
   });
 });

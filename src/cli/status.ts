@@ -79,7 +79,7 @@ export const statusCommand = new Command('status')
     }
   });
 
-function displayStatuses(statuses: AgentStatus[]): void {
+export function displayStatuses(statuses: AgentStatus[]): void {
   if (statuses.length === 0) {
     console.log('No agents running.');
     console.log('Add one with: cortextos add-agent <name>');
@@ -94,18 +94,27 @@ function displayStatuses(statuses: AgentStatus[]): void {
   console.log(header);
   console.log(separator);
 
+  let anyAwaiting = false;
+  let anyDormant = false;
   for (const s of statuses) {
     const name = s.name.padEnd(18);
     const crashes = s.crashCount ?? 0;
-    // Surface crash loops even when current session uptime is short
-    const statusLabel = crashes > 0 ? `${s.status}⚠` : s.status;
-    const status = statusLabel.padEnd(12);
+    // Surface crash loops even when current session uptime is short; special
+    // liveness states (first-run wedge, silent dormancy) take priority over
+    // the crash-count marker since they are the more actionable signal.
+    let label: string = crashes > 0 ? `${s.status}⚠` : s.status;
+    if (s.awaitingConfirmation) { label = 'unhealthy*'; anyAwaiting = true; }
+    if (s.dormant) { label = 'dormant†'; anyDormant = true; }
+    const status = label.padEnd(12);
     const pid = (s.pid?.toString() || '-').padEnd(10);
     const uptime = s.uptime != null ? formatUptime(s.uptime).padEnd(14) : '-'.padEnd(14);
     const crashCol = String(crashes).padEnd(9);
-    const model = s.model || '-';
+    const model = s.model || 'default';
     console.log(`  ${name}${status}${pid}${uptime}${crashCol}${model}`);
   }
+
+  if (anyAwaiting) console.log('  * awaiting interactive confirmation (first-run prompt not accepted)\n');
+  if (anyDormant) console.log('  † enabled but heartbeat stale relative to liveness baseline (possible silent dormancy)\n');
 
   console.log('');
   if (statuses.some(s => (s.crashCount ?? 0) > 0)) {

@@ -1,4 +1,7 @@
-node_modules/
+# No trailing slash: `node_modules/` matches only real directories, so a
+# SYMLINKED node_modules (common in worktree checkouts) evades it and can be
+# committed — which once took down every agent sharing this checkout's bus.
+node_modules
 .claude/
 !.claude/commands/
 !.claude/commands/**
@@ -60,3 +63,18 @@ dashboard/test-*.py
 !community/agents/research-agent/
 !community/agents/research-agent/**
 graphify-out/
+
+# Internal ops/dev reports — never public (2026-07-01 leak remediation, SEC-1 L4).
+# docs/ is already ignored above; these cover root-level and phase-report globs
+# so a dev artifact cannot re-track outside docs/. Real user docs live elsewhere.
+WINDOWS_INSTALL_REPORT.md
+*INSTALL_REPORT.md
+/PHASE*-REPORT.md
+docs/phase-reports/
+
+# claude-to-codex-migration leakage-guard fixture (author-specific ban tokens: fleet
+# roster + specific chat-ids). CI/local ONLY, pointed at by CTX_LEAKAGE_FIXTURE. NEVER
+# public — glob'd broadly so it can never be accidentally committed into the tree.
+leakage-fixture.json
+**/leakage-fixture.json
+*.leakage-fixture.json

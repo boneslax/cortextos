@@ -24,8 +24,36 @@ module.exports = {
         // added by hand is silently dropped on the next regeneration
         // run — and the operator channel would go dark with nothing saying so.
         CTX_OPERATOR_AGENT: process.env.CTX_OPERATOR_AGENT || "solo",
+        // On by default. global fetch (Undici) hardcodes autoSelectFamily=false
+        // and wedges on broken-dual-stack hosts (IPv6 configured but blackholed)
+        // by committing to the dead family for the full timeout. Routing the
+        // Telegram JSON API calls and file downloads over a dedicated keep-alive
+        // node:https path gives us Happy Eyeballs (autoSelectFamily) instead,
+        // which races the families and self-heals, without breaking IPv6-only
+        // hosts (multipart photo/document uploads stay on pooled fetch). Set to
+        // '0' to opt out and force pooled fetch.
+        CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS: process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS || '1',
+        // Debug-only: set to '1' to enable SIGUSR2 signal → controlled
+        // uncaughtException for testing the crash-visibility path
+        // (.daemon-crashed markers + crash-loop operator Telegram alert).
+        // Leave '0' in production; enable temporarily to reproduce crash
+        // paths during development. `kill -SIGUSR2 $(pm2 pid cortextos-daemon)`
+        // then watch the operator chat for "🚨 CRITICAL: daemon crash-looping"
+        // after 3 crashes in 15 min.
+        CTX_DEBUG_ALLOW_CRASH_TRIGGER: '0',
       },
-      max_restarts: 50,
+      // max_restarts + restart_delay is the ultimate crash-storm circuit
+      // breaker. If the daemon dies 10 times faster than 5s apart, PM2
+      // gives up — the fleet goes fully dead, requiring a manual
+      // `pm2 restart cortextos-daemon`. That is intentional: storm
+      // protection > fleet uptime during a pathological crash loop.
+      // The daemon's uncaughtException handler (src/daemon/index.ts)
+      // fires a Telegram alert to the operator at 3+ crashes in 15 min —
+      // well before this circuit trips. Do NOT raise these values without
+      // also strengthening the upstream fix; the 2026-04-22 storm is a
+      // reminder that unchecked auto-restart amplifies one bug into a
+      // fleet-wide outage.
+      max_restarts: 10,
       restart_delay: 5000,
       autorestart: true,
     },

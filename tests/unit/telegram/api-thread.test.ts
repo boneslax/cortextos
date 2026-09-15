@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { writeFileSync, mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -13,7 +13,17 @@ function okResponse() {
 }
 
 describe('TelegramAPI message_thread_id threading', () => {
+  // Force pooled fetch: the resilient node:https transport is default-ON
+  // (CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS !== '0') and bypasses a mocked
+  // globalThis.fetch, hitting the real Telegram API. Match the convention
+  // used by tests/unit/telegram/api.test.ts.
+  const originalUnpooled = process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+  beforeEach(() => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '0';
+  });
   afterEach(() => {
+    if (originalUnpooled === undefined) delete process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+    else process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = originalUnpooled;
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });

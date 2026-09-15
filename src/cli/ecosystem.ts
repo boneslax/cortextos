@@ -151,6 +151,7 @@ module.exports = {
         // added by hand is silently dropped on the next regeneration
         // run — and the operator channel would go dark with nothing saying so.
         CTX_OPERATOR_AGENT: process.env.CTX_OPERATOR_AGENT || ${JSON.stringify(options.operatorAgent ?? 'solo')},
+        CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS: process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS || '1',
       },
       max_restarts: 50,
       restart_delay: 5000,

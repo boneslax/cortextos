@@ -1,18 +1,31 @@
-import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { join, sep } from 'path';
 import { homedir } from 'os';
 import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
 import { AgentPTY } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
-import { MessageDedup, injectMessage } from '../pty/inject.js';
+import { OpencodePTY, opencodeSessionExists } from '../pty/opencode-pty.js';
+import { MessageDedup, injectMessage as injectMessageIntoPty } from '../pty/inject.js';
 import type { TelegramAPI } from '../telegram/api.js';
+import type { MessageConnector } from '../connectors/index.js';
+import { TelegramConnector } from '../connectors/index.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
 
 type LogFn = (msg: string) => void;
+
+// opencode --continue wedge auto-recovery thresholds. A wedged session exits
+// code 0 almost immediately on every `--continue` re-attach, so a "wedge exit"
+// is an exit_code=0 that arrives within FAST_EXIT_MS of the spawn. After
+// WEDGE_THRESHOLD consecutive such exits we stop trusting the session marker and
+// force a fresh boot. 3 mirrors the codex thread-resume crash-loop signature
+// (see shouldContinue()); the fast-exit gate keeps a genuinely long, cleanly
+// exited session from ever counting.
+const OPENCODE_CONTINUE_WEDGE_THRESHOLD = 3;
+const OPENCODE_CONTINUE_WEDGE_FAST_EXIT_MS = 60_000;
 
 /**
  * Manages a single agent's lifecycle.
@@ -35,6 +48,13 @@ export class AgentProcess {
   private sessionStart: Date | null = null;
   private status: AgentStatus['status'] = 'stopped';
   private stopping: boolean = false;
+  // Change B (join-in-flight re-entry): the single in-flight teardown promise.
+  // A stop() that arrives while a teardown is already running awaits THIS
+  // instead of returning immediately. The only re-entrant caller is the
+  // manager's eviction path (`await stale.process.stop()`), which must block
+  // until the real, death-confirmed teardown completes rather than racing a
+  // fresh spawn against a still-alive predecessor (the duplicate-PTY defect).
+  private stopInFlight: Promise<void> | null = null;
   // BUG-040 fix: persists across stop() return until handleExit clears it.
   // Required because BUG-032's CRLF + 5s wait can cause graceful shutdown to
   // exceed the 5s Promise.race timeout in stop(), which would otherwise reset
@@ -64,12 +84,22 @@ export class AgentProcess {
   // (each start() recreates the PTY, but the Telegram handle persists).
   private telegramApi: TelegramAPI | null = null;
   private telegramChatId: string | null = null;
-  private telegramTopicId: number | undefined = undefined;
   // Issue #392: tracks whether the most recently built startup prompt consumed
   // a handoff doc marker. start() reads this after spawn to decide whether the
-  // daemon should fire the codex-app-server back-online Telegram directly
-  // (skipped on handoff restart — the agent sends its own contextual reply).
+  // daemon should fire runtime-owned lifecycle Telegram directly.
   private lastSpawnWasHandoff = false;
+  // opencode --continue wedge auto-recovery state (see the OPENCODE_CONTINUE_WEDGE_*
+  // constants). lastSpawnMode/lastStartAtMs let handleExit tell an immediate
+  // exit-0-on-continue (wedge) apart from a normal exit; the counter tracks the
+  // consecutive streak and is reset by any non-wedge exit.
+  private lastSpawnMode: 'fresh' | 'continue' | null = null;
+  private lastStartAtMs = 0;
+  private opencodeContinueWedgeCount = 0;
+  // PR1 of pluggable connectors: holds the agent's MessageConnector handle.
+  // Populated via setConnector() from agent-manager. One-way mirror to legacy
+  // telegramApi/telegramChatId fields when (and only when) the connector is a
+  // TelegramConnector. Non-Telegram connectors leave the legacy fields untouched.
+  private connector: MessageConnector | null = null;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -107,8 +137,15 @@ export class AgentProcess {
       writeCortextosEnv(this.env.agentDir, this.env);
     }
 
-    // Determine start mode
-    const mode = this.shouldContinue() ? 'continue' : 'fresh';
+    // Determine start mode. CONSUME ONLY WHAT YOU HONOURED: one probe feeds
+    // the decision, the same observation authorises the post-spawn delete, and
+    // the delete is gated on that observation having actually selected `fresh`.
+    const observedForceFresh = this.probeForceFreshMarker();
+    const mode = this.shouldContinue(observedForceFresh) ? 'continue' : 'fresh';
+    // Record the mode/time this lifecycle spawned in so handleExit can detect an
+    // immediate exit-0-on-continue wedge (opencode --continue re-attach loop).
+    this.lastSpawnMode = mode;
+    this.lastStartAtMs = Date.now();
     const prompt = mode === 'fresh'
       ? this.buildStartupPrompt()
       : this.buildContinuePrompt();
@@ -120,6 +157,13 @@ export class AgentProcess {
     // (e.g. if the previous stop() timed out before the PTY actually exited).
     // We're starting fresh — the new PTY has no pending stop.
     this.stopRequested = false;
+    // disable-resurrection fix: a fresh start means this agent is (re-)enabled.
+    // Clear any lingering .user-disable marker so handleExit's crash-recovery gate
+    // stops suppressing restarts for it. No-op if the marker is absent.
+    try {
+      const disableMarker = join(this.env.ctxRoot, 'state', this.name, '.user-disable');
+      if (existsSync(disableMarker)) unlinkSync(disableMarker);
+    } catch { /* best effort */ }
     // BUG-040 fix: bump generation. The onExit closure below captures THIS
     // value and uses it to detect "I'm an old PTY whose exit fired after a
     // new lifecycle began" — in which case it bails out without touching
@@ -132,15 +176,17 @@ export class AgentProcess {
     this.log(`Log path: ${logPath}`);
     this.pty = this.config.runtime === 'hermes'
       ? new HermesPTY(this.env, this.config, logPath)
-      : this.config.runtime === 'codex-app-server'
-        ? new CodexAppServerPTY(this.env, this.config, logPath)
-        : new AgentPTY(this.env, this.config, logPath);
+      : this.config.runtime === 'opencode'
+        ? new OpencodePTY(this.env, this.config, logPath)
+        : this.config.runtime === 'codex-app-server'
+          ? new CodexAppServerPTY(this.env, this.config, logPath)
+          : new AgentPTY(this.env, this.config, logPath);
 
     // Issue #330: re-wire the Telegram handle on every start() (session refresh
     // creates a fresh CodexAppServerPTY). Only CodexAppServerPTY uses this — Claude / Hermes
     // typing indicators flow through fast-checker.
     if (this.config.runtime === 'codex-app-server' && this.telegramApi && this.telegramChatId) {
-      (this.pty as CodexAppServerPTY).setTelegramHandle(this.telegramApi, this.telegramChatId, this.telegramTopicId);
+      (this.pty as CodexAppServerPTY).setTelegramHandle(this.telegramApi, this.telegramChatId);
     }
 
     // BUG-011 fix: create a fresh exit signal for this run. resolveExit is
@@ -183,12 +229,13 @@ export class AgentProcess {
       this.sessionStart = new Date();
       this.log(`Running (pid: ${this.pty.getPid()})`);
 
-      // Issue #392: codex-app-server does not reliably execute the inline
-      // "Send a Telegram message saying you are back online" instruction the
-      // way claude-code does, so fire the back-online ping directly from the
-      // daemon for that runtime. Skipped on handoff restart — the agent
-      // sends its own contextual "back — ..." reply in that case.
-      this.maybeSendCodexBootNotification();
+      // Consume the force-fresh marker only now that the spawn has succeeded —
+      // a spawn failure must leave the fresh-boot request armed for the retry.
+      // Gated on mode: a marker that did not select `fresh` was never honoured
+      // and must survive for the next start.
+      if (mode === 'fresh' && observedForceFresh) this.deleteForceFreshMarker(observedForceFresh);
+
+      this.maybeSendRuntimeLifecycleNotification();
 
       // Start session timer
       this.startSessionTimer();
@@ -203,9 +250,28 @@ export class AgentProcess {
 
   /**
    * Stop the agent gracefully.
+   *
+   * Change B (join-in-flight): a re-entrant stop() awaits the in-flight teardown
+   * instead of the previous silent early no-op (`if (this.stopping) return;`).
+   * The only re-entrant caller is the manager's eviction path
+   * (`await stale.process.stop()`), which WANTS to block until the predecessor
+   * is truly dead before spawning fresh — the previous no-op let it return
+   * immediately and spawn a second live PTY alongside the still-alive first one.
    */
   async stop(): Promise<void> {
-    if (this.stopping) return;
+    if (this.stopping) {
+      if (this.stopInFlight) await this.stopInFlight;
+      return;
+    }
+    this.stopInFlight = this.runStop();
+    try {
+      await this.stopInFlight;
+    } finally {
+      this.stopInFlight = null;
+    }
+  }
+
+  private async runStop(): Promise<void> {
     this.stopping = true;
     // BUG-040 fix: stopRequested persists ACROSS stop()'s return until
     // handleExit clears it. This is the safety net for the case where the
@@ -238,6 +304,12 @@ export class AgentProcess {
           // and flips _alive=false. Skipping the 6s Claude-REPL dance makes
           // `bus hard-restart` feel responsive instead of appearing to do
           // nothing for several seconds.
+        } else if (this.config.runtime === 'opencode') {
+          // OpenCode runs as a TUI. It does not use Claude Code's `/exit`
+          // command contract, so stop with Ctrl-C and then let the shared
+          // liveness check below kill the PTY if it is still running.
+          pty.write('\x03'); // Ctrl-C
+          await sleep(1000);
         } else {
           // BUG-032 fix: use CRLF (not lone CR) so Claude Code's REPL actually
           // recognizes the /exit line as a complete command, AND wait long
@@ -255,6 +327,11 @@ export class AgentProcess {
       } catch {
         // Ignore write errors during shutdown
       }
+      // Change A (death-confirmed stop): capture the OS child pid BEFORE
+      // pty.kill(). node-pty's kill() can invalidate the handle, so getPid()
+      // is unreliable afterward — we need the pid to confirm death below.
+      const childPid = pty.getPid();
+
       // BUG-032 follow-up: only kill the PTY if the process is still alive.
       // After /exit + 5s wait, the child has usually exited cleanly. Calling
       // pty.kill() on an already-exited PTY tears down the file descriptor,
@@ -276,6 +353,33 @@ export class AgentProcess {
       // timeout reduces "Ignoring late exit from previous lifecycle" log noise.
       if (exitPromise) {
         await Promise.race([exitPromise, sleep(15000)]);
+      }
+
+      // Change A (death-confirmed stop): node-pty's kill() sends SIGHUP with no
+      // escalation, so a child that traps/ignores SIGHUP (or is simply slow to
+      // unwind) outlives the graceful window above. stop() would then return
+      // with the OS child still alive and untracked — free to co-emit alongside
+      // the next spawn under this agent name (the duplicate-PTY defect). If the
+      // child is still alive after the bounded race, escalate to SIGKILL and
+      // poll until the OS confirms it is gone before returning. This branch runs
+      // ONLY when the child survived the graceful window, so a normal fast exit
+      // adds ZERO latency and never sees a SIGKILL (no false kills).
+      if (childPid && isChildAlive(childPid)) {
+        this.log(`Graceful stop timed out — escalating to SIGKILL (pid ${childPid})`);
+        try {
+          process.kill(childPid, 'SIGKILL');
+        } catch {
+          // ESRCH: exited between the liveness check and the kill — fine.
+        }
+        // Bounded poll: 5s deadline / 100ms interval (hardcoded — a stop must
+        // not block the daemon indefinitely on a wedged, unkillable child).
+        const deadline = Date.now() + 5000;
+        while (isChildAlive(childPid) && Date.now() < deadline) {
+          await sleep(100);
+        }
+        if (isChildAlive(childPid)) {
+          this.log(`WARNING: pid ${childPid} still alive 5s after SIGKILL — proceeding anyway`);
+        }
       }
     }
 
@@ -340,7 +444,13 @@ export class AgentProcess {
       return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — content matches MessageDedup hash window` };
     }
 
-    injectMessage((data) => this.pty?.write(data), content);
+    if ('injectMessage' in this.pty && typeof this.pty.injectMessage === 'function') {
+      this.pty.injectMessage(content);
+    } else {
+      // CodexAppServerPTY intentionally models stdin writes itself and does not
+      // inherit AgentPTY. Feed it through the same write path used historically.
+      injectMessageIntoPty((data) => this.pty?.write(data), content);
+    }
     return { ok: true };
   }
 
@@ -374,6 +484,10 @@ export class AgentProcess {
       sessionStart: this.sessionStart?.toISOString(),
       crashCount: this.crashCount,
       model: this.config.model,
+      awaitingConfirmation:
+        this.pty && 'isAwaitingInteractiveConfirmation' in this.pty
+          ? this.pty.isAwaitingInteractiveConfirmation()
+          : false,
     };
   }
 
@@ -389,13 +503,46 @@ export class AgentProcess {
    * fire sendChatAction directly from the JSONL stream. Safe to call before
    * or after start() — the handle is re-applied on every PTY (re)spawn.
    */
-  setTelegramHandle(api: TelegramAPI, chatId: string, topicId?: number): void {
+  setTelegramHandle(api: TelegramAPI, chatId: string): void {
     this.telegramApi = api;
     this.telegramChatId = chatId;
-    this.telegramTopicId = topicId;
     if (this.config.runtime === 'codex-app-server' && this.pty) {
-      (this.pty as CodexAppServerPTY).setTelegramHandle(api, chatId, topicId);
+      (this.pty as CodexAppServerPTY).setTelegramHandle(api, chatId);
     }
+  }
+
+  /**
+   * Wire the agent's `MessageConnector` handle (PR1 of pluggable
+   * connectors). Coexists with `setTelegramHandle` for one release cycle
+   * — the daemon calls `setConnector` once at startAgent time; legacy
+   * call sites that still use `setTelegramHandle` continue to work.
+   *
+   * One-way mirror: if `c` is a `TelegramConnector`, the legacy
+   * `telegramApi`/`telegramChatId` fields are populated via
+   * `c.rawTelegramApi()` so CodexAppServerPTY's session-refresh re-wire
+   * (`agent-process.ts:126-128`) continues to find them. For any other
+   * connector kind, the legacy fields are left untouched (a Null- or
+   * future Matrix-connector does not clobber an existing Telegram
+   * handle that was set earlier in the lifecycle).
+   */
+  setConnector(c: MessageConnector): void {
+    this.connector = c;
+    if (c instanceof TelegramConnector) {
+      this.telegramApi = c.rawTelegramApi();
+      this.telegramChatId = c.getChatId();
+      if (this.config.runtime === 'codex-app-server' && this.pty) {
+        (this.pty as CodexAppServerPTY).setTelegramHandle(this.telegramApi, this.telegramChatId);
+      }
+    }
+  }
+
+  /**
+   * Returns the currently-wired `MessageConnector` (or null). Used by
+   * code paths that need to dispatch via the generic interface rather
+   * than the legacy Telegram fields.
+   */
+  getConnector(): MessageConnector | null {
+    return this.connector;
   }
 
   /**
@@ -531,6 +678,22 @@ export class AgentProcess {
       return;
     }
 
+    // disable-resurrection fix: a DISABLED agent that exits (crash / force-exit
+    // with stopRequested=false) must NOT be respawned by crash recovery. The
+    // `.user-disable` marker (written by `cortextos disable`) is the authoritative
+    // "stood down by the user" signal — mirror isDaemonShuttingDown()'s check.
+    // Return BEFORE crash counting and BEFORE both respawn setTimeouts
+    // (image-poison ~L587, crash-recovery ~L643). status='stopped' so the agent
+    // shows as down, not crash-looping. Marker is cleared on the next start().
+    // Acknowledged edge case: the crash-alert hook lazy-unlinks markers older
+    // than 5min, so a disabled agent that survives stop() and keeps running
+    // >5min could theoretically lose this gate — outside the repro's scope.
+    if (this.isUserDisabled()) {
+      this.status = 'stopped';
+      this.notifyStatusChange();
+      return;
+    }
+
     // BUG-040 fix: check stopRequested instead of (only) stopping. The
     // stopping flag is cleared inside stop() after a 15s timeout window —
     // which means a slow PTY shutdown can fire handleExit AFTER stopping is
@@ -583,6 +746,54 @@ export class AgentProcess {
         }
       }, 5000);
       return;
+    }
+
+    // opencode --continue wedge auto-recovery (companion to the image-poison
+    // block above; same shape, different signature). shouldContinue() passes
+    // `opencode --continue` whenever the session marker is present, with no
+    // wedge-awareness — so a session wedged on the bootstrap splash re-attaches
+    // on every crash-recovery restart and exits code 0 almost immediately,
+    // producing a self-perpetuating exit_code=0 loop that drains max_crashes and
+    // halts the agent (measured live 2026-08-12: opencode crashed 10x with
+    // exit_code=0 across 22min, then HALTED). The marker is trusted as "safe to
+    // continue" without confirming the prior session is not wedged. Detect the
+    // signature — an opencode agent, spawned in continue mode, exiting 0 within
+    // FAST_EXIT_MS — and after THRESHOLD consecutive such exits arm .force-fresh
+    // so the next boot discards the wedged session (shouldContinue() honors
+    // .force-fresh for all runtimes). This automates an operator's manual
+    // stop -> drop-marker -> fresh recovery. Like image-poison, a recovery
+    // restart is not charged against max_crashes_per_day — it is a self-inflicted
+    // continuity artifact, not an agent malfunction.
+    if (
+      exitCode === 0 &&
+      this.config.runtime === 'opencode' &&
+      this.lastSpawnMode === 'continue' &&
+      Date.now() - this.lastStartAtMs < OPENCODE_CONTINUE_WEDGE_FAST_EXIT_MS
+    ) {
+      this.opencodeContinueWedgeCount++;
+      if (this.opencodeContinueWedgeCount >= OPENCODE_CONTINUE_WEDGE_THRESHOLD) {
+        this.log(
+          `opencode --continue wedge: ${this.opencodeContinueWedgeCount} consecutive fast exit_code=0 continues — arming .force-fresh and restarting fresh (not counted toward max_crashes_per_day).`,
+        );
+        this.armForceFresh('opencode --continue wedge auto-recovery');
+        this.appendCrashToRestartsLog(exitCode, 5000, 'OPENCODE_CONTINUE_WEDGE_RECOVERY');
+        this.opencodeContinueWedgeCount = 0;
+        this.status = 'crashed';
+        this.notifyStatusChange();
+        setTimeout(() => {
+          if (this.status === 'crashed') {
+            this.start().catch(err => this.log(`opencode wedge recovery restart failed: ${err}`));
+          }
+        }, 5000);
+        return;
+      }
+      // Below threshold: fall through to normal crash recovery (still counted +
+      // backoff). The next restart re-continues; if it wedges again the streak
+      // grows until the threshold trips the force-fresh above.
+    } else {
+      // Any non-wedge exit — nonzero code, fresh mode, or a session that stayed
+      // up past the fast-exit window — breaks the consecutive streak.
+      this.opencodeContinueWedgeCount = 0;
     }
 
     // CrashLoopPauser (instar-inspired): if a sliding window is configured,
@@ -640,22 +851,114 @@ export class AgentProcess {
     }, backoff);
   }
 
-  private shouldContinue(): boolean {
+  /**
+   * Probe for the `.force-fresh` marker WITHOUT consuming it, returning the
+   * IDENTITY of the file observed — not just whether one existed.
+   *
+   * The identity is load-bearing. Deferring the consume to after spawn opens a
+   * seconds-wide window in which another writer can replace the marker with a
+   * NEW fresh-boot request (the marker has multiple writers, some in separate
+   * CLI processes entirely). An unconditional post-spawn delete cannot tell
+   * that newer request apart from the one observed at mode decision, and
+   * swallows it — so the concurrent restart boots `--continue`, which is the
+   * very failure this deferral exists to prevent, reintroduced on a narrower
+   * window.
+   *
+   * Returns null when absent.
+   */
+  private probeForceFreshMarker(): { ino: number; mtimeMs: number; size: number } | null {
+    try {
+      const stat = statSync(join(this.env.ctxRoot, 'state', this.name, '.force-fresh'));
+      return { ino: Number(stat.ino), mtimeMs: stat.mtimeMs, size: stat.size };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Consume the `.force-fresh` marker. Call only after pty.spawn() succeeds.
+   *
+   * Consumes ONLY the exact file observed at probe time. If the marker on disk
+   * is a different file (replaced mid-spawn) it is LEFT IN PLACE, because it
+   * represents a request this launch did not satisfy.
+   *
+   * Tolerates an already-absent file: start() can be re-entered after a failed
+   * spawn, and the marker may have been consumed by an earlier successful one.
+   */
+  private deleteForceFreshMarker(observed: { ino: number; mtimeMs: number; size: number }): void {
+    const markerPath = join(this.env.ctxRoot, 'state', this.name, '.force-fresh');
+
+    // Atomically RESERVE whatever currently sits at the marker path before
+    // looking at it. A check-then-unlink here would be a TOCTOU: the marker's
+    // writers include hardRestart in a SEPARATE CLI process, whose write can
+    // land between an identity check and the unlink — and the unlink would
+    // then delete that new request, recreating the exact lost-request race
+    // the identity binding exists to prevent. renameSync is the atomic take:
+    // a concurrent replacement either lands BEFORE the rename (it gets swept
+    // into the reserve, detected by the identity check below, and restored)
+    // or AFTER (writeFileSync creates a fresh marker at the now-empty path,
+    // which this function never touches). Rename preserves ino/mtime/size, so
+    // the identity check works on the reserved file.
+    const reservePath = `${markerPath}.consumed.${process.pid}.${Date.now().toString(36)}`;
+    try {
+      renameSync(markerPath, reservePath);
+    } catch {
+      return; // marker already gone — consumed earlier or never present
+    }
+
+    let reserved: { ino: number; mtimeMs: number; size: number } | null = null;
+    try {
+      const st = statSync(reservePath);
+      reserved = { ino: Number(st.ino), mtimeMs: st.mtimeMs, size: st.size };
+    } catch { /* fall through to restore-or-drop below */ }
+
+    if (
+      reserved &&
+      reserved.ino === observed.ino &&
+      reserved.mtimeMs === observed.mtimeMs &&
+      reserved.size === observed.size
+    ) {
+      // Exactly the file this launch honoured — consume it.
+      try { unlinkSync(reservePath); } catch { /* inert leftover */ }
+      return;
+    }
+
+    // We swept a NEWER request (replaced after the mode-decision probe). Put
+    // it back for the next start — unless an even newer marker has already
+    // landed at the path, in which case the fresh-boot intent already stands
+    // and the swept copy is redundant.
+    this.log('.force-fresh changed during spawn — preserving the newer request for the next start');
+    try {
+      if (existsSync(markerPath)) unlinkSync(reservePath);
+      else renameSync(reservePath, markerPath);
+    } catch { /* best effort — a stray reserve file is inert */ }
+  }
+
+  private shouldContinue(
+    observedForceFresh: { ino: number; mtimeMs: number; size: number } | null,
+  ): boolean {
+    // Check for force-fresh marker FIRST (all runtimes honor it).
+    //
+    // Ordering matters: this check used to sit BELOW the Hermes early-return,
+    // which meant a `.force-fresh` armed on a Hermes agent was never honored
+    // (the agent kept resuming as long as state.db existed) AND never
+    // consumed, so it leaked in the state dir indefinitely.
+    //
+    // This is a PROBE ONLY — it must not consume the marker. The consume moved
+    // to start()'s post-spawn block. Consuming here spent the fresh-boot
+    // request at the MODE DECISION, well before pty.spawn(); any failure in
+    // between burned the marker, and the next start() then booted `--continue`
+    // into the exact session the marker existed to escape (e.g. the
+    // image-poison crash loop that arms the marker in handleExit).
+    if (observedForceFresh) {
+      return false;
+    }
+
     // Hermes: session continuity is determined by whether the SQLite DB exists.
     // HERMES_HOME env var overrides the default ~/.hermes path.
     if (this.config.runtime === 'hermes') {
       const hermesHome = process.env['HERMES_HOME'];
       return hermesDbExists(hermesHome);
-    }
-
-    // Check for force-fresh marker (all runtimes honor it).
-    const forceFreshPath = join(this.env.ctxRoot, 'state', this.name, '.force-fresh');
-    if (existsSync(forceFreshPath)) {
-      try {
-        const { unlinkSync } = require('fs');
-        unlinkSync(forceFreshPath);
-      } catch { /* ignore */ }
-      return false;
     }
 
     // codex-app-server: session continuity is tracked by the adapter's own
@@ -673,6 +976,13 @@ export class AgentProcess {
         'codex-app-server-thread.json',
       );
       return existsSync(threadStatePath);
+    }
+
+    // opencode: do not inspect Claude JSONL history. The OpencodePTY adapter
+    // writes a lightweight marker after a successful spawn; that marker is the
+    // only signal that the next boot should pass `opencode --continue`.
+    if (this.config.runtime === 'opencode') {
+      return opencodeSessionExists(this.env.ctxRoot, this.name);
     }
 
     // Default (Claude runtime): existing conversation = JSONL files present.
@@ -700,17 +1010,7 @@ export class AgentProcess {
   private buildStartupPrompt(): string {
     const onboardedPath = join(this.env.ctxRoot, 'state', this.name, '.onboarded');
     const onboardingPath = join(this.env.agentDir, 'ONBOARDING.md');
-    const heartbeatPath = join(this.env.ctxRoot, 'state', this.name, 'heartbeat.json');
     let onboardingAppend = '';
-
-    // If agent has a heartbeat but no .onboarded marker, they completed onboarding but
-    // forgot to write the marker. Auto-write it so they don't re-onboard next restart.
-    if (!existsSync(onboardedPath) && existsSync(heartbeatPath)) {
-      try {
-        const { writeFileSync } = require('fs');
-        writeFileSync(onboardedPath, '', 'utf-8');
-      } catch { /* ignore */ }
-    }
 
     if (!existsSync(onboardedPath) && existsSync(onboardingPath)) {
       onboardingAppend = ' IMPORTANT: This is your FIRST BOOT. Before doing anything else, read ONBOARDING.md and complete the onboarding protocol.';
@@ -725,10 +1025,11 @@ export class AgentProcess {
     // HANDOFF UX: the pickup message MUST be the first action after reading the handoff doc —
     // before cron restoration, before heartbeat, before anything else. Placing this instruction
     // immediately after the handoffBlock in the prompt ensures it is not buried.
-    const handoffUxOverride = isHandoffRestart
+    const shouldPromptTelegram = this.shouldPromptTelegramOnlineMessage();
+    const handoffUxOverride = isHandoffRestart && shouldPromptTelegram
       ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc. CRITICAL: After reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. Do this BEFORE running heartbeat, BEFORE any other tool call. No cron IDs, no status report, no cold-boot phrasing. Do NOT send "Booting up... one moment" (skip AGENTS.md step 1 entirely).'
       : '';
-    const onlineMessage = isHandoffRestart
+    const onlineMessage = isHandoffRestart || !shouldPromptTelegram
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
     return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
@@ -740,7 +1041,14 @@ export class AgentProcess {
     const deliverablesBlock = this.buildDeliverablesBlock();
     // Session refresh (--continue) is never a handoff restart.
     this.lastSpawnWasHandoff = false;
-    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations. After checking inbox, send a Telegram message to the user saying you are back online.`;
+    const onlineMessage = this.shouldPromptTelegramOnlineMessage()
+      ? ' After checking inbox, send a Telegram message to the user saying you are back online.'
+      : '';
+    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations.${onlineMessage}`;
+  }
+
+  private shouldPromptTelegramOnlineMessage(): boolean {
+    return this.config.telegram_polling !== false && !!this.telegramApi && !!this.telegramChatId;
   }
 
   /**
@@ -803,26 +1111,81 @@ export class AgentProcess {
   }
 
   /**
-   * Issue #392: send the back-online Telegram notification directly from the
-   * daemon when the codex-app-server runtime spawns. The boot prompt's inline
-   * "Send a Telegram message..." instruction reaches the codex thread but is
-   * not executed reliably as a tool call, leaving James without the standard
-   * post-restart notification claude-code peers send.
+   * Issue #392 / OpenCode parity: send lifecycle Telegram directly from the
+   * daemon for runtimes whose startup/continue prompts are not reliable enough
+   * to guarantee a user-visible notification.
+   *
+   * codex-app-server: the boot prompt's inline "Send a Telegram message..."
+   * instruction reaches the codex thread but is not executed reliably as a tool
+   * call, leaving James without the standard post-restart notification
+   * claude-code peers send.
+   *
+   * opencode: the prompt is injected into the persistent TUI after startup.
+   * Real production evidence showed an OpenCode --continue restart updated the
+   * process/session markers but emitted no Telegram message, so lifecycle
+   * visibility must be daemon-owned just like Codex.
+   *
+   * Two distinct notifications, mirroring what a claude-code agent emits:
+   *  - msg1 (planned-restart lifecycle, "🔄 <agent> restarted (planned): ..."):
+   *    for claude this is sent by hook-crash-alert.ts on PTY exit. codex/opencode
+   *    runtimes do NOT run Claude Code hooks, so on a handoff restart the daemon
+   *    emits the same notification here for parity (James saw msg1 only for
+   *    claude agents otherwise). Format mirrors hook-crash-alert.ts:394-397.
+   *  - msg2 (back-online / "back — ..." summary): codex reliably self-sends its
+   *    own contextual reply via the boot prompt; opencode (deepseek) does NOT, so
+   *    the daemon sends a handoff-flavored back-online ping for opencode only.
    *
    * Skipped when:
-   *  - runtime is anything other than codex-app-server (claude-code/hermes
-   *    already emit this via the prompt),
-   *  - the most recent prompt was built for a handoff restart (the agent
-   *    sends its own contextual "back — ..." reply in that case),
-   *  - no Telegram handle has been wired (no chat_id configured).
+   *  - runtime is anything other than codex-app-server/opencode (claude-code
+   *    and hermes already emit both via the hook + prompt),
+   *  - Telegram is disabled or no Telegram handle has been wired.
    */
-  private maybeSendCodexBootNotification(): void {
-    if (this.config.runtime !== 'codex-app-server') return;
-    if (this.lastSpawnWasHandoff) return;
-    if (!this.telegramApi || !this.telegramChatId) return;
-    this.telegramApi
-      .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`, undefined, { messageThreadId: this.telegramTopicId })
-      .catch(() => { /* non-fatal: notification is observability only */ });
+  private maybeSendRuntimeLifecycleNotification(): void {
+    if (this.config.runtime !== 'codex-app-server' && this.config.runtime !== 'opencode') return;
+    if (!this.shouldPromptTelegramOnlineMessage()) return;
+    const telegramApi = this.telegramApi;
+    const telegramChatId = this.telegramChatId;
+    if (!telegramApi || !telegramChatId) return;
+    const send = (text: string) =>
+      telegramApi
+        .sendMessage(telegramChatId, text)
+        .catch(() => { /* non-fatal: notification is observability only */ });
+
+    if (this.lastSpawnWasHandoff) {
+      // msg1: planned-restart lifecycle notif, hook parity for runtimes without
+      // Claude Code hooks. Both codex and opencode were missing this.
+      send(this.buildPlannedRestartNotification());
+      // msg2 ("back — ...") is self-sent by the agent via the handoff boot prompt
+      // (agent-process.ts buildStartupPrompt handoffUxOverride) for BOTH codex and
+      // opencode — opencode now reliably honors it. The daemon used to send an
+      // "Agent X is back online (context handoff)" substitute for opencode, but
+      // that produced a redundant 3rd message on top of the self-sent "back —".
+      // Removed: msg1 (daemon) + msg2 (agent self-send) = clean 2-message pattern.
+      return;
+    }
+
+    // Non-handoff restart (crash recovery / config reload): both runtimes need
+    // the daemon-emitted back-online ping.
+    send(`Agent ${this.name} is back online`);
+  }
+
+  /**
+   * Build the planned-restart lifecycle notification (msg1) for codex/opencode,
+   * reading the reason from the `.restart-planned` marker and matching the
+   * hook-crash-alert.ts:394-397 format string exactly so codex/opencode parity
+   * is byte-identical to what claude agents emit via the hook.
+   */
+  private buildPlannedRestartNotification(): string {
+    let reason = '';
+    try {
+      const markerPath = join(this.env.ctxRoot, 'state', this.name, '.restart-planned');
+      if (existsSync(markerPath)) {
+        reason = readFileSync(markerPath, 'utf-8').trim();
+      }
+    } catch { /* non-fatal — fall through to generic reason */ }
+    return reason.startsWith('CONTEXT-FORCE-RESTART')
+      ? `🔄 ${this.name} restarting with memory`
+      : `🔄 ${this.name} restarted (planned): ${reason || 'no reason given'}`;
   }
 
   private startSessionTimer(): void {
@@ -897,6 +1260,24 @@ export class AgentProcess {
   }
 
   /**
+   * Check whether this agent has been explicitly disabled by the user.
+   *
+   * Returns true iff a `.user-disable` marker exists in this agent's state
+   * dir (written by `cortextos disable`). Unlike isDaemonShuttingDown()'s 60s
+   * freshness window, there is NO time bound here: `.user-disable` is a
+   * persistent flag with an explicit lifecycle (cleared on the next start()),
+   * not a transient shutdown signal.
+   */
+  private isUserDisabled(): boolean {
+    const marker = join(this.env.ctxRoot, 'state', this.name, '.user-disable');
+    try {
+      return existsSync(marker);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Append an unplanned-exit entry to restarts.log. Complements the planned
    * SELF-RESTART / HARD-RESTART entries written by src/bus/system.ts so that
    * a single file gives the complete restart history for an agent.
@@ -909,7 +1290,7 @@ export class AgentProcess {
   private appendCrashToRestartsLog(
     exitCode: number,
     backoffMs: number,
-    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY',
+    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY' | 'OPENCODE_CONTINUE_WEDGE_RECOVERY',
   ): void {
     try {
       const logDir = join(this.env.ctxRoot, 'logs', this.name);
@@ -918,7 +1299,7 @@ export class AgentProcess {
       const details =
         kind === 'HALTED'
           ? `exit_code=${exitCode} crash_count=${this.crashCount} max_crashes=${this.maxCrashesPerDay}`
-          : kind === 'IMAGE_POISON_RECOVERY'
+          : kind === 'IMAGE_POISON_RECOVERY' || kind === 'OPENCODE_CONTINUE_WEDGE_RECOVERY'
             ? `exit_code=${exitCode} backoff_s=${backoffMs / 1000} (not counted toward max_crashes)`
             : `exit_code=${exitCode} crash_count=${this.crashCount} backoff_s=${backoffMs / 1000}`;
       const logLine = `[${timestamp}] ${kind}: ${details}\n`;
@@ -954,4 +1335,18 @@ export class AgentProcess {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Change A: OS-level pid liveness probe using the signal-0 idiom. Local copy of
+// the same helper duplicated in agent-manager.ts (isPidAlive), utils/lock.ts,
+// and pty/opencode-pty.ts: signal 0 sends nothing, it only tests process
+// existence + our permission to signal it. A process owned by another user
+// (EPERM) is alive; only ESRCH (process gone) counts as dead.
+function isChildAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
 }

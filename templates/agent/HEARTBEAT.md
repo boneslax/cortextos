@@ -32,6 +32,12 @@ If this command ERRORS, your agent shows as DEAD on the dashboard and the comman
 
 Both are required every cycle. Skipping Step 1 leaves your dashboard view stale even though you're firing events.
 
+**Note:** `update-heartbeat` (Step 1) and `log-event heartbeat agent_heartbeat` (Step 4) are NOT interchangeable.
+- `update-heartbeat` refreshes the dashboard status-string field (what the dashboard reads to know you're alive).
+- `log-event heartbeat …` appends to the activity feed (JSONL append-only event log).
+
+Both are required every cycle. Skipping Step 1 leaves your dashboard view stale even though you're firing events.
+
 ## Step 2: Sweep inbox for un-ACK'd messages
 
 Messages arrive in real time via the fast-checker daemon — you don't need to poll for them. This step is a safety sweep for anything that wasn't ACK'd (e.g. a crash mid-processing).
@@ -84,7 +90,7 @@ MEMORY_DIR="$(pwd)/memory"
 mkdir -p "$MEMORY_DIR"
 cat >> "$MEMORY_DIR/$TODAY.md" << MEMORY
 
-## Heartbeat Update - $(date -u +%H:%M UTC) / $LOCAL_TIME
+## Heartbeat Update - $(date -u +'%H:%M UTC') / $LOCAL_TIME
 - WORKING ON: <task_id or "none">
 - Status: <healthy/working/blocked>
 - Inbox: <N messages processed>

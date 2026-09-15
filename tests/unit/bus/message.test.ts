@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { sendMessage, checkInbox, ackInbox } from '../../../src/bus/message';
+import { sendMessage, checkInbox, ackInbox, InboxLockUnavailableError } from '../../../src/bus/message';
+import { acquireLock, releaseLock } from '../../../src/utils/lock';
 import { resolvePaths } from '../../../src/utils/paths';
 import type { BusPaths } from '../../../src/types';
 
@@ -122,6 +123,26 @@ describe('Message Bus', () => {
 
       expect(inboxFiles.length).toBe(0);
       expect(inflightFiles.length).toBe(1);
+    });
+
+    it('throws InboxLockUnavailableError when the inbox lock is held — never a fake empty read', () => {
+      // A held (or permanently orphaned) lock must surface as a failure the
+      // caller can retry — returning [] here is indistinguishable from a
+      // successfully-read empty inbox and silently black-holes every message.
+      sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'must not vanish');
+      const held = acquireLock(receiverPaths.inbox);
+      expect(held).not.toBe(false);
+      try {
+        expect(() => checkInbox(receiverPaths)).toThrow(InboxLockUnavailableError);
+        expect(() => checkInbox(receiverPaths)).toThrow(/Inbox lock unavailable/);
+      } finally {
+        if (held) releaseLock(held);
+      }
+      // Once the lock is free the message is still there and delivers — nothing
+      // was consumed or lost during the locked window.
+      const messages = checkInbox(receiverPaths);
+      expect(messages.length).toBe(1);
+      expect(messages[0].text).toBe('must not vanish');
     });
   });
 

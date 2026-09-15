@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, rmSync, readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { updateCronFire, readCronState, parseDurationMs } from '../../../src/bus/cron-state';
+import * as lock from '../../../src/utils/lock';
 
 let tmpDir: string;
 
@@ -108,5 +109,40 @@ describe('updateCronFire', () => {
     expect(inbox?.interval).toBe('2h');
     expect(hb?.interval).toBe('4h');
     cleanup();
+  });
+});
+
+describe('updateCronFire — locked, atomic read-modify-write', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    cleanup();
+  });
+
+  it('runs the read-modify-write under the stateDir lock', () => {
+    const withLock = vi.spyOn(lock, 'withFileLockSync');
+    updateCronFire(tmpDir, 'heartbeat', '4h');
+    expect(withLock.mock.calls.some(([dir]) => dir === tmpDir)).toBe(true);
+  });
+
+  it('writes atomically — no leftover temp file, on-disk bytes end with a newline', () => {
+    updateCronFire(tmpDir, 'heartbeat', '4h');
+    // atomicWriteSync uses a `.tmp.<hex>` sidecar it renames away; none should remain
+    expect(readdirSync(tmpDir).some(f => f.startsWith('.tmp.'))).toBe(false);
+    const bytes = readFileSync(join(tmpDir, 'cron-state.json'), 'utf-8');
+    expect(bytes.endsWith('}\n')).toBe(true);
+    expect(() => JSON.parse(bytes)).not.toThrow();
+  });
+
+  it('a concurrent writer is refused while the stateDir lock is held (no lost update)', () => {
+    updateCronFire(tmpDir, 'first', '2h');
+    lock.withFileLockSync(tmpDir, () => {
+      // A holds the lock; a second writer's acquire must be refused, so it
+      // cannot race into A's read->write window and drop A's record.
+      expect(lock.acquireLock(tmpDir)).toBe(false);
+    });
+    // After release the second write lands serially; both records survive.
+    updateCronFire(tmpDir, 'second', '6h');
+    const names = readCronState(tmpDir).crons.map(r => r.name).sort();
+    expect(names).toEqual(['first', 'second']);
   });
 });
