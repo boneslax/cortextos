@@ -78,3 +78,6 @@ docs/phase-reports/
 leakage-fixture.json
 **/leakage-fixture.json
 *.leakage-fixture.json
+
+# Test-run fixture artifacts (created by running the suite from repo root)
+.cortextOS/
