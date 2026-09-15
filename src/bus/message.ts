@@ -88,6 +88,20 @@ export function sendMessage(
 }
 
 /**
+ * Distinguishes an unreadable inbox from a successfully-read empty inbox.
+ * Production callers must surface this state and retry; they must never emit
+ * the successful empty representation (`[]`).
+ */
+export class InboxLockUnavailableError extends Error {
+  readonly code = 'INBOX_LOCK_UNAVAILABLE';
+
+  constructor(readonly inbox: string) {
+    super(`Inbox lock unavailable: ${inbox}`);
+    this.name = 'InboxLockUnavailableError';
+  }
+}
+
+/**
  * Check inbox for pending messages.
  * Reads inbox directory, moves messages to inflight, returns sorted array.
  * Recovers stale inflight messages (>5 minutes old).
@@ -98,9 +112,12 @@ export function checkInbox(paths: BusPaths): InboxMessage[] {
   ensureDir(inbox);
   ensureDir(inflight);
 
-  // Acquire lock
-  if (!acquireLock(inbox)) {
-    return [];
+  // Acquire lock. A refused lock throws rather than returning [] — a permanently
+  // orphaned lock must look like a failure to the caller, never like a
+  // successfully-read empty inbox (which silently black-holes every message).
+  const lockHandle = acquireLock(inbox);
+  if (!lockHandle) {
+    throw new InboxLockUnavailableError(inbox);
   }
 
   try {
@@ -159,7 +176,10 @@ export function checkInbox(paths: BusPaths): InboxMessage[] {
 
     return messages;
   } finally {
-    releaseLock(inbox);
+    // Release is bound to the acquired generation handle: if another process
+    // legitimately stole this lock as stale mid-operation, this release is a
+    // no-op instead of destroying the new holder's lock.
+    releaseLock(lockHandle);
   }
 }
 

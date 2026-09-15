@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { TelegramAPI } from '../../../src/telegram/api';
 
 // Thin passthrough (PLAN-v3 §5): getChatMember POSTs chat_id + user_id and
@@ -6,8 +6,18 @@ import { TelegramAPI } from '../../../src/telegram/api';
 // unreachable / inconclusive — lives in the D1 classifier and is tested there.
 
 describe('TelegramAPI.getChatMember', () => {
+  // Force pooled fetch: the resilient node:https transport is default-ON
+  // (CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS !== '0') and bypasses a mocked
+  // globalThis.fetch, hitting the real Telegram API. Match the convention
+  // used by tests/unit/telegram/api.test.ts.
+  const originalUnpooled = process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+  beforeEach(() => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '0';
+  });
   const originalFetch = globalThis.fetch;
   afterEach(() => {
+    if (originalUnpooled === undefined) delete process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+    else process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = originalUnpooled;
     globalThis.fetch = originalFetch;
     vi.restoreAllMocks();
   });

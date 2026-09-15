@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 let capturedOnExit: ((exitCode: number, signal?: number) => void) | null = null;
 
 const mockPty = {
+  sessionNonce: vi.fn().mockReturnValue(null),
   spawn: vi.fn().mockResolvedValue(undefined),
   kill: vi.fn(),
   write: vi.fn(),
@@ -12,7 +13,15 @@ const mockPty = {
   onExit: vi.fn().mockImplementation((cb: (exitCode: number, signal?: number) => void) => {
     capturedOnExit = cb;
   }),
-  getOutputBuffer: vi.fn().mockReturnValue({ isBootstrapped: vi.fn().mockReturnValue(false) }),
+  // CONTRACT-COMPLETE buffer. handleExit() captures the buffer and calls
+  // hasRateLimitSignature() on it; a buffer missing that method makes handleExit
+  // THROW, so performStart takes its catch branch and the !this.pty early return
+  // is never reached. Any test naming that early return then passes for the
+  // wrong reason — it observes a TypeError, not preservation.
+  getOutputBuffer: vi.fn().mockReturnValue({
+    isBootstrapped: vi.fn().mockReturnValue(false),
+    hasRateLimitSignature: vi.fn().mockReturnValue(false),
+  }),
 };
 
 vi.mock('../../../src/pty/agent-pty.js', () => ({
@@ -38,7 +47,12 @@ vi.mock('../../../src/utils/atomic.js', () => ({
   atomicWriteSync: vi.fn(),
 }));
 
-vi.mock('../../../src/utils/env.js', () => ({
+// Partial mock: resolveHermesHome() now parses the agent .env through the shared
+// parseEnvFile so it agrees with AgentPTY about the same file, so the REAL parser
+// must stay reachable here. Stubbing it out would make this suite pass against a
+// resolver that no longer parses anything.
+vi.mock('../../../src/utils/env.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../src/utils/env.js')>()),
   writeCortextosEnv: vi.fn(),
   resolveEnv: vi.fn().mockReturnValue({ instanceId: 'test', ctxRoot: '/tmp/test' }),
 }));
@@ -57,6 +71,8 @@ const fsMocks = {
   writeFileSync: vi.fn(),
   appendFileSync: vi.fn(),
   statSync: vi.fn(),
+  unlinkSync: vi.fn(),
+  renameSync: vi.fn(),
 };
 
 vi.mock('fs', async () => {
@@ -69,6 +85,8 @@ vi.mock('fs', async () => {
     get writeFileSync() { return fsMocks.writeFileSync; },
     get appendFileSync() { return fsMocks.appendFileSync; },
     get statSync() { return fsMocks.statSync; },
+    get unlinkSync() { return fsMocks.unlinkSync; },
+    get renameSync() { return fsMocks.renameSync; },
   };
 });
 
@@ -98,7 +116,66 @@ beforeEach(() => {
   fsMocks.writeFileSync.mockReset();
   fsMocks.appendFileSync.mockReset();
   fsMocks.statSync.mockReset();
+  fsMocks.unlinkSync.mockReset();
+  fsMocks.renameSync.mockReset();
 });
+
+/**
+ * Stateful in-memory model of the marker filesystem, for the consume-path
+ * tests. A naive path-matching mock silently mis-models the rename-reserve
+ * mechanism (e.g. existsSync answering true for the marker AFTER the rename
+ * moved it away would steer the code into the drop-reserve branch and encode
+ * the very bug under test into the mock). This models the three ops the
+ * mechanism uses — rename moves identity between paths, write creates/replaces
+ * at a path, unlink clears a path — with rename preserving ino/mtime/size
+ * exactly as the real fs does.
+ */
+type MarkerId = { ino: number; mtimeMs: number; size: number };
+function installMarkerModel(initial: MarkerId | null) {
+  const state = {
+    marker: initial as MarkerId | null,           // what sits at .force-fresh
+    reserves: new Map<string, MarkerId>(),        // .force-fresh.consumed.* files
+  };
+  const isMarker = (p: unknown) => String(p).endsWith('.force-fresh');
+  const isReserve = (p: unknown) => String(p).includes('.force-fresh.consumed.');
+
+  fsMocks.existsSync.mockImplementation((p: string) => {
+    if (isReserve(p)) return state.reserves.has(String(p));
+    if (isMarker(p)) return state.marker !== null;
+    return false;
+  });
+  fsMocks.statSync.mockImplementation((p: string) => {
+    if (isReserve(p)) {
+      const id = state.reserves.get(String(p));
+      if (id) return id;
+      throw new Error('ENOENT');
+    }
+    if (isMarker(p) && state.marker) return state.marker;
+    throw new Error('ENOENT');
+  });
+  fsMocks.renameSync.mockImplementation((from: string, to: string) => {
+    if (isMarker(from) && isReserve(to)) {
+      if (!state.marker) throw new Error('ENOENT');
+      state.reserves.set(String(to), state.marker);
+      state.marker = null;
+      return;
+    }
+    if (isReserve(from) && isMarker(to)) {
+      const id = state.reserves.get(String(from));
+      if (!id) throw new Error('ENOENT');
+      state.marker = id;
+      state.reserves.delete(String(from));
+      return;
+    }
+    throw new Error('ENOENT');
+  });
+  fsMocks.unlinkSync.mockImplementation((p: string) => {
+    if (isReserve(p)) { state.reserves.delete(String(p)); return; }
+    if (isMarker(p)) { state.marker = null; return; }
+    // other markers (.user-disable etc.) — no-op
+  });
+  return state;
+}
 
 describe('AgentProcess - Hermes runtime: shouldContinue', () => {
   it('spawns in fresh mode when Hermes state.db does not exist', async () => {
@@ -124,7 +201,231 @@ describe('AgentProcess - Hermes runtime: shouldContinue', () => {
     await ap.start();
 
     expect(mockHermesDbExists).toHaveBeenCalledWith('/custom/hermes');
-    process.env['HERMES_HOME'] = originalHermesHome;
+    if (originalHermesHome === undefined) {
+      delete process.env['HERMES_HOME'];
+    } else {
+      process.env['HERMES_HOME'] = originalHermesHome;
+    }
+  });
+
+  it('honors the .force-fresh marker even when Hermes state.db exists', async () => {
+    // Regression: the force-fresh check used to sit BELOW the Hermes
+    // early-return in shouldContinue(), so hardRestartSelf() on a Hermes
+    // agent never forced a fresh session and the marker leaked forever.
+    const state = installMarkerModel({ ino: 7, mtimeMs: 42, size: 8 });
+    mockHermesDbExists.mockReturnValue(true);
+
+    const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+    await ap.start();
+
+    // Fresh mode despite state.db existing — the marker wins...
+    expect(mockPty.spawn).toHaveBeenCalledWith('fresh', expect.any(String));
+    // ...and the Hermes DB probe is never consulted (marker short-circuits).
+    expect(mockHermesDbExists).not.toHaveBeenCalled();
+    // ...and the marker is consumed so the NEXT start can continue again:
+    // atomically reserved (rename), then the reserve removed. Nothing left.
+    expect(state.marker).toBeNull();
+    expect(state.reserves.size).toBe(0);
+    const renamed = fsMocks.renameSync.mock.calls.map((c: unknown[]) => [String(c[0]), String(c[1])]);
+    expect(renamed.some(([from, to]) => from.endsWith('.force-fresh') && to.includes('.consumed.'))).toBe(true);
+  });
+
+  it('does NOT consume .force-fresh when pty.spawn() FAILS', async () => {
+    // The marker authorizes a fresh boot. Consuming it at the mode decision
+    // spent that authorization 74 lines before the spawn, so any failure in
+    // between silently downgraded the NEXT start to `--continue` — resuming the
+    // exact session the marker existed to escape. That is the hazard the
+    // recovery note and .rate-limited are already protected from; this pins the
+    // same protection for .force-fresh.
+    // FALSE-SECURE BEFORE (nova, and it was my own named weakest claim): this
+    // mocked existsSync but NOT statSync, so the probe returned null, the launch
+    // was CONTINUE, and no marker was ever exercised. The assertion passed
+    // because nothing had been consumed — not because preservation worked.
+    fsMocks.existsSync.mockImplementation((p: string) => String(p).endsWith('.force-fresh'));
+    fsMocks.statSync.mockImplementation((p: string) => {
+      if (String(p).endsWith('.force-fresh')) return { ino: 11, mtimeMs: 22, size: 33 };
+      throw new Error('ENOENT');
+    });
+    mockHermesDbExists.mockReturnValue(true);
+    mockPty.spawn.mockRejectedValueOnce(new Error('spawn failed'));
+
+    const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+    await ap.start().catch(() => { /* start surfaces the failure; not what this pins */ });
+
+    // The marker must actually have SELECTED fresh, or the preservation claim
+    // is about a launch the marker never influenced.
+    expect(mockPty.spawn).toHaveBeenCalledWith('fresh', expect.any(String));
+    const unlinked = fsMocks.unlinkSync.mock.calls.map((c: unknown[]) => String(c[0]));
+    expect(
+      unlinked.some((p: string) => p.endsWith('.force-fresh')),
+      'a failed spawn must leave .force-fresh on disk so the retry still boots fresh',
+    ).toBe(false);
+  });
+
+  it('does NOT consume .force-fresh when the PTY exits DURING spawn', async () => {
+    // The narrower path, and the one most likely to be missed. start() has an
+    // early return for "PTY exited during spawn" that lands BEFORE the delete
+    // block — deliberately, so the recovery note and rate-limit marker survive
+    // for the retry. .force-fresh must survive there too. A fix that only
+    // handles the throwing case reproduces the original bug on this path.
+    // Same false-secure defect as the case above: existsSync without statSync
+    // meant this never observed a marker and never launched fresh.
+    fsMocks.existsSync.mockImplementation((p: string) => String(p).endsWith('.force-fresh'));
+    fsMocks.statSync.mockImplementation((p: string) => {
+      if (String(p).endsWith('.force-fresh')) return { ino: 11, mtimeMs: 22, size: 33 };
+      throw new Error('ENOENT');
+    });
+    mockHermesDbExists.mockReturnValue(true);
+    // Resolve normally, but fire the exit handler so handleExit() nulls this.pty
+    // before start() reaches the post-spawn block.
+    mockPty.spawn.mockImplementationOnce(async () => { capturedOnExit?.(1); });
+
+    const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+
+    // PIN WHICH PATH RAN, via the one difference observable from outside:
+    // the !this.pty early return RETURNS, while performStart's catch RE-THROWS
+    // (agent-process.ts:321, so startAgent can abort secondary wiring).
+    //
+    // Before the mock buffer carried hasRateLimitSignature, handleExit threw a
+    // TypeError, start() REJECTED, and this case passed anyway — it observed an
+    // absence of unlink produced by a crash, not by preservation. Asserting the
+    // absence alone says nothing about which path produced it.
+    await expect(
+      ap.start(),
+      'the early return must RESOLVE; a throw in handleExit rejects and reaches the same absence by the catch path',
+    ).resolves.toBeUndefined();
+
+    expect(mockPty.spawn).toHaveBeenCalledWith('fresh', expect.any(String));
+    const unlinked = fsMocks.unlinkSync.mock.calls.map((c: unknown[]) => String(c[0]));
+    expect(
+      unlinked.some((p: string) => p.endsWith('.force-fresh')),
+      'the exit-during-spawn early return must preserve .force-fresh, as it already does for the other two markers',
+    ).toBe(false);
+  });
+
+  it('TIMING: does NOT consume a marker that arrived AFTER the mode decision', async () => {
+    // nova's casualty on 2965894c, wider than the stat/unlink residual I
+    // disclosed. The mode-decision probe and the identity-capture probe used to
+    // be two independent reads: a marker created between them was invisible to
+    // the decision and visible to the capture, so the launch went CONTINUE and
+    // the post-spawn delete consumed a request that was never honoured.
+    //
+    // Identity binding cannot fix it — the marker is UNCHANGED between capture
+    // and delete. CONSUME ONLY WHAT YOU HONOURED.
+    //
+    // THE INTERLEAVING IS DRIVEN BY CALL COUNT, not by a timer. My first
+    // attempt used setTimeout and was FALSE-SECURE: reverting to two probes
+    // left it green, because the marker never actually landed between them.
+    // A stat that reports ENOENT on its FIRST call and success afterwards
+    // reproduces the race deterministically, and it is exactly the observation
+    // the two-probe version made twice.
+    let statCalls = 0;
+    fsMocks.existsSync.mockImplementation((p: string) => {
+      if (!String(p).endsWith('.force-fresh')) return false;
+      return statCalls > 0;
+    });
+    fsMocks.statSync.mockImplementation((p: string) => {
+      if (!String(p).endsWith('.force-fresh')) throw new Error('ENOENT');
+      statCalls += 1;
+      if (statCalls === 1) throw new Error('ENOENT');   // absent at the decision
+      return { ino: 42, mtimeMs: 7, size: 9 };          // present for any later read
+    });
+    mockHermesDbExists.mockReturnValue(true);
+
+    const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+    await ap.start().catch(() => { /* not what this pins */ });
+
+    expect(mockPty.spawn).toHaveBeenCalledWith('continue', expect.any(String));
+    const unlinked = fsMocks.unlinkSync.mock.calls.map((c: unknown[]) => String(c[0]));
+    expect(
+      unlinked.some((p: string) => p.endsWith('.force-fresh')),
+      'a marker that never selected fresh mode must NOT be consumed',
+    ).toBe(false);
+  });
+
+  it('TIMING: does NOT swallow a .force-fresh REPLACED during spawn', async () => {
+    // Codex P2 on 6c22479a, and a regression MY OWN FIX introduced. Deferring
+    // the consume to after spawn opens a seconds-wide window; .force-fresh has
+    // three writers and `bus/system.ts` hard-restart runs in a separate CLI
+    // process, so a NEW request can land mid-spawn. An unconditional
+    // post-spawn delete cannot tell it apart from the marker observed at mode
+    // decision and swallows it — reintroducing the original bug on a narrower
+    // window.
+    //
+    // THIS IS THE TIMING AXIS. The other cases vary WHAT fails; this one
+    // varies WHEN the marker is written. My original mutation set held the
+    // write fixed and would never have found this.
+    const original = { ino: 100, mtimeMs: 1_000, size: 10 };
+    const replacement = { ino: 200, mtimeMs: 9_999, size: 42 };
+    const state = installMarkerModel(original);
+    mockHermesDbExists.mockReturnValue(true);
+    // A concurrent hard-restart replaces the marker WHILE the PTY is starting.
+    mockPty.spawn.mockImplementationOnce(async () => { state.marker = replacement; });
+
+    const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+    await ap.start().catch(() => { /* not what this pins */ });
+
+    // The replaced marker is a NEW request and must survive this launch: the
+    // consume sweeps it into the reserve atomically, detects the identity
+    // mismatch, and RESTORES it to the marker path — with no reserve residue.
+    expect(state.marker).toEqual(replacement);
+    expect(state.reserves.size).toBe(0);
+  });
+
+  it('TIMING: still consumes the marker when it is UNCHANGED across spawn', () => {
+    // The positive sibling. Without it, the case above passes on an
+    // implementation that never consumes anything at all — which is exactly
+    // the sticky-forever bug the consume exists to prevent.
+    const stable = { ino: 100, mtimeMs: 1_000, size: 10 };
+    const state = installMarkerModel(stable);
+    mockHermesDbExists.mockReturnValue(true);
+
+    const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+    return ap.start().then(() => {
+      // an unchanged marker must still be consumed after a successful spawn —
+      // fully: nothing at the marker path, no reserve residue.
+      expect(state.marker).toBeNull();
+      expect(state.reserves.size).toBe(0);
+    });
+  });
+
+  it('TOCTOU: a request landing at the exact unlink instant survives (atomic rename-reserve)', async () => {
+    // The check-then-unlink race: hardRestart runs in a separate CLI process,
+    // and its writeFileSync can land AFTER the identity check but BEFORE the
+    // unlink — the unlink then deletes the brand-new request. The interleave is
+    // armed at the fs layer: the adversarial write fires inside the FIRST
+    // unlinkSync call, i.e. at the exact instant the consume's removal
+    // executes. On check-then-unlink code the removal targets the MARKER path
+    // and destroys the just-landed request (this test is red there). With the
+    // atomic rename-reserve, the marker was already swept to the reserve, the
+    // adversary's write creates a fresh marker at the now-empty path, and the
+    // removal targets only the reserve — the new request survives.
+    const observed = { ino: 100, mtimeMs: 1_000, size: 10 };
+    const newRequest = { ino: 300, mtimeMs: 5_555, size: 21 };
+    const state = installMarkerModel(observed);
+    mockHermesDbExists.mockReturnValue(true);
+
+    const baseUnlink = fsMocks.unlinkSync.getMockImplementation()!;
+    let adversaryFired = false;
+    fsMocks.unlinkSync.mockImplementation((p: string) => {
+      if (!adversaryFired && String(p).includes('.force-fresh')) {
+        // The concurrent hardRestart's write lands NOW — after any check the
+        // consume performed, before its removal completes.
+        adversaryFired = true;
+        state.marker = newRequest;
+      }
+      baseUnlink(p);
+    });
+
+    const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+    await ap.start();
+
+    expect(adversaryFired, 'the interleave must actually fire or this casualty is vacuous').toBe(true);
+    expect(
+      state.marker,
+      'a request that lands at the unlink instant must survive for the next start',
+    ).toEqual(newRequest);
+    expect(state.reserves.size).toBe(0);
   });
 });
 

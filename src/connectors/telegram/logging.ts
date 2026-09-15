@@ -1,0 +1,278 @@
+/**
+ * Telegram message logging and last-sent context caching.
+ * Matches the bash send-telegram.sh outbound logging (lines 100-108)
+ * and last-sent cache (lines 111-113).
+ */
+
+import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import { join, dirname } from 'path';
+import { logEvent } from '../../bus/event.js';
+import type { BusPaths, TelegramMessage } from '../../types/index.js';
+import { stripControlChars } from '../../utils/validate.js';
+
+/**
+ * Optional metadata attached to an outbound Telegram message log entry.
+ * Fields are all optional so existing callers that pass nothing still
+ * produce the same JSONL shape as before this extension.
+ *
+ * - `parseMode`: which parse_mode the first send attempt used. "html"
+ *   for the default path (Markdown-to-HTML conversion), "none" when the
+ *   caller used --plain-text.
+ */
+export interface OutboundLogMetadata {
+  parseMode?: 'html' | 'none';
+}
+
+/**
+ * Append an outbound message to the agent's JSONL log.
+ * Path: {ctxRoot}/logs/{agentName}/outbound-messages.jsonl
+ */
+export function logOutboundMessage(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+  text: string,
+  messageId: number,
+  metadata?: OutboundLogMetadata,
+  threadId?: number,
+): void {
+  const logDir = join(ctxRoot, 'logs', agentName);
+  mkdirSync(logDir, { recursive: true });
+
+  // Only emit metadata fields that were actually set so the base log shape
+  // stays unchanged for callers that pass nothing (backwards compat).
+  const meta: Record<string, unknown> = {};
+  if (metadata?.parseMode !== undefined) meta.parse_mode = metadata.parseMode;
+  // thread_id recorded only when present (DM/v1 lines unchanged); lets
+  // buildRecentHistory isolate per-project-topic conversation context.
+  if (threadId !== undefined) meta.thread_id = threadId;
+
+  const entry = JSON.stringify({
+    timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    agent: agentName,
+    chat_id: String(chatId),
+    text,
+    message_id: messageId,
+    ...meta,
+  });
+
+  appendFileSync(join(logDir, 'outbound-messages.jsonl'), entry + '\n', 'utf-8');
+}
+
+/**
+ * Append an inbound message to the agent's JSONL log.
+ * Path: {ctxRoot}/logs/{agentName}/inbound-messages.jsonl
+ */
+export function logInboundMessage(
+  ctxRoot: string,
+  agentName: string,
+  rawMessage: object,
+): void {
+  const logDir = join(ctxRoot, 'logs', agentName);
+  mkdirSync(logDir, { recursive: true });
+
+  const entry = JSON.stringify({
+    ...rawMessage,
+    archived_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    agent: agentName,
+  });
+
+  appendFileSync(join(logDir, 'inbound-messages.jsonl'), entry + '\n', 'utf-8');
+}
+
+/**
+ * Persist an inbound Telegram message to the daemon's JSONL archive AND
+ * emit a `message/telegram_received` bus event so dashboards and
+ * experiment cycles can count fleet-wide inbound traffic. Symmetric with
+ * `telegram_sent` emitted from the outbound path in `cortextos bus
+ * send-telegram`.
+ *
+ * Wrapped: a logEvent failure (e.g. unwritable analytics dir) must not
+ * break message processing — the logged inbound JSONL still goes through.
+ */
+export function recordInboundTelegram(
+  paths: BusPaths,
+  ctxRoot: string,
+  agentName: string,
+  org: string,
+  fromName: string,
+  msg: TelegramMessage,
+  log?: (m: string) => void,
+): void {
+  const text = (msg.text || msg.caption || '').toString();
+  const replyTo = summarizeReplyTarget(msg.reply_to_message);
+  logInboundMessage(ctxRoot, agentName, {
+    message_id: msg.message_id,
+    from: msg.from?.id,
+    from_name: fromName,
+    chat_id: msg.chat?.id,
+    // Record the forum topic so per-project history can be isolated. Absent
+    // for DM/General → unchanged log shape.
+    ...(msg.message_thread_id !== undefined ? { thread_id: msg.message_thread_id } : {}),
+    text,
+    ...(replyTo ? {
+      reply_to_message_id: replyTo.messageId,
+      reply_to_text: replyTo.text,
+      reply_to_has_media: replyTo.hasMedia,
+    } : {}),
+    timestamp: new Date().toISOString(),
+  });
+
+  const hasMedia = !!(msg.photo || msg.document || msg.voice || msg.audio || msg.video || msg.video_note);
+  try {
+    // Daemon-on-behalf delivery write: deliberately does NOT opt into
+    // heartbeat refresh, so a wedged agent's heartbeat cannot be spoofed
+    // fresh by inbound traffic it never acted on.
+    logEvent(paths, agentName, org, 'message', 'telegram_received', 'info', {
+      chat_id: String(msg.chat?.id ?? ''),
+      message_id: msg.message_id,
+      from_id: msg.from?.id,
+      from_name: fromName,
+      has_media: hasMedia,
+      text_chars: text.length,
+      ...(replyTo ? {
+        reply_to_message_id: replyTo.messageId,
+        reply_to_text_chars: replyTo.text.length,
+        reply_to_has_media: replyTo.hasMedia,
+      } : {}),
+    });
+  } catch (err) {
+    log?.(`logEvent(telegram_received) failed: ${err}`);
+  }
+}
+
+function summarizeReplyTarget(msg: TelegramMessage | undefined): {
+  messageId: number;
+  text: string;
+  hasMedia: boolean;
+} | null {
+  if (!msg) return null;
+
+  const parts: string[] = [];
+  if (msg.text) parts.push(stripControlChars(msg.text));
+  if (msg.caption) parts.push(stripControlChars(msg.caption));
+  if (msg.document) parts.push(`[document: ${msg.document.file_name ?? 'file'}]`);
+  if (msg.photo) parts.push('[photo]');
+  if (msg.video) parts.push('[video]');
+  if (msg.video_note) parts.push('[video note]');
+  if (msg.voice) parts.push('[voice message]');
+  if (msg.audio) parts.push('[audio]');
+
+  const hasMedia = !!(msg.photo || msg.document || msg.voice || msg.audio || msg.video || msg.video_note);
+  return {
+    messageId: msg.message_id,
+    text: parts.join('\n').slice(0, 500),
+    hasMedia,
+  };
+}
+
+/**
+ * Cache the last-sent text for a given chat.
+ * Path: {ctxRoot}/state/{agentName}/last-telegram-{chatId}.txt
+ */
+export function cacheLastSent(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+  text: string,
+  threadId?: number,
+): void {
+  const stateDir = join(ctxRoot, 'state', agentName);
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(stateDir, lastSentFileName(chatId, threadId)), text, 'utf-8');
+}
+
+/**
+ * Read the last-sent text for a given chat (+ optional forum topic), or null.
+ */
+export function readLastSent(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+  threadId?: number,
+): string | null {
+  const filePath = join(ctxRoot, 'state', agentName, lastSentFileName(chatId, threadId));
+  if (!existsSync(filePath)) {
+    return null;
+  }
+  return readFileSync(filePath, 'utf-8');
+}
+
+/**
+ * Last-sent cache filename. Per (chat, topic) when a thread is present so two
+ * project topics in the same group don't overwrite each other's "your last
+ * message" context; bare-chat (DM/v1) filename is unchanged. MUST match
+ * FastChecker.readLastSent's filename convention.
+ */
+export function lastSentFileName(chatId: string | number, threadId?: number): string {
+  return `last-telegram-${chatId}${threadId !== undefined ? `-t${threadId}` : ''}.txt`;
+}
+
+/**
+ * Build a short recent conversation snippet for context injection.
+ * Reads the last `limit` messages (combined inbound + outbound) for the
+ * given agent/chatId (+ optional forum topic), sorts by timestamp, and
+ * returns a formatted string. Returns null if no history is available.
+ */
+export function buildRecentHistory(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+  limit: number = 6,
+  threadId?: number,
+): string | null {
+  const logDir = join(ctxRoot, 'logs', agentName);
+  const inboundPath = join(logDir, 'inbound-messages.jsonl');
+  const outboundPath = join(logDir, 'outbound-messages.jsonl');
+  const chatIdStr = String(chatId);
+
+  interface Entry { ts: string; speaker: string; text: string; }
+  const entries: Entry[] = [];
+
+  const readLines = (filePath: string, speaker: string) => {
+    if (!existsSync(filePath)) return;
+    try {
+      const raw = readFileSync(filePath, 'utf-8').trim();
+      if (!raw) return;
+      const lines = raw.split('\n').filter(Boolean);
+      // Filter by chat/thread FIRST, then keep the most recent `limit` matches.
+      // (Do NOT tail raw lines before filtering — a busy SIBLING topic in the
+      // same group would push this topic's entries out of the window and return
+      // nothing.) Scan from the end, collect matches up to limit.
+      const matched: Entry[] = [];
+      for (let i = lines.length - 1; i >= 0 && matched.length < limit; i--) {
+        try {
+          const obj = JSON.parse(lines[i]);
+          if (String(obj.chat_id) !== chatIdStr) continue;
+          // Isolate per-project-topic history: when a thread is requested, only
+          // entries from that thread; when none (DM/v1), only thread-less
+          // entries so a group's topic chatter never bleeds into the DM view.
+          if (threadId !== undefined) {
+            if (obj.thread_id !== threadId) continue;
+          } else if (obj.thread_id !== undefined) {
+            continue;
+          }
+          const text = (obj.text || '').trim();
+          if (!text) continue;
+          matched.push({ ts: obj.timestamp || obj.archived_at || '', speaker, text });
+        } catch { /* skip malformed */ }
+      }
+      for (const e of matched) entries.push(e);
+    } catch { /* skip unreadable */ }
+  };
+
+  readLines(inboundPath, process.env.ADMIN_USERNAME ?? 'user');
+  readLines(outboundPath, agentName);
+
+  if (entries.length === 0) return null;
+
+  entries.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  const recent = entries.slice(-limit);
+
+  const formatted = recent.map(e => {
+    const preview = e.text.length > 200 ? e.text.slice(0, 200) + '...' : e.text;
+    return '[' + e.speaker + ']: ' + preview;
+  });
+
+  return formatted.join('\n');
+}

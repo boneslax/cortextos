@@ -495,6 +495,191 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
   });
 });
 
+describe('CodexAppServerPTY mid-turn steer', () => {
+  function makeReadyPty() {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _alive: boolean })._alive = true;
+    (pty as unknown as { _threadId: string })._threadId = 'thread-1';
+    (pty as unknown as { _rpc: { request: typeof requestMock; respondError: typeof respondErrorMock } })._rpc = {
+      request: requestMock,
+      respondError: respondErrorMock,
+    };
+    return pty;
+  }
+
+  function rpc(pty: InstanceType<typeof CodexAppServerPTY>) {
+    return pty as unknown as { handleRpcMessage(message: unknown): void };
+  }
+
+  async function startExecutingTurn(pty: InstanceType<typeof CodexAppServerPTY>, turnId = 'turn-abc') {
+    pty.write('long task');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requestMock).toHaveBeenCalledWith('turn/start', expect.objectContaining({ threadId: 'thread-1' }));
+    rpc(pty).handleRpcMessage({
+      method: 'turn/started',
+      params: { threadId: 'thread-1', turn: { id: turnId, items: [], status: 'inProgress' } },
+    });
+  }
+
+  function callsTo(method: string) {
+    return requestMock.mock.calls.filter(([m]) => m === method);
+  }
+
+  // Drain the full microtask queue (steer rejection -> catch -> enqueue -> drain
+  // chains span more ticks than a fixed number of Promise.resolve() awaits).
+  function flush() {
+    return new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  it('steers the active turn instead of queueing when executing', async () => {
+    requestMock.mockResolvedValue({ result: {} });
+    const pty = makeReadyPty();
+    await startExecutingTurn(pty);
+
+    pty.write('mid-turn message');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callsTo('turn/steer')).toHaveLength(1);
+    expect(requestMock).toHaveBeenLastCalledWith('turn/steer', {
+      threadId: 'thread-1',
+      expectedTurnId: 'turn-abc',
+      input: [{ type: 'text', text: 'mid-turn message', text_elements: [] }],
+    });
+
+    // Steered input must NOT also be queued: completing the turn fires no new turn/start.
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-abc' } } });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(callsTo('turn/start')).toHaveLength(1);
+  });
+
+  it('falls back to the queue when steer is rejected (non-steerable turn)', async () => {
+    requestMock.mockImplementation((method: string) => {
+      if (method === 'turn/steer') {
+        return Promise.reject(new Error('ActiveTurnNotSteerable'));
+      }
+      return Promise.resolve({ result: {} });
+    });
+    const pty = makeReadyPty();
+    await startExecutingTurn(pty);
+
+    pty.write('steer me');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callsTo('turn/steer')).toHaveLength(1);
+    expect(callsTo('turn/start')).toHaveLength(1); // not submitted yet
+
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-abc' } } });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callsTo('turn/start')).toHaveLength(2);
+    expect(callsTo('turn/start')[1][1]).toMatchObject({
+      input: [{ type: 'text', text: 'steer me', text_elements: [] }],
+    });
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+  });
+
+  it('preserves ordering across multiple rejected steers', async () => {
+    requestMock.mockImplementation((method: string) => {
+      if (method === 'turn/steer') {
+        return Promise.reject(new Error('ExpectedTurnMismatch'));
+      }
+      return Promise.resolve({ result: {} });
+    });
+    const pty = makeReadyPty();
+    await startExecutingTurn(pty);
+
+    for (const text of ['one', 'two']) {
+      pty.write(text);
+      pty.write('\r');
+      await flush();
+    }
+    expect(callsTo('turn/steer')).toHaveLength(2);
+
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-abc' } } });
+    await flush();
+    expect(callsTo('turn/start')[1][1]).toMatchObject({
+      input: [{ type: 'text', text: 'one', text_elements: [] }],
+    });
+
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+    await flush();
+    expect(callsTo('turn/start')[2][1]).toMatchObject({
+      input: [{ type: 'text', text: 'two', text_elements: [] }],
+    });
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+  });
+
+  it('queues without steering while executing but before turn/started arrives', async () => {
+    requestMock.mockResolvedValue({ result: {} });
+    const pty = makeReadyPty();
+    pty.write('long task');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+    // _executing is true but no turn/started notification has been seen.
+
+    pty.write('early message');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callsTo('turn/steer')).toHaveLength(0);
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(callsTo('turn/start')).toHaveLength(2);
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+  });
+
+  it('honors the CODEX_STEER_DISABLED kill-switch', async () => {
+    process.env.CODEX_STEER_DISABLED = '1';
+    try {
+      requestMock.mockResolvedValue({ result: {} });
+      const pty = makeReadyPty();
+      await startExecutingTurn(pty);
+
+      pty.write('mid-turn message');
+      pty.write('\r');
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(callsTo('turn/steer')).toHaveLength(0);
+      rpc(pty).handleRpcMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-abc' } } });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(callsTo('turn/start')).toHaveLength(2);
+      rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+    } finally {
+      delete process.env.CODEX_STEER_DISABLED;
+    }
+  });
+
+  it('clears the active turn id on turn/completed and on error notifications', async () => {
+    requestMock.mockResolvedValue({ result: {} });
+    const pty = makeReadyPty();
+    await startExecutingTurn(pty);
+    const internals = pty as unknown as { _activeTurnId: string | null };
+    expect(internals._activeTurnId).toBe('turn-abc');
+
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-abc' } } });
+    expect(internals._activeTurnId).toBeNull();
+
+    await startExecutingTurn(pty, 'turn-def');
+    expect(internals._activeTurnId).toBe('turn-def');
+    rpc(pty).handleRpcMessage({ method: 'error', params: { message: 'boom' } });
+    expect(internals._activeTurnId).toBeNull();
+  });
+});
+
 describe('CodexAppServerPTY extractTelegramPayload media types', () => {
   function extract(content: string, options?: { existsSync?: boolean; readFileSync?: string }): string | null {
     if (options?.existsSync !== undefined) fsMocks.existsSync.mockReturnValue(options.existsSync);
@@ -832,31 +1017,37 @@ describe('CodexAppServerPTY thread lifecycle', () => {
     });
   });
 
-  it('resumes the persisted thread in fresh mode when state exists', async () => {
+  it('starts a new thread in fresh mode even when persisted thread state exists', async () => {
     fsMocks.existsSync.mockReturnValue(true);
     fsMocks.readFileSync.mockReturnValue(JSON.stringify({
       threadId: 'persisted-fresh-thread',
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       updatedAt: '2026-05-07T00:00:00Z',
     }));
-    requestMock.mockResolvedValue({ result: { thread: { id: 'persisted-fresh-thread' } } });
+    requestMock.mockResolvedValue({ result: { thread: { id: 'new-fresh-thread' } } });
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
 
-    expect(requestMock).toHaveBeenCalledWith('thread/resume', {
-      threadId: 'persisted-fresh-thread',
+    expect(requestMock).toHaveBeenCalledTimes(1);
+    expect(requestMock).toHaveBeenCalledWith('thread/start', {
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
       config: { features: { goals: true } },
-      excludeTurns: true,
+      sessionStartSource: 'startup',
+      experimentalRawEvents: false,
       persistExtendedHistory: true,
     });
     expect(requestMock).not.toHaveBeenCalledWith(
-      'thread/start',
+      'thread/resume',
       expect.anything(),
+    );
+    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining('codex-app-server-thread.json'),
+      expect.stringContaining('"threadId": "new-fresh-thread"'),
+      'utf-8',
     );
   });
 });
@@ -930,7 +1121,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 1000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1000 },
+      last: { cachedInputTokens: 5000, inputTokens: 60000, outputTokens: 4000, reasoningOutputTokens: 1000, totalTokens: 70000 },
       total: { cachedInputTokens: 5000, inputTokens: 60000, outputTokens: 4000, reasoningOutputTokens: 1000, totalTokens: 70000 },
       modelContextWindow: 200000,
     });
@@ -956,8 +1147,8 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
-      total: { cachedInputTokens: 0, inputTokens: 64000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 64000 },
+      last: { cachedInputTokens: 0, inputTokens: 64000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 64000 },
+      total: { cachedInputTokens: 0, inputTokens: 640000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 640000 },
       modelContextWindow: null,
     });
 
@@ -970,8 +1161,8 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     const pty = new CodexAppServerPTY(mockEnv, { codex_context_cap: 100000 });
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
-      total: { cachedInputTokens: 0, inputTokens: 50000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 50000 },
+      last: { cachedInputTokens: 0, inputTokens: 50000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 50000 },
+      total: { cachedInputTokens: 0, inputTokens: 500000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 500000 },
       modelContextWindow: null,
     });
 
@@ -984,8 +1175,8 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
-      total: { cachedInputTokens: 0, inputTokens: 210000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 210000 },
+      last: { cachedInputTokens: 0, inputTokens: 210000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 210000 },
+      total: { cachedInputTokens: 0, inputTokens: 2100000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 2100000 },
       modelContextWindow: 1000000,
     });
 
@@ -997,13 +1188,52 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
-      total: { cachedInputTokens: 0, inputTokens: 300000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 300000 },
+      last: { cachedInputTokens: 0, inputTokens: 300000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 300000 },
+      total: { cachedInputTokens: 0, inputTokens: 3000000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 3000000 },
       modelContextWindow: 256000,
     });
 
     const payload = lastWrittenPayload()!;
     expect(payload.used_percentage).toBe(100);
+  });
+
+  it('uses current-window last tokens instead of lifetime total tokens', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _threadId: string })._threadId = 'thread-9';
+    feedTokenUsage(pty, {
+      last: { cachedInputTokens: 30000, inputTokens: 80000, outputTokens: 2000, reasoningOutputTokens: 0, totalTokens: 82000 },
+      total: { cachedInputTokens: 312000000, inputTokens: 323000000, outputTokens: 880000, reasoningOutputTokens: 0, totalTokens: 324000000 },
+      modelContextWindow: 258400,
+    });
+
+    const payload = lastWrittenPayload()!;
+    expect(payload.used_percentage).toBeCloseTo((82000 / 258400) * 100, 5);
+    expect(payload.used_percentage).not.toBe(100);
+    expect(payload.current_usage).toEqual({
+      input_tokens: 80000,
+      output_tokens: 2000,
+      cache_read_input_tokens: 30000,
+      cache_creation_input_tokens: 0,
+    });
+  });
+
+  it('writes null used_percentage instead of false-100 when current-window data is missing', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _threadId: string })._threadId = 'thread-9';
+    feedTokenUsage(pty, {
+      total: { cachedInputTokens: 312000000, inputTokens: 323000000, outputTokens: 880000, reasoningOutputTokens: 0, totalTokens: 324000000 },
+      modelContextWindow: 258400,
+    });
+
+    const payload = lastWrittenPayload()!;
+    expect(payload.used_percentage).toBeNull();
+    expect(payload.exceeds_200k_tokens).toBe(false);
+    expect(payload.current_usage).toEqual({
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    });
   });
 
   it('skips the write when params.tokenUsage is missing', () => {
@@ -1016,7 +1246,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     expect(atomicWriteSyncMock).not.toHaveBeenCalled();
   });
 
-  it('skips the write when total.totalTokens is missing', () => {
+  it('writes null used_percentage when total.totalTokens is missing', () => {
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
@@ -1024,7 +1254,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
       total: { cachedInputTokens: 0, inputTokens: 100, outputTokens: 0, reasoningOutputTokens: 0 },
       modelContextWindow: 200000,
     });
-    expect(atomicWriteSyncMock).not.toHaveBeenCalled();
+    expect(lastWrittenPayload()?.used_percentage).toBe(0);
   });
 
   it('still emits the event log line even on a successful context write', () => {
