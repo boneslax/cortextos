@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "tsup",
+    "postinstall": "node scripts/fix-spawn-helper.mjs",
     "dev": "tsup --watch",
     "test": "vitest run",
     "test:watch": "vitest",
