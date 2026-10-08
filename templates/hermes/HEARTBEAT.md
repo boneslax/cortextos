@@ -70,7 +70,7 @@ TODAY=$(date -u +%Y-%m-%d)
 mkdir -p memory
 cat >> "memory/$TODAY.md" << MEMORY
 
-## Heartbeat Update - $(date -u +%H:%M)
+## Heartbeat Update - $(date -u +'%H:%M UTC') / $LOCAL_TIME
 - WORKING ON: <task_id or "none">
 - Status: <healthy/working/blocked>
 - Inbox: <N messages processed>
